@@ -371,6 +371,8 @@ class EmulatorWindow {
   std::unique_ptr<NetplayStatusDialog> netplay_status_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
+
+  bool installing_additional_content_ = false;
 };
 
 }  // namespace app
