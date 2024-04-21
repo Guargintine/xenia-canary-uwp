@@ -495,14 +495,14 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   FILE* file = xe::filesystem::OpenFile(path, "rb");
 
   if (!file) {
-    return FileSignatureType::Unknown;
+    return Emulator::FileSignatureType::Unknown;
   }
 
   const uint64_t file_size = std::filesystem::file_size(path);
   constexpr int64_t header_size = 4;
 
   if (file_size < header_size) {
-    return FileSignatureType::Unknown;
+    return Emulator::FileSignatureType::Unknown;
   }
 
   char file_magic[header_size];
@@ -523,21 +523,21 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
     case xe::cpu::kXEX25Signature:
       return FileSignatureType::XEX25;
     case xe::cpu::kXEX1Signature:
-      return FileSignatureType::XEX1;
+      return Emulator::FileSignatureType::XEX1;
     case xe::cpu::kXEX2Signature:
-      return FileSignatureType::XEX2;
+      return Emulator::FileSignatureType::XEX2;
     case xe::vfs::kCONSignature:
-      return FileSignatureType::CON;
+      return Emulator::FileSignatureType::CON;
     case xe::vfs::kLIVESignature:
-      return FileSignatureType::LIVE;
+      return Emulator::FileSignatureType::LIVE;
     case xe::vfs::kPIRSSignature:
-      return FileSignatureType::PIRS;
+      return Emulator::FileSignatureType::PIRS;
     case xe::vfs::kXSFSignature:
       return FileSignatureType::XISO;
     case xe::cpu::kXBESignature:
       return FileSignatureType::XBE;
     case xe::cpu::kElfSignature:
-      return FileSignatureType::ELF;
+      return Emulator::FileSignatureType::ELF;
     default:
       break;
   }
@@ -545,7 +545,7 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   magic_value = make_fourcc(file_magic[0], file_magic[1], 0, 0);
 
   if (xe::kernel::kEXESignature == magic_value) {
-    return FileSignatureType::EXE;
+    return Emulator::FileSignatureType::EXE;
   }
 
   file = xe::filesystem::OpenFile(path, "rb");
@@ -557,7 +557,7 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
       make_fourcc(file_magic[0], file_magic[1], file_magic[2], file_magic[3]);
 
   if (xe::vfs::kZarMagic == magic_value) {
-    return FileSignatureType::ZAR;
+    return Emulator::FileSignatureType::ZAR;
   }
 
   // Check if XISO
@@ -567,11 +567,15 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   XELOGI("Checking for XISO");
 
   if (device->Initialize()) {
-    return FileSignatureType::XISO;
+    return Emulator::FileSignatureType::XISO;
   }
 
   XELOGE("{}: {} ({:08X})", __func__, path.extension(), magic_value);
   return FileSignatureType::Unknown;
+}
+
+Emulator::FileSignatureType GetFileSignature(const std::filesystem::path& path) {
+  return Emulator::GetFileSignature(path);
 }
 
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
