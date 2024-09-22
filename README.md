@@ -35,7 +35,9 @@ To get started with netplay read [config setup](https://github.com/AdrianCassar/
     </a>
 </p>
 
-<h1 align="center">Xenia Canary - Xbox 360 Emulator</h1>
+Xenia Canary UWP is an unofficial fork of Xenia Canary to support UWP and the Xbox platforms. It is not associated with the Xenia developers.
+
+<h1>Original Readme</h1>
 
 Xenia Canary is an experimental fork of the Xenia emulator. For more information, see the
 [Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki).
