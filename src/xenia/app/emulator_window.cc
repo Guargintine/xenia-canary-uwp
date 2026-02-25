@@ -52,6 +52,10 @@
 #include "xenia/ui/virtual_key.h"
 
 #include "version.h"
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/UWPUtil.h"
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
 
 DECLARE_bool(debug);
 
@@ -76,8 +80,11 @@ DECLARE_string(network_guid);
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
 
-DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
-            "General");
+DEFINE_bool(controller_hotkeys, false,
+            "Toggle hotkeys for Xbox and PS controllers.", "General");
+
+DEFINE_bool(skip_frontend, true,
+            "Skip the UWP frontend and launch with a file-picker.", "General");
 
 DEFINE_bool(auto_check_updates, true,
             "Automatically check for updates on startup and notify if any are "
@@ -174,7 +181,9 @@ namespace app {
 
 using xe::ui::FileDropEvent;
 using xe::ui::KeyEvent;
+#if !XE_PLATFORM_WINRT
 using xe::ui::MenuItem;
+#endif
 using xe::ui::UIEvent;
 
 using namespace xe::hid;
@@ -212,6 +221,15 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
   updater_ = std::make_shared<Updater>("AdrianCassar", "xenia-canary");
 
   LoadRecentlyLaunchedTitles();
+
+#if XE_PLATFORM_WINRT
+  if (cvars::skip_frontend) {
+    UWP::OpenGamePicker(emulator_);
+  } else {
+    gamelist_ = std::unique_ptr<WinRTFrontendDialog>(
+        new WinRTFrontendDialog(imgui_drawer_.get(), *this));
+  }
+#endif
 }
 
 std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
@@ -812,6 +830,7 @@ bool EmulatorWindow::Initialize() {
 
   // Main menu.
   // FIXME: This code is really messy.
+#if !XE_PLATFORM_WINRT
   auto main_menu = MenuItem::Create(MenuItem::Type::kNormal);
   auto file_menu = MenuItem::Create(MenuItem::Type::kPopup, "&File");
   auto recent_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Open Recent");
@@ -1027,6 +1046,7 @@ bool EmulatorWindow::Initialize() {
   main_menu->AddChild(std::move(help_menu));
 
   window_->SetMainMenu(std::move(main_menu));
+#endif
 
   window_->SetMainMenuEnabled(false);
 
@@ -1349,6 +1369,9 @@ void EmulatorWindow::FileDrop(const std::filesystem::path& path) {
 }
 
 void EmulatorWindow::FileOpen() {
+#if XE_PLATFORM_WINRT
+  UWP::OpenGamePicker(emulator_);
+#else
   std::filesystem::path path;
 
   auto file_picker = xe::ui::FilePicker::Create();
@@ -1372,6 +1395,7 @@ void EmulatorWindow::FileOpen() {
     // Only run the title if a file is selected
     RunTitle(path);
   }
+#endif
 }
 
 void EmulatorWindow::FileClose() { emulator_->TerminateTitle(); }
@@ -1379,6 +1403,7 @@ void EmulatorWindow::FileClose() { emulator_->TerminateTitle(); }
 void EmulatorWindow::InstallContent() {
   std::vector<std::filesystem::path> paths;
 
+#if !XE_PLATFORM_WINRT
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
   file_picker->set_type(ui::FilePicker::Type::kFile);
@@ -1390,6 +1415,7 @@ void EmulatorWindow::InstallContent() {
   if (file_picker->Show(window_.get())) {
     paths = file_picker->selected_files();
   }
+#endif
 
   if (paths.empty()) {
     return;
@@ -2195,6 +2221,11 @@ const std::map<int, EmulatorWindow::ControllerHotKey> controller_hotkey_map = {
 
 EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
     int buttons) {
+  #if XE_PLATFORM_WINRT
+  // Just crashes and gets in the way of WinRT's frontend
+  return {};
+  #endif
+
   // Default return value
   EmulatorWindow::ControllerHotKey Unknown_hotkey = {};
 
@@ -2625,6 +2656,7 @@ void EmulatorWindow::RunPreviouslyPlayedTitle() {
 
 void EmulatorWindow::FillRecentlyLaunchedTitlesMenu(
     xe::ui::MenuItem* recent_menu) {
+#if !XE_PLATFORM_WINRT
   for (int i = 0; i < recently_launched_titles_.size(); ++i) {
     std::string hotkey = (i == 0) ? "F9" : "";
 
@@ -2637,6 +2669,7 @@ void EmulatorWindow::FillRecentlyLaunchedTitlesMenu(
         MenuItem::Type::kString, item_text, hotkey,
         std::bind(&EmulatorWindow::RunTitle, this, entry.path_to_file)));
   }
+#endif
 }
 
 void EmulatorWindow::LoadRecentlyLaunchedTitles() {

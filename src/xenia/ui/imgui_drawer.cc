@@ -23,6 +23,11 @@
 #include "xenia/ui/resources.h"
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/window.h"
+#include <xenia/hid/input.h>
+
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb/stb_image.h"
@@ -612,7 +617,6 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   ImGui::SetCurrentContext(internal_state_);
 
   ImGuiIO& io = ImGui::GetIO();
-
   uint64_t current_frame_time_ticks = Clock::QueryHostTickCount();
   io.DeltaTime =
       float(double(current_frame_time_ticks - last_frame_time_ticks_) /
@@ -628,7 +632,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   float physical_to_logical =
       float(window_->GetMediumDpi()) / float(window_->GetDpi());
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
-  io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+  io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;  
 
   if (!dialogs_.empty()) {
     UpdateGamepads();
