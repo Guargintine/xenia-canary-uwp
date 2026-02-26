@@ -353,7 +353,7 @@ std::unique_ptr<apu::AudioSystem> EmulatorApp::CreateAudioSystem(
 #endif  // XE_PLATFORM_LINUX
 #if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
   factory.Add<apu::sdl::SDLAudioSystem>("sdl");
-#endif  // !XE_PLATFORM_ANDROID
+#endif  // !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
   factory.Add<apu::nop::NopAudioSystem>("nop");
   return factory.Create(cvars::apu, processor);
 }
@@ -459,12 +459,14 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
         "compatible with Direct3D 12 feature level 11_0.\n"
         "\n"
 #endif  // XE_PLATFORM_WIN32
+#if !XE_PLATFORM_WINRT
         "For Vulkan, the Vulkan runtime must be installed, and the GPU must "
         "support at least Vulkan 1.0. The Vulkan runtime can be downloaded at "
         "https://vulkan.lunarg.com/sdk/home.\n"
         "\n"
         "Also, ensure that you have the latest driver installed for your GPU.\n"
         "\n"
+#endif  // !XE_PLATFORM_WINRT
 #endif  // XE_PLATFORM_ANDROID
         "See https://xenia.jp/faq/ for more information and the system "
         "requirements.");
@@ -480,9 +482,9 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
   } else {
     Factory<hid::InputDriver, ui::Window*, size_t> factory;
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 || XE_PLATFORM_WINRT
     factory.Add("xinput", xe::hid::xinput::Create);
-#endif  // XE_PLATFORM_WIN32
+#endif  // XE_PLATFORM_WIN32 || XE_PLATFORM_WINRT
 #if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
     factory.Add("sdl", xe::hid::sdl::Create);
 #endif  // !XE_PLATFORM_ANDROID

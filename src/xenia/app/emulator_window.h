@@ -257,6 +257,26 @@ class EmulatorWindow {
     float volume_ = 0.0f;
   };
 
+#if XE_PLATFORM_WINRT
+  class WinRTFrontendDialog final : public ui::ImGuiDialog {
+   public:
+    WinRTFrontendDialog(ui::ImGuiDrawer* imgui_drawer,
+                        EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateBackground();
+
+    EmulatorWindow& emulator_window_;
+    std::shared_ptr<ui::ImmediateTexture> background_tex_;
+    std::string selected_path_;
+    bool show_path_warning_ = false;
+    char cl_buffer_[128] = {};
+  };
+#endif  // XE_PLATFORM_WINRT
 
   explicit EmulatorWindow(Emulator* emulator,
                           ui::WindowedAppContext& app_context, uint32_t width,

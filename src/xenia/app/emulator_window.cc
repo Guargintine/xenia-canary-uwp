@@ -2648,7 +2648,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
 
     emulator_->file_system()->Clear();
   } else {
-    AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
+    AddRecentlyLaunchedTitle(path_to_file, std::string(emulator_->title_name()));
 
     auto xam =
         emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
@@ -2818,8 +2818,6 @@ void EmulatorWindow::ClearDialogs() {
 
 #if XE_PLATFORM_WINRT
 void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
-  static char cl_buffer[128] = {};
-  static std::string selectedPath;
   std::string launch_path;
   if (UWP::HasGamePath()) {
     UWP::SelectGameFromWinRT(emulator_window_.emulator());
@@ -2920,7 +2918,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           }
 
           auto c_readback_resolve = dynamic_cast<cvar::ConfigVar<bool>*>(
-              cvar::ConfigVars->find("d3d12_readback_resolve")->second);
+              cvar::ConfigVars->find("readback_memexport")->second);
           if (ImGui::Checkbox("Readback Resolve",
                               c_readback_resolve->current_value())) {
             c_readback_resolve->SetConfigValue(
@@ -3306,8 +3304,8 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         auto cl = dynamic_cast<cvar::ConfigVar<std::string>*>(
             cvar::ConfigVars->find("cl")->second);
         std::string cl_text = (std::string)cl->GetTypedConfigValue();
-        if (cl_text != cl_buffer) {
-          cl->SetConfigValue(cl_buffer);
+        if (cl_text != cl_buffer_) {
+          cl->SetConfigValue(cl_buffer_);
           config::SaveConfig();
         }
 
@@ -3317,7 +3315,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         }
 
         ImGui::SameLine();
-        ImGui::InputText("##cl-text", cl_buffer, 128);
+        ImGui::InputText("##cl-text", cl_buffer_, 128);
 
         if (ImGui::IsItemFocused()) {
           tooltip = cl->description();
@@ -3335,27 +3333,27 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         if (ImGui::BeginListBox("##folders")) {
           for (auto path : UWP::GetPaths()) {
             if (ImGui::Selectable(path.c_str())) {
-              selectedPath = path;
+              selected_path_ = path;
             }
           }
           ImGui::EndListBox();
         }
 
-        if (selectedPath == "") {
+        if (selected_path_ == "") {
           ImGui::BeginDisabled();
         }
 
         if (ImGui::Button("Remove Path")) {
-          if (selectedPath != "") {
+          if (selected_path_ != "") {
             auto paths = UWP::GetPaths();
-            paths.erase(std::remove(paths.begin(), paths.end(), selectedPath),
+            paths.erase(std::remove(paths.begin(), paths.end(), selected_path_),
                         paths.end());
             UWP::SetGamePaths(paths);
-            selectedPath = "";
+            selected_path_ = "";
           }
         }
 
-        if (selectedPath == "") {
+        if (selected_path_ == "") {
           ImGui::EndDisabled();
         }
 
@@ -3484,15 +3482,36 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
       if (ImGui::BeginTabItem("About", nullptr)) {
         ImGui::TextWrapped(
-            "Xenia UWP 1.1.5a\nA fork of Xenia introducing Xbox support and a big "
-            "picture frontend.\n\n"
-            "Xenia's Website: https://xenia.jp/\n"
-            "Xenia's Patreon: https://www.patreon.com/xenia_project\n\n"
-            "This Xbox fork was developed by SirMangler.\n"
-            "Support me on Ko-Fi: https://ko-fi.com/sirmangler\n"
-            "Source Code: https://github.com/SirMangler/xenia/\n\n"
-            "Big thanks to TXF for creating the background, as well as to "
-            "Reverie and TRW for extensive testing and moral support!");
+            "Xenia UWP 1.7.0\nBased on commit "
+            "125b4c8c05851e48faa73fda2a593f0629c5f7df\n"
+            "A fork of Xenia introducing Xbox support and a big picture "
+            "frontend.\n");
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("Xenia Website")) {
+          LaunchWebBrowser("https://xenia.jp/");
+        }
+        if (ImGui::Button("Xenia Team Donations")) {
+          LaunchWebBrowser("https://www.patreon.com/xenia_project");
+        }
+        if (ImGui::Button("Xbox Port Donations")) {
+          LaunchWebBrowser("https://ko-fi.com/sirmangler");
+        }
+        if (ImGui::Button("Get the Source Code")) {
+          LaunchWebBrowser("https://github.com/SirMangler/xenia/");
+        }
+        if (ImGui::Button("Get More from the Dev Store")) {
+          LaunchWebBrowser("https://xbdev.store/");
+        }
+        if (ImGui::Button("Xbox Emulation Hub")) {
+          LaunchWebBrowser("https://discord.gg/WCmxvvxHqu");
+        }
+
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+            "This UWP Xbox Port was originally made by SirMangler and the "
+            "hardwork of all the Xenia Project contributers over the years\n");
 
         ImGui::EndTabItem();
       }
@@ -3546,7 +3565,6 @@ EmulatorWindow::WinRTFrontendDialog::GetOrCreateBackground() {
   background_tex_ = std::move(tex);
   return background_tex_;
 }
-
 #endif  // XE_PLATFORM_WINRT
 
 }  // namespace app
