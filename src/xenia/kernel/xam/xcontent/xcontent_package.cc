@@ -189,15 +189,18 @@ void ContentPackage::InitializePackageHeader(
   if (spa_info) {
     const auto icon = spa_info->title_icon();
     if (!icon.empty()) {
-      header_.content_metadata.title_thumbnail_size = icon.size();
+      const auto title_thumbnail_size = std::min(
+          icon.size(), xe::countof(header_.content_metadata.title_thumbnail));
+      header_.content_metadata.title_thumbnail_size =
+          static_cast<uint32_t>(title_thumbnail_size);
       memcpy(header_.content_metadata.title_thumbnail, icon.data(),
-             std::min(icon.size(),
-                      xe::countof(header_.content_metadata.title_thumbnail)));
+             title_thumbnail_size);
 
-      header_.content_metadata.thumbnail_size = icon.size();
-      memcpy(header_.content_metadata.thumbnail, icon.data(),
-             std::min(icon.size(),
-                      xe::countof(header_.content_metadata.thumbnail)));
+      const auto thumbnail_size = std::min(
+          icon.size(), xe::countof(header_.content_metadata.thumbnail));
+      header_.content_metadata.thumbnail_size =
+          static_cast<uint32_t>(thumbnail_size);
+      memcpy(header_.content_metadata.thumbnail, icon.data(), thumbnail_size);
     }
 
     header_.content_metadata.set_display_name(spa_info->default_language(),

@@ -14,7 +14,7 @@
 #include "xenia/app/updater_dialog.h"
 #include "xenia/base/logging.h"
 
-#ifdef XE_PLATFORM_WIN32
+#if defined(XE_PLATFORM_WIN32) && !XE_PLATFORM_WINRT
 #include <shlobj.h>
 #include <windows.h>
 #else
@@ -505,7 +505,7 @@ void UpdaterDialog::OnDraw(ImGuiIO& io) {
         if (ImGui::Button(apply_lbl.c_str(), apply_btn_size)) {
           bool try_update = false;
 
-#ifdef XE_PLATFORM_WIN32
+#if defined(XE_PLATFORM_WIN32) && !XE_PLATFORM_WINRT
           try_update = updater_->IsAnotherInstanceRunning();
 #endif
 
@@ -641,7 +641,7 @@ bool UpdaterCompletionDialog::CopyFilePathToClipboard(
     const std::wstring& file_path) {
   std::u16string file_to_copy_path(file_path.begin(), file_path.end());
 
-#ifdef XE_PLATFORM_WIN32
+#if defined(XE_PLATFORM_WIN32) && !XE_PLATFORM_WINRT
   size_t path_size =
       string_util::size_in_bytes(file_to_copy_path.c_str(), true);
   size_t buffer_size = path_size + sizeof(DROPFILES);

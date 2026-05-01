@@ -334,7 +334,7 @@ dword_result_t XamGetToken_entry(dword_t user_index, lpstring_t url_ptr,
     const uint32_t mock_token_len = static_cast<uint32_t>(mock_token.size());
 
     const uint32_t token_data_addrress =
-        kernel_memory()->SystemHeapAlloc(mock_token.size());
+        kernel_memory()->SystemHeapAlloc(mock_token_len);
 
     uint8_t* token_data =
         kernel_memory()->TranslateVirtual<uint8_t*>(token_data_addrress);
@@ -1724,7 +1724,7 @@ dword_result_t NetDll_XHttpCrackUrl_entry(
 
       xe::string_util::copy_truncating(result_dst_ptr, processed_data.c_str(),
                                        component_length_ptr);
-      component_length_ptr = processed_data.size();
+      component_length_ptr = static_cast<uint32_t>(processed_data.size());
     } else if (component_length_ptr) {
       component_ptr = component_result_ptr;
       component_length_ptr = size;

@@ -68,8 +68,8 @@ bool UWPWindow::OpenImpl() {
   }
 
   WindowDestructionReceiver destruction_receiver(this);
-  OnActualSizeUpdate(width, height,
-                     destruction_receiver);  
+  OnActualSizeUpdate(width, height, WindowResizeAction::kManual,
+                    destruction_receiver);
   return true; 
 }
 
@@ -78,7 +78,14 @@ void UWPWindow::RequestPaintImpl() {
   OnPaint(); 
 }
 
-void UWPWindow::RequestCloseImpl() {}
+void UWPWindow::RequestCloseImpl() {
+  WindowDestructionReceiver destruction_receiver(this);
+  OnBeforeClose(destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyed()) {
+    return;
+  }
+  OnAfterClose();
+}
 
 void UWPWindow::FocusImpl() {}
 

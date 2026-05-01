@@ -14,14 +14,13 @@
 
 #undef CreateFile
 
-#include "xenia/base/platform.h"
-#if XE_PLATFORM_WINRT
-#include "xenia-canary-uwp/UWPUtil.h"
-#endif
-
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
+#if XE_PLATFORM_WINRT
+#include <fileapifromapp.h>
+#include "xenia-canary-uwp/UWPUtil.h"
+#endif
 #include "xenia/base/string.h"
 
 namespace xe {
@@ -43,6 +42,7 @@ std::filesystem::path to_path(const std::u16string_view source) {
 }
 
 namespace filesystem {
+
 std::filesystem::path GetExecutablePath() {
   wchar_t* path;
   auto error = _get_wpgmptr(&path);
@@ -50,11 +50,11 @@ std::filesystem::path GetExecutablePath() {
 }
 
 std::filesystem::path GetExecutableFolder() {
-  #if XE_PLATFORM_WINRT
+#if XE_PLATFORM_WINRT
   return UWP::GetLocalState();
-  #else
+#else
   return GetExecutablePath().parent_path();
-  #endif
+#endif
 }
 
 std::filesystem::path GetUserFolder() {
@@ -68,14 +68,18 @@ std::filesystem::path GetUserFolder() {
     result.assign(path);
     CoTaskMemFree(path);
   }
-
-  return path;
+  return result;
 #endif
 }
 
 bool CreateEmptyFile(const std::filesystem::path& path) {
+#if XE_PLATFORM_WINRT
+  auto handle = CreateFileFromAppW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
   auto handle = CreateFileW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
+#endif
   if (handle == INVALID_HANDLE_VALUE) {
     return false;
   }
@@ -206,7 +210,11 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   // We assume we've already created the file in the caller.
   DWORD creation_disposition = OPEN_EXISTING;
+#if XE_PLATFORM_WINRT
+  HANDLE handle = CreateFileFromAppW(
+#else
   HANDLE handle = CreateFileW(
+#endif
       path.c_str(), open_access, share_mode, nullptr, creation_disposition,
       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {

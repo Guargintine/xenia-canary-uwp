@@ -60,7 +60,7 @@ class NetplaySettingsDialog final : public ui::ImGuiDialog {
 
   bool dialog_opened_ = false;
 
-  int selected_interface_index_ = 0;
+  size_t selected_interface_index_ = 0;
   const char* selected_network_interface_item_ = nullptr;
   std::vector<std::string> network_interfaces_;
   std::unordered_map<std::string, std::string> network_interface_guids_;

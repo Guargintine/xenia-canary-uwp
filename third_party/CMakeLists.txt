@@ -134,6 +134,14 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   )
 endif()
 
+# Discord desktop IPC and registry registration are outside the UWP app
+# container. Keep the shared presence model and invite decoding linked, while
+# providing an inert transport on UWP only.
+if(XENIA_BUILD_UWP)
+  set_property(TARGET discord-rpc PROPERTY SOURCES
+    ${PROJECT_SOURCE_DIR}/xenia-canary-uwp/discord_rpc_uwp.cc)
+endif()
+
 # ==============================================================================
 # fmt
 # ==============================================================================
@@ -836,11 +844,34 @@ file(GLOB_RECURSE CURL_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/libcurl/lib/**.h"
 )
 add_library(libcurl STATIC ${CURL_SOURCES})
-target_link_libraries(libcurl PRIVATE crypt32 secur32)
 target_include_directories(libcurl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libcurl/lib ${CMAKE_CURRENT_SOURCE_DIR}/libcurl/include)
-target_compile_definitions(libcurl PRIVATE
-  BUILDING_LIBCURL HTTP_ONLY USE_SCHANNEL USE_WINDOWS_SSPI
-)
+target_compile_definitions(libcurl PRIVATE BUILDING_LIBCURL HTTP_ONLY)
+if(XENIA_BUILD_UWP)
+  # SSPI/Schannel is unavailable in the UWP API partition. wolfSSL retains
+  # HTTPS with Windows certificate trust and the system BCrypt entropy source.
+  set(BUILD_SHARED_LIBS OFF)
+  set(WOLFSSL_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(WOLFSSL_CRYPT_TESTS OFF CACHE BOOL "" FORCE)
+  set(WOLFSSL_OPENSSLEXTRA ON CACHE BOOL "" FORCE)
+  set(WOLFSSL_TLSX ON CACHE BOOL "" FORCE)
+  set(WOLFSSL_SNI ON CACHE BOOL "" FORCE)
+  set(WOLFSSL_SYS_CA_CERTS ON CACHE BOOL "" FORCE)
+  set(WOLFSSL_BUILD_OUT_OF_TREE ON CACHE BOOL "" FORCE)
+  set(WARNING_C_FLAGS "")
+  add_subdirectory(wolfssl)
+  target_compile_definitions(wolfssl PUBLIC
+    NO_WOLFSSL_DIR WOLFSSL_SP_NO_DYN_STACK)
+  target_sources(wolfssl PRIVATE ${PROJECT_SOURCE_DIR}/xenia-canary-uwp/wolfssl_rng_uwp.c)
+  target_compile_definitions(wolfssl PRIVATE CUSTOM_RAND_GENERATE_SEED=xe_uwp_random_seed)
+  target_compile_options(wolfssl PRIVATE
+    /FI${PROJECT_SOURCE_DIR}/xenia-canary-uwp/wolfssl_rng_uwp.h)
+  target_link_libraries(wolfssl PUBLIC bcrypt crypt32 ws2_32)
+  target_compile_definitions(libcurl PRIVATE USE_WOLFSSL CURL_CA_NATIVE)
+  target_link_libraries(libcurl PRIVATE wolfssl)
+else()
+  target_compile_definitions(libcurl PRIVATE USE_SCHANNEL USE_WINDOWS_SSPI)
+  target_link_libraries(libcurl PRIVATE crypt32 secur32)
+endif()
 
 # ==============================================================================
 # miniupnp

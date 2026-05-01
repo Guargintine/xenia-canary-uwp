@@ -585,7 +585,18 @@ class Win32Thread : public Win32Handle<Thread> {
   }
 
   void Terminate(int exit_code) override {
+#if XE_PLATFORM_WINRT
+    // TerminateThread is not exposed by the app SDK. Guest thread teardown
+    // already uses NT thread semantics, so use the matching runtime export.
+    using NtTerminateThreadFn = LONG(NTAPI*)(HANDLE, LONG);
+    static auto terminate_thread = reinterpret_cast<NtTerminateThreadFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtTerminateThread"));
+    if (!terminate_thread || terminate_thread(handle_, exit_code) < 0) {
+      xe::FatalError("Failed to terminate an emulator host thread.");
+    }
+#else
     TerminateThread(handle_, exit_code);
+#endif
   }
 
  private:

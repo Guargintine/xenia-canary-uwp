@@ -254,6 +254,9 @@ CheckForUpdateInfo Updater::CheckForUpdates(
 
 #ifdef XE_PLATFORM_WIN32
 std::wstring Updater::RunPowershellCommand(const std::string& command) const {
+#if XE_PLATFORM_WINRT
+  return {};
+#else
   std::wstring result;
   std::string ps_command =
       fmt::format("powershell -NoProfile -Command \"{}\"", command);
@@ -271,6 +274,7 @@ std::wstring Updater::RunPowershellCommand(const std::string& command) const {
   }
   _pclose(pipe);
   return result;
+#endif
 }
 
 bool Updater::IsAnotherInstanceRunning() const {
@@ -715,6 +719,11 @@ CommitMessages Updater::ParseCommitMessages(
 }
 
 bool Updater::UpdateAndRestart(const std::filesystem::path& zip_path) {
+#if XE_PLATFORM_WINRT
+  // Packaged apps are updated by installing a package, not replacing the
+  // running executable with a desktop release.
+  return false;
+#else
   std::error_code ec;
 
   if (zip_path.empty()) {
@@ -927,6 +936,7 @@ bool Updater::UpdateAndRestart(const std::filesystem::path& zip_path) {
   execlp("/bin/bash", "/bin/bash", "-c", exec.c_str(), nullptr);
   return false;
 #endif
+#endif  // XE_PLATFORM_WINRT
 }
 
 }  // namespace app

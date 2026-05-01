@@ -52,9 +52,9 @@ class GamercardUI final : public XamDialog {
 
  private:
   void OnDraw(ImGuiIO& io) override;
-  void DrawBaseSettings(ImGuiIO& io);
+  void DrawBaseSettings(ImGuiIO& io, bool draw_header = true);
   void DrawOnlineSettings(ImGuiIO& io);
-  void DrawGpdSettings(ImGuiIO& io);
+  void DrawGpdSettings(ImGuiIO& io, bool draw_header = true);
 
   void LoadGamercardInfo();
   void LoadSetting(UserSettingId setting_id);
@@ -65,7 +65,7 @@ class GamercardUI final : public XamDialog {
 
   void DrawSettingComboBox(UserSettingId setting_id, std::string label,
                            const char* const items[], int item_count,
-                           float alignment);
+                           float alignment, float label_offset = 0.0f);
 
   void DrawInputTextBox(
       std::string label, char* buffer, size_t buffer_size, float alignment,

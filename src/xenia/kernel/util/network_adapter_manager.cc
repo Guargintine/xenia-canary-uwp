@@ -246,10 +246,13 @@ bool NetworkAdapterManager::UpdateNetworkInterface(
 
 // Get the index of the best interface to reach that WAN address
 int32_t NetworkAdapterManager::GetBestInterfaceIfIndex() {
-  const in_addr destAddr = ip_to_in_addr("8.8.8.8");
+  sockaddr_in dest_addr{};
+  dest_addr.sin_family = AF_INET;
+  dest_addr.sin_addr = ip_to_in_addr("8.8.8.8");
 
   DWORD bestIfIndex = -1;
-  DWORD result = GetBestInterface(destAddr.S_un.S_addr, &bestIfIndex);
+  DWORD result = GetBestInterfaceEx(
+      reinterpret_cast<sockaddr*>(&dest_addr), &bestIfIndex);
 
   if (result != NO_ERROR) {
     XELOGI("Error finding best interface: {}", result);

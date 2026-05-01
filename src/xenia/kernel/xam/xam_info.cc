@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <limits>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -372,9 +374,13 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
           kernel_state()->xam_state()->user_tracker()->GetUserTitleInfo(
               profile->xuid(), title_id);
       if (title) {
+        if (title->title_name.size() >= std::numeric_limits<uint32_t>::max()) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
         xe::string_util::copy_and_swap_truncating(
             title_name_ptr, title->title_name, title->title_name.size() + 1);
-        *title_name_length_ptr = title->title_name.size() + 1;
+        *title_name_length_ptr =
+            static_cast<uint32_t>(title->title_name.size() + 1);
         return X_ERROR_SUCCESS;
       }
     }
@@ -383,10 +389,14 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
   std::u16string title_name = xe::to_utf16(
       kernel_state()->emulator()->game_info_database()->GetTitleName());
 
+  if (title_name.size() >= std::numeric_limits<uint32_t>::max()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   xe::string_util::copy_and_swap_truncating(title_name_ptr, title_name,
                                             title_name.size() + 1);
 
-  *title_name_length_ptr = title_name.size() + 1;
+  *title_name_length_ptr = static_cast<uint32_t>(title_name.size() + 1);
 
   return X_ERROR_SUCCESS;
 }

@@ -33,7 +33,7 @@ DECLARE_bool(record_mmio_access_exceptions);
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
 
-DEFINE_bool(enable_host_guest_stack_synchronization, false,
+DEFINE_bool(enable_host_guest_stack_synchronization, !XE_PLATFORM_WINRT,
             "Records entries for guest/host stack mappings at function starts "
             "and checks for reentry at return sites. Has slight performance "
             "impact, but fixes crashes in games that use setjmp/longjmp.",

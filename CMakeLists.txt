@@ -1,4 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
+
+# UWP is configured in a separate build tree because its system ABI and
+# permitted Windows APIs also apply to every static library it links.
+option(XENIA_BUILD_UWP "Build the UWP/Xbox application" OFF)
+if(XENIA_BUILD_UWP)
+  if(NOT CMAKE_HOST_WIN32 OR NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+    message(FATAL_ERROR "XENIA_BUILD_UWP requires a Visual Studio generator on Windows")
+  endif()
+  set(CMAKE_SYSTEM_NAME WindowsStore)
+  set(CMAKE_SYSTEM_VERSION 10.0)
+  set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION "10.0.17134.0")
+endif()
+
 if(APPLE)
   project(xenia LANGUAGES C CXX OBJCXX)
   set(CMAKE_OBJCXX_STANDARD 20)
@@ -36,6 +49,20 @@ message(STATUS "Target architecture: XE_TARGET_AARCH64=${XE_TARGET_AARCH64} XE_T
 # Options
 option(XENIA_BUILD_TESTS "Build test suites" OFF)
 option(XENIA_BUILD_MISC "Build misc subprojects (trace viewers, shader compiler, vfs-dump, demos)" OFF)
+
+if(XENIA_BUILD_UWP)
+  if(NOT XE_TARGET_X86_64 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "The UWP frontend currently supports x64 only")
+  endif()
+  if(XENIA_BUILD_TESTS OR XENIA_BUILD_MISC)
+    message(FATAL_ERROR "Configure desktop tests and tools in a separate build directory")
+  endif()
+  add_compile_definitions(
+    XE_PLATFORM_WINRT=1 WINRT_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000005
+  )
+  include_directories(${PROJECT_SOURCE_DIR}/xenia-canary-uwp)
+endif()
 
 # Toggle profiler
 add_compile_definitions(XE_OPTION_PROFILING=0)
@@ -81,6 +108,15 @@ file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/scratch")
 
 # Python for shader compilation scripts
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+if(XENIA_BUILD_UWP)
+  # xenia-build.py normally creates this header. Direct CMake users need it too.
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/tools/build/generate_version.py ${CMAKE_BINARY_DIR}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+endif()
 
 # Include helpers
 include(cmake/XeniaHelpers.cmake)
@@ -140,9 +176,13 @@ if(MSVC)
   )
 
   # Global Windows system libraries
-  link_libraries(
-    ntdll wsock32 ws2_32 xinput comctl32 shcore shlwapi dxguid bcrypt
-  )
+  if(XENIA_BUILD_UWP)
+    link_libraries(windowsapp ws2_32 xinputuap dxguid bcrypt iphlpapi)
+  else()
+    link_libraries(
+      ntdll wsock32 ws2_32 xinput comctl32 shcore shlwapi dxguid bcrypt
+    )
+  endif()
   # Windows manifest for executables is handled per-target
 
   # --- Per-configuration MSVC flags ---
@@ -325,4 +365,8 @@ add_subdirectory(src/xenia)
 set(CMAKE_FOLDER "")
 
 # Set default startup project for Visual Studio
-set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT xenia-app)
+if(XENIA_BUILD_UWP)
+  set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT xenia-uwp)
+else()
+  set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT xenia-app)
+endif()

@@ -319,7 +319,7 @@ std::optional<X_ONLINE_PRESENCE> FriendsManager::GetFriendPresence(
   char16_t* rich_presence_ptr =
       reinterpret_cast<char16_t*>(presence.wszRichPresence);
 
-  presence.cchRichPresence = rich_presence.size();
+  presence.cchRichPresence = static_cast<uint32_t>(rich_presence.size());
 
   xe::string_util::copy_truncating(rich_presence_ptr, rich_presence,
                                    X_MAX_RICHPRESENCE_SIZE);
@@ -359,7 +359,7 @@ X_ONLINE_FRIEND FriendsManager::GenerateDummyFriend() const {
   xe::string_util::copy_truncating(dummy_friend.Gamertag, gamertag.c_str(),
                                    xe::countof(dummy_friend.Gamertag));
 
-  dummy_friend.cchRichPresence = rich_presence.size();
+  dummy_friend.cchRichPresence = static_cast<uint32_t>(rich_presence.size());
 
   char16_t* rich_presence_ptr =
       reinterpret_cast<char16_t*>(dummy_friend.wszRichPresence);

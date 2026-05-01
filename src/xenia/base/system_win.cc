@@ -21,42 +21,43 @@ void LaunchWebBrowser(const std::string_view url) {
 #if XE_PLATFORM_WINRT
   UWP::LaunchUri(std::string(url));
 #else
-  std::u16string url_u16 = xe::to_utf16(url);
-  std::wstring url_w(url_u16.begin(), url_u16.end());
-
-  std::wstring edge_uri = L"microsoft-edge:" + url_w;
-  ShellExecuteW(nullptr, L"open", edge_uri.c_str(), nullptr, nullptr,
-                SW_SHOWNORMAL);
+  auto wide_url = xe::to_utf16(url);
+  ShellExecuteW(nullptr, L"open", reinterpret_cast<LPCWSTR>(wide_url.c_str()),
+                nullptr, nullptr, SW_SHOWNORMAL);
 #endif
 }
 
 void LaunchFileExplorer(const std::filesystem::path& url) {
-  //ShellExecuteW(nullptr, L"explore", url.c_str(), nullptr, nullptr,
-  //              SW_SHOWNORMAL);
+#if !XE_PLATFORM_WINRT
+  ShellExecuteW(nullptr, L"explore", url.c_str(), nullptr, nullptr,
+                SW_SHOWNORMAL);
+#endif
 }
 
 void ShowSimpleMessageBox(SimpleMessageBoxType type,
                           const std::string_view message) {
-  //const wchar_t* title;
-  //std::u16string wide_message = xe::to_utf16(message);
-  //DWORD type_flags = MB_OK | MB_APPLMODAL | MB_SETFOREGROUND;
-  //switch (type) {
-  //  default:
-  //  case SimpleMessageBoxType::Help:
-  //    title = L"Xenia Help";
-  //    type_flags |= MB_ICONINFORMATION;
-  //    break;
-  //  case SimpleMessageBoxType::Warning:
-  //    title = L"Xenia Warning";
-  //    type_flags |= MB_ICONWARNING;
-  //    break;
-  //  case SimpleMessageBoxType::Error:
-  //    title = L"Xenia Error";
-  //    type_flags |= MB_ICONERROR;
-  //    break;
-  //}
-  //MessageBoxW(nullptr, reinterpret_cast<LPCWSTR>(wide_message.c_str()), title,
-  //            type_flags);
+#if !XE_PLATFORM_WINRT
+  const wchar_t* title;
+  std::u16string wide_message = xe::to_utf16(message);
+  DWORD type_flags = MB_OK | MB_APPLMODAL | MB_SETFOREGROUND;
+  switch (type) {
+    default:
+    case SimpleMessageBoxType::Help:
+      title = L"Xenia Help";
+      type_flags |= MB_ICONINFORMATION;
+      break;
+    case SimpleMessageBoxType::Warning:
+      title = L"Xenia Warning";
+      type_flags |= MB_ICONWARNING;
+      break;
+    case SimpleMessageBoxType::Error:
+      title = L"Xenia Error";
+      type_flags |= MB_ICONERROR;
+      break;
+  }
+  MessageBoxW(nullptr, reinterpret_cast<LPCWSTR>(wide_message.c_str()), title,
+              type_flags);
+#endif
 }
 
 static std::map<const uint32_t, DWORD> xeniaToWindowsPriorityClassMapping = {

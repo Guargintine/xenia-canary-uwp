@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <limits>
 #include <span>
 
 #include "xenia/kernel/xam/apps/xlivebase_app.h"
@@ -2054,6 +2055,10 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
 
   uint32_t server_path_length = 0;
 
+  if (guest_path.size() >= std::numeric_limits<uint32_t>::max()) {
+    return X_E_INVALIDARG;
+  }
+
   if (args->server_path_ptr) {
     const size_t size_bytes = xe::string_util::size_in_bytes(guest_path, true);
 
@@ -2075,7 +2080,7 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
   }
 
   if (args->server_path_length_ptr) {
-    server_path_length = guest_path.size() + 1;
+    server_path_length = static_cast<uint32_t>(guest_path.size() + 1);
 
     xe::store_and_swap<uint32_t>(
         memory_->TranslateVirtual(args->server_path_length_ptr),

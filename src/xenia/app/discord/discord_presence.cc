@@ -19,7 +19,7 @@ extern "C" {
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/base/string.h"
 
-DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
+DEFINE_bool(discord, !XE_PLATFORM_WINRT, "Enable Discord rich presence", "General");
 
 // TODO: This library has been deprecated in favor of Discord's GameSDK.
 namespace xe {

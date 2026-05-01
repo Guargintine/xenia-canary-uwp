@@ -21,8 +21,7 @@
 #include "xenia/ui/graphics_provider.h"
 
 // The test case for AMD is 4D5307E6 (checked in 2018).
-// Should be false for WinRt/Xbox, fixes most games.
-DEFINE_bool(dxbc_switch, false,
+DEFINE_bool(dxbc_switch, !XE_PLATFORM_WINRT,
             "Use switch rather than if for flow control. Turning this off or "
             "on may improve stability, though this heavily depends on the "
             "driver - on AMD, it's recommended to have this set to true, as "

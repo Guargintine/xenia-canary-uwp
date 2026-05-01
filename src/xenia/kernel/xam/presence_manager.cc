@@ -298,7 +298,8 @@ uint32_t PresenceManager::GetSubscribedPeersTotal() const {
 
     if (profile) {
       std::lock_guard<std::mutex> lock(profile->subscriptions_mutex_);
-      total_subscribed_peers += profile->subscriptions_.size();
+      total_subscribed_peers +=
+          static_cast<uint32_t>(profile->subscriptions_.size());
     }
   }
 

@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <future>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -68,6 +69,11 @@
 #elif XE_ARCH_ARM64
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
+
+#if XE_PLATFORM_WINRT
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Storage.Pickers.h>
+#endif
 
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
@@ -498,15 +504,20 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
     return Emulator::FileSignatureType::Unknown;
   }
 
-  const uint64_t file_size = std::filesystem::file_size(path);
+  std::error_code size_error;
+  const uint64_t file_size = std::filesystem::file_size(path, size_error);
   constexpr int64_t header_size = 4;
 
-  if (file_size < header_size) {
+  if (size_error || file_size < header_size) {
+    fclose(file);
     return Emulator::FileSignatureType::Unknown;
   }
 
   char file_magic[header_size];
-  fread(file_magic, sizeof(file_magic), 1, file);
+  if (fread(file_magic, sizeof(file_magic), 1, file) != 1) {
+    fclose(file);
+    return FileSignatureType::Unknown;
+  }
 
   fourcc_t magic_value =
       make_fourcc(file_magic[0], file_magic[1], file_magic[2], file_magic[3]);
@@ -549,8 +560,14 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   }
 
   file = xe::filesystem::OpenFile(path, "rb");
-  xe::filesystem::Seek(file, -header_size, SEEK_END);
-  fread(file_magic, 1, header_size, file);
+  if (!file) {
+    return FileSignatureType::Unknown;
+  }
+  if (!xe::filesystem::Seek(file, -header_size, SEEK_END) ||
+      fread(file_magic, 1, header_size, file) != header_size) {
+    fclose(file);
+    return FileSignatureType::Unknown;
+  }
   fclose(file);
 
   magic_value =
@@ -574,7 +591,8 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   return Emulator::FileSignatureType::Unknown;
 }
 
-Emulator::FileSignatureType GetFileSignature(const std::filesystem::path& path) {
+Emulator::FileSignatureType GetFileSignature(
+    const std::filesystem::path& path) {
   return Emulator::GetFileSignature(path);
 }
 
@@ -937,6 +955,18 @@ X_STATUS Emulator::ProcessContentPackageHeader(
 X_STATUS Emulator::InstallContentPackage(
     const std::filesystem::path& path, ContentInstallEntry& installation_info) {
   installation_info.installation_state_ = InstallState::preparing;
+
+  // Callers may install directly without first presenting the package details.
+  // Populate the current ContentManager installation paths in that case.
+  if (installation_info.data_installation_path_.empty()) {
+    X_STATUS header_result =
+        ProcessContentPackageHeader(path, installation_info);
+    if (XFAILED(header_result)) {
+      installation_info.installation_state_ = InstallState::failed;
+      return header_result;
+    }
+    installation_info.installation_state_ = InstallState::preparing;
+  }
 
   auto package =
       kernel_state_->content_manager()->OpenAndMountPackage(path, "");
@@ -1362,28 +1392,60 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
 
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
+#if XE_PLATFORM_WINRT
+  // Disc swapping is requested by a guest thread. The picker must be created
+  // on the UI thread while the guest waits for its asynchronous result.
+  if (!display_window_ || display_window_->app_context().IsInUIThread()) {
+    return {};
+  }
+  auto result = std::make_shared<std::promise<std::filesystem::path>>();
+  auto future = result->get_future();
+  if (!display_window_->app_context().CallInUIThread([result]() {
+        try {
+          winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+          picker.FileTypeFilter().Append(L"*");
+          picker.PickSingleFileAsync().Completed([result](const auto& operation,
+                                                          const auto&) {
+            try {
+              auto file = operation.GetResults();
+              result->set_value(file
+                                    ? std::filesystem::path(file.Path().c_str())
+                                    : std::filesystem::path());
+            } catch (const winrt::hresult_error&) {
+              result->set_value({});
+            }
+          });
+        } catch (const winrt::hresult_error&) {
+          result->set_value({});
+        }
+      })) {
+    return {};
+  }
+  return future.get();
+#else
   std::filesystem::path path = "";
 
-  //auto file_picker = xe::ui::FilePicker::Create();
-  //file_picker->set_mode(ui::FilePicker::Mode::kOpen);
-  //file_picker->set_type(ui::FilePicker::Type::kFile);
-  //file_picker->set_multi_selection(false);
-  //file_picker->set_title(!window_message.empty() ? window_message
-  //                                               : "Select Content Package");
-  //file_picker->set_extensions({
-  //    {"Supported Files", "*.iso;*.xex;*.xcp;*.*"},
-  //    {"Disc Image (*.iso)", "*.iso"},
-  //    {"Xbox Executable (*.xex)", "*.xex"},
-  //    {"All Files (*.*)", "*.*"},
-  //});
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_multi_selection(false);
+  file_picker->set_title(!window_message.empty() ? window_message
+                                                 : "Select Content Package");
+  file_picker->set_extensions({
+      {"Supported Files", "*.iso;*.xex;*.xcp;*.*"},
+      {"Disc Image (*.iso)", "*.iso"},
+      {"Xbox Executable (*.xex)", "*.xex"},
+      {"All Files (*.*)", "*.*"},
+  });
 
-  //if (file_picker->Show()) {
-  //  auto selected_files = file_picker->selected_files();
-  //  if (!selected_files.empty()) {
-  //    path = selected_files[0];
-  //  }
-  //}
+  if (file_picker->Show()) {
+    auto selected_files = file_picker->selected_files();
+    if (!selected_files.empty()) {
+      path = selected_files[0];
+    }
+  }
   return path;
+#endif
 }
 
 bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
@@ -1502,6 +1564,17 @@ void Emulator::WaitUntilExit() {
     }
   }
 
+#if XE_PLATFORM_WINRT
+  // A restore replaces the main thread inside the loop. Reset title state only
+  // after the final exit, and avoid repeating TerminateTitle's notification.
+  main_thread_ = nullptr;
+  if (is_title_open()) {
+    title_id_ = std::nullopt;
+    title_name_.clear();
+    title_version_.clear();
+    on_terminate();
+  }
+#endif
   on_exit();
 }
 

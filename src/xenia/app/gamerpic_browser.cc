@@ -128,6 +128,11 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
   if (ImGui::BeginPopupModal(
           "Gamerpic Browser", &titles_args_.browser_open,
           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
+    const bool close_requested =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Escape, false));
     CleanupTitleImagesThreads();
 
     // loaded_page_ isn't reliable enough?
@@ -641,6 +646,15 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
 
     DrawGamerpicsBrowser(selected_title_gamerpics_, gamerpic_args_);
 
+    ImGui::Separator();
+    if (ImGui::Button("Close") || close_requested) {
+      titles_args_.browser_open = false;
+      ImGui::CloseCurrentPopup();
+      // Release the browser on the next draw, after the current frame has
+      // finished using its gamerpic textures.
+      ImGui::EndPopup();
+      return;
+    }
     ImGui::EndPopup();
   }
 

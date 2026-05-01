@@ -12,6 +12,11 @@
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/xam/user_settings.h"
 #include "xenia/ui/resources.h"
+#include "xenia/ui/window.h"
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/WinRTKeyboard.h"
+#include "xenia/app/ui_text_effect_helpers.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -27,6 +32,18 @@ void CreateProfileUI::OnDraw(ImGuiIO& io) {
   if (!xeDrawCreateProfile(imgui_drawer(), emulator_, create_profile_args_)) {
     Close();
   }
+}
+
+void CreateProfileUI::OnClose() {
+#if XE_PLATFORM_WINRT
+  // ImGui's current draw commands still reference the guide and gamerpic.
+  // Release them after this frame has been submitted, not when Draw deletes us.
+  auto frame_resources =
+      std::make_shared<CreateProfileUIArgs>(std::move(create_profile_args_));
+  emulator_->display_window()->app_context().CallInUIThreadDeferred(
+      [frame_resources = std::move(frame_resources)]() {});
+#endif
+  XamDialog::OnClose();
 }
 
 void CreateProfileUI::Initialize() {
@@ -66,16 +83,62 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
   auto profile_manager =
       emulator->kernel_state()->xam_state()->profile_manager();
 
+#if XE_PLATFORM_WINRT
+  ImGuiIO& io = ImGui::GetIO();
+  if (!args.guide_background) {
+    args.guide_background =
+        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer);
+  }
+  const ImVec2 panel_size =
+      xe::app::GetGuidePanelSize(args.guide_background, io.DisplaySize.y);
+  const ImVec2 panel_padding = xe::app::GetGuidePanelPadding();
+  const ImVec2 panel_position = ImGui::GetMainViewport()->Pos;
+  ImGui::SetNextWindowPos(panel_position, ImGuiCond_Always);
+  ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, panel_padding);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  const bool visible = ImGui::BeginPopupModal(
+      "Create Profile", &args.dialog_open,
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+          ImGuiWindowFlags_NoBackground);
+  ImGui::PopStyleVar(3);
+  if (!visible) {
+    return false;
+  }
+  auto* draw_list = ImGui::GetWindowDrawList();
+  xe::app::DrawGuidePanelBackground(
+      draw_list, args.guide_background, panel_position,
+      ImVec2(panel_position.x + panel_size.x, panel_position.y + panel_size.y));
+  const auto header = xe::app::DrawOverlayHeader(
+      draw_list, panel_position, panel_size, panel_padding,
+      io.DisplaySize.x / 1024.0f, io.DisplaySize.y / 576.0f, "Create Profile");
+  ImGui::SetCursorScreenPos(
+      ImVec2(panel_position.x + panel_padding.x,
+             header.position.y + header.font_size + 55.0f));
+  if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+    args.dialog_open = false;
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    return false;
+  }
+#else
   if (!ImGui::BeginPopupModal("Create Profile", &args.dialog_open,
                               ImGuiWindowFlags_NoCollapse |
                                   ImGuiWindowFlags_AlwaysAutoResize |
                                   ImGuiWindowFlags_HorizontalScrollbar)) {
     return false;
   }
+#endif
 
   const float window_width = ImGui::GetContentRegionAvail().x;
 
-  float btn_height = 25;
+#if XE_PLATFORM_WINRT
+  const float btn_height = ImGui::GetFrameHeight();
+#else
+  const float btn_height = 25;
+#endif
   float btn_width =
       (window_width * 0.5f) - (ImGui::GetStyle().ItemSpacing.x * 0.5f);
   ImVec2 half_width_btn = ImVec2(btn_width, btn_height);
@@ -103,6 +166,9 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
 
   if (ImGui::IsWindowAppearing()) {
     ImGui::SetKeyboardFocusHere();
+#if XE_PLATFORM_WINRT
+    UWP::ShowKeyboard();
+#endif
   }
 
   ImGui::TextUnformatted("Gamertag:");
@@ -110,6 +176,12 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
   const bool enter_pressed =
       ImGui::InputText("##Gamertag", args.gamertag, sizeof(args.gamertag),
                        ImGuiInputTextFlags_EnterReturnsTrue);
+
+#if XE_PLATFORM_WINRT
+  if (ImGui::IsItemActivated()) {
+    UWP::ShowKeyboard();
+  }
+#endif
 
   if (ImGui::IsItemEdited() || enter_pressed) {
     args.valid_gamertag =

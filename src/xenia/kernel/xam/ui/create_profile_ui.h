@@ -29,6 +29,7 @@ struct CreateProfileUIArgs {
       downloaded_gamerpics;
   std::unique_ptr<xe::ui::ImmediateTexture> big_gamerpic_texture;
   std::optional<GamerPictureKey> gamerpic_key;
+  std::shared_ptr<xe::ui::ImmediateTexture> guide_background;
 };
 
 class CreateProfileUI final : public XamDialog {
@@ -46,6 +47,7 @@ class CreateProfileUI final : public XamDialog {
 
  private:
   void OnDraw(ImGuiIO& io) override;
+  void OnClose() override;
 
   void Initialize();
 

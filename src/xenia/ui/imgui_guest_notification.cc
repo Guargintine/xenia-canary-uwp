@@ -14,7 +14,12 @@
 #include "xenia/ui/imgui_guest_notification.h"
 #include "xenia/ui/imgui_notification.h"
 
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WINRT
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Core.h>
+#include <winrt/Windows.Media.Playback.h>
+#include <winrt/Windows.Storage.h>
+#elif XE_PLATFORM_WIN32
 #include <playsoundapi.h>
 #endif
 
@@ -25,6 +30,29 @@ DEFINE_string(notification_sound_path, "",
 
 namespace xe {
 namespace ui {
+
+#if XE_PLATFORM_WINRT
+namespace {
+winrt::fire_and_forget PlayNotificationSound(std::string path) {
+  try {
+    static winrt::Windows::Media::Playback::MediaPlayer player;
+    if (player.PlaybackSession().PlaybackState() ==
+        winrt::Windows::Media::Playback::MediaPlaybackState::Playing) {
+      co_return;
+    }
+    auto file =
+        co_await winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(
+            winrt::to_hstring(path));
+    player.Source(
+        winrt::Windows::Media::Core::MediaSource::CreateFromStorageFile(file));
+    player.Play();
+  } catch (const winrt::hresult_error& error) {
+    XELOGW("Unable to play notification sound: {}",
+           winrt::to_string(error.message()));
+  }
+}
+}  // namespace
+#endif
 
 ImGuiGuestNotification::ImGuiGuestNotification(ui::ImGuiDrawer* imgui_drawer,
                                                std::string& title,
@@ -46,7 +74,11 @@ void ImGuiGuestNotification::UpdateNotificationState() {
       // TODO(Gliniak): Implement delayed notifications.
       current_stage_ = NotificationStage::FazeIn;
       notification_draw_progress_ = 0.2f;
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WINRT
+      if (!cvars::notification_sound_path.empty()) {
+        PlayNotificationSound(cvars::notification_sound_path);
+      }
+#elif XE_PLATFORM_WIN32
       if (!cvars::notification_sound_path.empty()) {
         auto notification_sound_path = cvars::notification_sound_path;
         if (std::filesystem::exists(notification_sound_path)) {

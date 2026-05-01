@@ -50,7 +50,9 @@ XInputInputDriver::~XInputInputDriver() {
   }
 
 #if XE_PLATFORM_WINRT
-  static_cast<xe::ui::UWPWindow*>(window())->ClearXInputDriver();
+  if (window()) {
+    static_cast<xe::ui::UWPWindow*>(window())->ClearXInputDriver();
+  }
 #endif
 }
 
@@ -89,7 +91,9 @@ X_STATUS XInputInputDriver::Setup() {
   XInputEnable_ = xie;
 
 #if XE_PLATFORM_WINRT
-  static_cast<xe::ui::UWPWindow*>(window())->SetXInputDriver(this);
+  if (window()) {
+    static_cast<xe::ui::UWPWindow*>(window())->SetXInputDriver(this);
+  }
 #endif
 
   return X_STATUS_SUCCESS;

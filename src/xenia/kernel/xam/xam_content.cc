@@ -961,8 +961,8 @@ dword_result_t XamContentGetAttributesInternal_entry(
   info->ftCreationTime = file_info->create_timestamp;
   info->ftLastAccessTime = file_info->access_timestamp;
   info->ftLastWriteTime = file_info->write_timestamp;
-  info->nFileSizeHigh = file_info->total_size >> 32;
-  info->nFileSizeLow = file_info->total_size;
+  info->nFileSizeHigh = static_cast<uint32_t>(file_info->total_size >> 32);
+  info->nFileSizeLow = static_cast<uint32_t>(file_info->total_size);
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, 0);

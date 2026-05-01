@@ -89,7 +89,8 @@ X_RESULT ContentPackageDirectory::SetThumbnail(
   memcpy(header_.content_metadata.thumbnail, thumbnail.data(),
          std::min(thumbnail.size(), max_thumbnail_size));
 
-  header_.content_metadata.thumbnail_size = thumbnail.size();
+  header_.content_metadata.thumbnail_size =
+      static_cast<uint32_t>(thumbnail.size());
   return X_ERROR_SUCCESS;
 }
 

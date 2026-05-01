@@ -12,6 +12,7 @@
 #include <array>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
@@ -30,6 +31,30 @@
 namespace xe {
 namespace kernel {
 namespace xam {
+
+#if XE_PLATFORM_WINRT
+namespace {
+// Read-only fallback for packaged files that UWP cannot memory-map. Writable
+// packages must use a real mapping so upstream profile/save writes reach disk.
+class BufferedPackageMemory final : public MappedMemory {
+ public:
+  explicit BufferedPackageMemory(std::vector<uint8_t> buffer)
+      : buffer_(std::move(buffer)) {
+    data_ = buffer_.data();
+    size_ = buffer_.size();
+  }
+
+  void Close(uint64_t truncate_size = 0) override {
+    buffer_.clear();
+    data_ = nullptr;
+    size_ = 0;
+  }
+
+ private:
+  std::vector<uint8_t> buffer_;
+};
+}  // namespace
+#endif
 
 ContentPackageContainer::ContentPackageContainer(
     vfs::VirtualFileSystem* file_system, const std::string_view device_path,
@@ -81,6 +106,26 @@ bool ContentPackageContainer::LoadPackage(
   }
 
   package_ = xe::MappedMemory::Open(package_path, open_mode);
+#if XE_PLATFORM_WINRT
+  if (!package_ && open_mode == MappedMemory::Mode::kRead) {
+    auto file = filesystem::FileHandle::OpenExisting(
+        package_path, filesystem::FileAccess::kGenericRead);
+    if (file) {
+      std::error_code size_error;
+      const auto file_size =
+          std::filesystem::file_size(package_path, size_error);
+      if (!size_error) {
+        std::vector<uint8_t> buffer(static_cast<size_t>(file_size));
+        size_t bytes_read = 0;
+        if (file->Read(0, buffer.data(), buffer.size(), &bytes_read) &&
+            bytes_read == buffer.size()) {
+          package_ = std::make_unique<BufferedPackageMemory>(std::move(buffer));
+          XELOGW("Using buffered package reads for {} on UWP", package_path);
+        }
+      }
+    }
+  }
+#endif
 
   if (!package_) {
     return false;
@@ -191,7 +236,8 @@ X_RESULT ContentPackageContainer::SetThumbnail(
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
 
-  header_.content_metadata.thumbnail_size = thumbnail.size();
+  header_.content_metadata.thumbnail_size =
+      static_cast<uint32_t>(thumbnail.size());
   memcpy(header_.content_metadata.thumbnail, thumbnail.data(),
          thumbnail.size());
   return X_ERROR_SUCCESS;

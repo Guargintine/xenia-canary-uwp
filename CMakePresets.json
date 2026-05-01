@@ -39,6 +39,22 @@
       "cacheVariables": {
         "CMAKE_SYSTEM_PROCESSOR": "ARM64"
       }
+    },
+    {
+      "name": "uwp",
+      "displayName": "UWP / Xbox (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "binaryDir": "${sourceDir}/build/uwp",
+      "cacheVariables": {
+        "XENIA_BUILD_UWP": "ON",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+      }
     }
   ],
   "buildPresets": [
@@ -89,6 +105,14 @@
       "name": "vs-arm64-checked",
       "configurePreset": "vs-arm64",
       "configuration": "Checked"
+    },
+    {
+      "name": "uwp-release",
+      "configurePreset": "uwp",
+      "configuration": "Release",
+      "targets": [
+        "xenia-uwp"
+      ]
     }
   ]
 }

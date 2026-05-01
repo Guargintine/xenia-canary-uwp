@@ -48,6 +48,13 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
   if (ImGui::BeginPopupModal(
           "Netplay Settings", &dialog_opened_,
           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+    // Capture this before drawing nested popups so their Back action cannot
+    // also dismiss the settings window in the same frame.
+    const bool close_requested =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Escape, false));
     ImGui::SetWindowFontScale(1.05f);
 
     const auto emulator = emulator_window_->emulator();
@@ -367,12 +374,16 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
 
     ImGui::SetWindowFontScale(1.0f);
 
+    ImGui::Separator();
+    if (ImGui::Button("Close") || close_requested) {
+      dialog_opened_ = false;
+      ImGui::CloseCurrentPopup();
+    }
     ImGui::EndPopup();
   }
 
   if (!dialog_opened_) {
     Close();
-    ImGui::CloseCurrentPopup();
     emulator_window_->ToggleNetplaySettingsDialog();
   }
 }
@@ -397,7 +408,8 @@ void NetplaySettingsDialog::UpdateSelectedInterfaceItemAndIndex() {
       guid_keys, network_adapter_manager_->GetSelectedAdapaterGUID());
 
   if (it != guid_keys.end()) {
-    selected_interface_index_ = std::distance(guid_keys.begin(), it);
+    selected_interface_index_ =
+        static_cast<size_t>(std::distance(guid_keys.begin(), it));
     selected_network_interface_item_ = network_interface_guids_.at(*it).c_str();
   } else {
     selected_interface_index_ = 0;
@@ -488,9 +500,11 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
   if (ImGui::BeginPopupModal(
           "Netplay Status", &dialog_opened_,
           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
-    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
-      ImGui::CloseCurrentPopup();
-    }
+    const bool close_requested =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+        (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Escape, false));
 
     ImGui::SetWindowFontScale(1.10f);
 
@@ -569,12 +583,16 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
 
     ImGui::SetWindowFontScale(1.0f);
 
+    ImGui::Separator();
+    if (ImGui::Button("Close") || close_requested) {
+      dialog_opened_ = false;
+      ImGui::CloseCurrentPopup();
+    }
     ImGui::EndPopup();
   }
 
   if (!dialog_opened_) {
     Close();
-    ImGui::CloseCurrentPopup();
     emulator_window_->ToggleNetplayStatusDialog();
   }
 }
