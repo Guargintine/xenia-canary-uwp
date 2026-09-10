@@ -673,6 +673,8 @@ dword_result_t xeXamContentDelete(dword_t user_index, lpvoid_t content_data_ptr,
   XCONTENT_DATA_AGGREGATE content_data = *content_data_ptr.as<XCONTENT_DATA*>();
   if (content_data_size == sizeof(XCONTENT_DATA_AGGREGATE)) {
     content_data = *content_data_ptr.as<XCONTENT_DATA_AGGREGATE*>();
+  } else if (content_data_size == sizeof(XCONTENT_DATA_INTERNAL)) {
+    content_data = *content_data_ptr.as<XCONTENT_DATA_INTERNAL*>();
   }
 
   if (user_index != XUserIndexNone) {
