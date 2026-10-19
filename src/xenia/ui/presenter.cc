@@ -15,9 +15,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/ui/window.h"
 
-#if XE_PLATFORM_WINRT
-#include "xenia-canary-uwp/UWPUtil.h"
-#elif XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
 #include "xenia/ui/window_win.h"
 #endif
 
@@ -242,9 +240,6 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   // reconnect).
   bool draw_ui = !ui_drawers_.empty();
   bool do_paint = force_paint || draw_ui;
-#if XE_PLATFORM_WINRT
-  UWP::SetUIOpen(draw_ui);
-#endif
   // Reset ui_thread_paint_requested_ unconditionally also, regardless of
   // whether the UI needs to be drawn - the flag may be set to try reconnecting,
   // for example.
@@ -401,6 +396,11 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {
+  }
+  if (is_active) {
+    // Publish the sequence after the mailbox so a reader observing a new
+    // sequence can acquire its corresponding image (or a newer one).
+    guest_output_refresh_count_.fetch_add(1, std::memory_order_release);
   }
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in

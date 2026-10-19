@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "third_party/stb/stb_image.h"
+#include "xenia/app/frontend_theme.h"
 #include "xenia/base/cvar.h"
 #include "xenia/ui/imgui_drawer.h"
 
@@ -234,7 +235,7 @@ inline ImVec4 GetConfiguredUIAccentColor(float alpha = 1.0f) {
   if (accent == "yellow") {
     return ImVec4(214.0f / 255.0f, 195.0f / 255.0f, 82.0f / 255.0f, alpha);
   }
-  if (accent == "grey") {
+  if (accent == "grey" || accent == "silver") {
     return ImVec4(215.0f / 255.0f, 217.0f / 255.0f, 219.0f / 255.0f, alpha);
   }
   if (accent == "black") {
@@ -247,8 +248,9 @@ inline ImVec4 GetConfiguredUIAccentColor(float alpha = 1.0f) {
 }
 
 inline bool UseDarkAccentComboText() {
-  return ui_text_effect_helpers::GetStringConfigValue("ui_border_color", "green") ==
-         "white";
+  const std::string accent =
+      ui_text_effect_helpers::GetStringConfigValue("ui_border_color", "green");
+  return accent == "white" || accent == "grey" || accent == "silver";
 }
 
 struct ScopedAccentComboStyle {
@@ -371,13 +373,17 @@ inline bool DrawTextEffectButton(const char* label,
   ImVec2 button_min = ImGui::GetItemRectMin();
   ImVec2 button_max = ImGui::GetItemRectMax();
   ImGui::PopStyleColor();
-  const ImVec2 label_size = ImGui::CalcTextSize(label);
+  const std::string visible_label = std::string(label).substr(0, std::string(label).find("##"));
+  const ImVec2 label_size = ImGui::CalcTextSize(visible_label.c_str());
   const ImVec2 label_pos(
       button_min.x + (button_max.x - button_min.x - label_size.x) * 0.5f,
       button_min.y + (button_max.y - button_min.y - label_size.y) * 0.5f);
-  DrawTextWithConfiguredEffect(ImGui::GetWindowDrawList(), ImGui::GetFont(),
+  auto* draw_list = ImGui::GetWindowDrawList();
+  draw_list->PushClipRect(button_min, button_max, true);
+  DrawTextWithConfiguredEffect(draw_list, ImGui::GetFont(),
                                ImGui::GetFontSize(), label_pos,
-                               ImGui::GetColorU32(ImGuiCol_Text), label);
+                               ImGui::GetColorU32(ImGuiCol_Text), visible_label.c_str());
+  draw_list->PopClipRect();
   return pressed;
 }
 
@@ -435,7 +441,9 @@ inline std::string GetClockString() {
 
 inline std::shared_ptr<ui::ImmediateTexture> LoadOverlayTexture(
     ui::ImGuiDrawer* imgui_drawer, const char* asset_path, bool transparent) {
-  if (!imgui_drawer || !asset_path || !std::filesystem::exists(asset_path)) {
+  std::error_code ec;
+  if (!imgui_drawer || !asset_path ||
+      !std::filesystem::exists(asset_path, ec)) {
     return nullptr;
   }
   auto* drawer = imgui_drawer->GetImmediateDrawer();
@@ -466,59 +474,58 @@ inline std::shared_ptr<ui::ImmediateTexture> LoadOverlayTexture(
   return std::shared_ptr<ui::ImmediateTexture>(texture.release());
 }
 
-inline std::string ResolveConfiguredGuideBackgroundAssetPath(
-    bool prefer_wide = false) {
-  std::string guide_name =
-      ui_text_effect_helpers::GetStringConfigValue("ui_guide_image", "blades.png");
-  if (guide_name.empty() || guide_name.find('.') == std::string::npos) {
-    guide_name = "blades.png";
+inline std::string ResolveConfiguredThemeAssetPath(ThemeAsset asset,
+                                                   const char* color_cvar) {
+  const std::string color =
+      ui_text_effect_helpers::GetStringConfigValue(color_cvar, "green");
+  const std::string path = ThemeAssetPath(asset, color);
+  std::error_code ec;
+  if (std::filesystem::exists(path, ec)) {
+    return path;
   }
-
-  const auto has_suffix = [](const std::string& value,
-                             const std::string& suffix) {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) ==
-               0;
-  };
-
-  std::filesystem::path guide_path(guide_name);
-  std::string guide_stem = guide_path.stem().string();
-  std::string guide_ext = guide_path.extension().string();
-  if (guide_ext.empty()) {
-    guide_ext = ".png";
-  }
-
-  std::vector<std::string> guide_asset_candidates;
-  if (prefer_wide) {
-    if (has_suffix(guide_stem, "_wide") || has_suffix(guide_stem, "-wide")) {
-      guide_asset_candidates.push_back(guide_name);
-    } else {
-      guide_asset_candidates.push_back(guide_stem + "_wide" + guide_ext);
-      guide_asset_candidates.push_back(guide_stem + "-wide" + guide_ext);
-    }
-    guide_asset_candidates.push_back("blades_wide.png");
-    guide_asset_candidates.push_back("guide-wide.png");
-  }
-
-  guide_asset_candidates.push_back(guide_name);
-  guide_asset_candidates.push_back("blades.png");
-
-  for (const auto& candidate : guide_asset_candidates) {
-    std::string candidate_path = "Assets/guide_images/" + candidate;
-    if (std::filesystem::exists(candidate_path)) {
-      return candidate_path;
-    }
-  }
-
-  return "Assets/search.png";
+  return ThemeAssetPath(asset, "green");
 }
 
-inline std::shared_ptr<ui::ImmediateTexture> LoadConfiguredGuideBackgroundTexture(
-    ui::ImGuiDrawer* imgui_drawer, bool prefer_wide = false) {
+inline std::string ResolveConfiguredGuideBackgroundAssetPath(
+    bool prefer_wide = false) {
+  return ResolveConfiguredThemeAssetPath(
+      prefer_wide ? ThemeAsset::kWideGuide : ThemeAsset::kGuide,
+      "ui_guide_color");
+}
+
+inline std::shared_ptr<ui::ImmediateTexture>
+LoadConfiguredGuideBackgroundTexture(ui::ImGuiDrawer* imgui_drawer,
+                                     bool prefer_wide = false) {
   const std::string guide_asset_path =
       ResolveConfiguredGuideBackgroundAssetPath(prefer_wide);
   return LoadOverlayTexture(imgui_drawer, guide_asset_path.c_str(), true);
 }
+
+class GuideBackgroundTextureCache {
+ public:
+  std::shared_ptr<ui::ImmediateTexture> Get(ui::ImGuiDrawer* imgui_drawer,
+                                            bool prefer_wide = false) {
+    if (!imgui_drawer) {
+      return nullptr;
+    }
+    auto* drawer = imgui_drawer->GetImmediateDrawer();
+    const std::string path =
+        ResolveConfiguredGuideBackgroundAssetPath(prefer_wide);
+    if (!texture_ || drawer_ != drawer || path_ != path) {
+      imgui_drawer->RetainTextureForFrame(texture_);
+      texture_ = LoadOverlayTexture(imgui_drawer, path.c_str(), true);
+      drawer_ = drawer;
+      path_ = path;
+    }
+    imgui_drawer->RetainTextureForFrame(texture_);
+    return texture_;
+  }
+
+ private:
+  std::shared_ptr<ui::ImmediateTexture> texture_;
+  ui::ImmediateDrawer* drawer_ = nullptr;
+  std::string path_;
+};
 
 inline std::shared_ptr<ui::ImmediateTexture> LoadButtonTexture(
     ui::ImGuiDrawer* imgui_drawer, char button) {

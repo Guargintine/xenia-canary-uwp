@@ -70,7 +70,7 @@ X_STATUS ContentManager::ExtractContentHeader(
 }
 
 std::unique_ptr<ContentPackage> ContentManager::OpenPackage(
-    const std::filesystem::path host_path) {
+    const std::filesystem::path host_path, bool read_only) {
   const std::string device_path = GeneratePackageDevicePath(host_path);
 
   if (std::filesystem::is_directory(host_path)) {
@@ -78,7 +78,7 @@ std::unique_ptr<ContentPackage> ContentManager::OpenPackage(
         kernel_state_->file_system(), device_path, host_path);
   } else {
     auto package = std::make_unique<ContentPackageContainer>(
-        kernel_state_->file_system(), device_path, host_path);
+        kernel_state_->file_system(), device_path, host_path, read_only);
 
     return package->IsValidPackage() ? std::move(package) : nullptr;
   }
@@ -111,10 +111,10 @@ std::unique_ptr<ContentPackage> ContentManager::CreatePackage(
 
 ContentPackage* ContentManager::OpenAndMountPackage(
     const std::filesystem::path host_path, const std::string_view root_name,
-    const std::string_view root_path) {
+    const std::string_view root_path, bool read_only) {
   auto global_lock = global_critical_region_.Acquire();
 
-  return MountPackage(root_name, OpenPackage(host_path), root_path);
+  return MountPackage(root_name, OpenPackage(host_path, read_only), root_path);
 }
 
 ContentPackage* ContentManager::CreateAndMountPackage(
@@ -291,7 +291,7 @@ std::vector<XCONTENT_DATA_INTERNAL> ContentManager::ListContent(
 
       for (const auto& file_info : file_infos) {
         if (std::unique_ptr<ContentPackage> package =
-                OpenPackage(file_info.path / file_info.name)) {
+                OpenPackage(file_info.path / file_info.name, true)) {
           result.emplace_back(package->GetContentMetadata());
         }
       }
@@ -354,7 +354,7 @@ std::vector<XCONTENT_DATA_INTERNAL> ContentManager::ListContent(
 
         for (const auto& file_info : file_infos) {
           if (std::unique_ptr<ContentPackage> package =
-                  OpenPackage(file_info.path / file_info.name)) {
+                  OpenPackage(file_info.path / file_info.name, true)) {
             if (!package->IsValidPackage()) {
               continue;
             }

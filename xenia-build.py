@@ -168,12 +168,19 @@ def import_vs_environment():
     install_path = None
     env_tool_args = None
 
+    # Relative to this script, so it does not depend on the working directory.
+    vswhere_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "tools", "vswhere",
+        "vswhere.exe")
     vswhere = subprocess.check_output(
-        "tools/vswhere/vswhere.exe -version \"[17,)\" -latest -prerelease -format json -utf8 -products"
-        " Microsoft.VisualStudio.Product.Enterprise"
-        " Microsoft.VisualStudio.Product.Professional"
-        " Microsoft.VisualStudio.Product.Community"
-        " Microsoft.VisualStudio.Product.BuildTools",
+        [
+            vswhere_path, "-version", "[17,)", "-latest", "-prerelease",
+            "-format", "json", "-utf8", "-products",
+            "Microsoft.VisualStudio.Product.Enterprise",
+            "Microsoft.VisualStudio.Product.Professional",
+            "Microsoft.VisualStudio.Product.Community",
+            "Microsoft.VisualStudio.Product.BuildTools",
+        ],
         encoding="utf-8",
     )
     if vswhere:

@@ -32,7 +32,91 @@ DECLARE_int32(discord_presence_user_index);
 namespace xe {
 namespace app {
 
+namespace {
+struct NetplayStatusText {
+  const char* mode;
+  const char* api;
+  const char* services;
+  const char* upnp;
+  bool failed = false;
+};
+
+NetplayStatusText GetNetplayStatusText(Emulator* emulator) {
+  NetplayStatusText status{};
+  const auto api = emulator->GetXboxLiveAPI();
+  const auto state = api->GetInitState();
+  switch (cvars::network_mode) {
+    case kernel::NETWORK_MODE::OFFLINE:
+      status.mode = "Offline";
+      break;
+    case kernel::NETWORK_MODE::LAN:
+      status.mode = "System Link";
+      break;
+    default:
+      status.mode = "Xbox Live";
+      break;
+  }
+  if (cvars::network_mode == kernel::NETWORK_MODE::OFFLINE) {
+    status.services = "Disabled (offline mode)";
+    status.api = "Not used in offline mode";
+  } else if (!api->HasInitializationStarted()) {
+    status.services = "Not started (launch a game)";
+    status.api = "Not checked by game services";
+  } else if (state == kernel::XLiveAPI::InitState::Pending) {
+    status.services = "Initializing";
+    status.api = "Checking connection";
+  } else if (state == kernel::XLiveAPI::InitState::Success) {
+    status.services = "Ready";
+    status.api = "Last connection check succeeded";
+  } else {
+    status.services = "Initialization failed";
+    status.api = "Last connection check failed";
+    status.failed = true;
+  }
+
+  const auto upnp = emulator->GetUPnP();
+  if (!cvars::upnp) {
+    status.upnp = "Disabled in settings";
+  } else if (!upnp) {
+    status.upnp = "Unavailable";
+  } else if (upnp->IsActive()) {
+    status.upnp = "Router found";
+  } else {
+    switch (upnp->GetDiscoveryState()) {
+      case kernel::UPnP::DiscoveryState::NotStarted:
+        status.upnp = "Enabled; discovery not started";
+        break;
+      case kernel::UPnP::DiscoveryState::Searching:
+        status.upnp = "Searching for a router";
+        break;
+      case kernel::UPnP::DiscoveryState::DeviceFound:
+        status.upnp = "Router found (starts when a game launches)";
+        break;
+      case kernel::UPnP::DiscoveryState::Failed:
+        status.upnp = "No compatible router found";
+        break;
+    }
+  }
+  return status;
+}
+}  // namespace
+
+#if XE_PLATFORM_WINRT
+namespace {
+bool GuideActivationReleased() {
+  return !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) &&
+         !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+         !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) &&
+         !ImGui::IsKeyDown(ImGuiKey_Space) &&
+         !ImGui::IsMouseDown(ImGuiMouseButton_Left);
+}
+}  // namespace
+#endif
+
 void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  OnDrawGuide();
+#else
   if (!dialog_opened_) {
     dialog_opened_ = true;
     ImGui::OpenPopup("Netplay Settings");
@@ -386,7 +470,344 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
     Close();
     emulator_window_->ToggleNetplaySettingsDialog();
   }
+#endif
 }
+
+#if XE_PLATFORM_WINRT
+void NetplaySettingsDialog::OpenGuidePage(GuidePage page) {
+  guide_page_ = page;
+  guide_focus_requested_ = true;
+  guide_activation_armed_ = false;
+}
+
+void NetplaySettingsDialog::GoBackGuidePage() {
+  OpenGuidePage(guide_page_ == GuidePage::kAddressActions
+                    ? GuidePage::kAddAPIAddress
+                    : GuidePage::kSettings);
+}
+
+void NetplaySettingsDialog::OnDrawGuide() {
+  if (!dialog_opened_) {
+    dialog_opened_ = true;
+    ImGui::OpenPopup("Netplay Settings");
+  }
+
+  if (BeginGuidePopup("Netplay Settings", &dialog_opened_, guide_dialog_state_,
+                      imgui_drawer())) {
+    // Handle Back before controls so each press returns only one page.
+    const bool back_requested = ConsumeGuideBackPress();
+    bool close_requested = false;
+    if (back_requested) {
+      if (guide_page_ == GuidePage::kSettings) {
+        close_requested = true;
+      } else {
+        GoBackGuidePage();
+      }
+    }
+
+    if (!guide_activation_armed_ && GuideActivationReleased()) {
+      guide_activation_armed_ = true;
+    }
+    const bool focus_requested =
+        guide_focus_requested_ && guide_activation_armed_;
+    if (focus_requested) {
+      guide_focus_requested_ = false;
+    }
+    const auto xlive_api =
+        emulator_window_->emulator()->kernel_state()->GetXboxLiveAPI();
+    const bool updatable =
+        xlive_api->GetInitState() == kernel::XLiveAPI::InitState::Pending;
+    const bool is_default =
+        selected_api_address_item_ == xlive_api->GetDefaultPublicServer();
+
+    // Reset scroll position when returning to a page.
+    if (focus_requested) {
+      ImGui::SetScrollY(0.0f);
+    }
+
+    ImGui::BeginDisabled(!guide_activation_armed_);
+    switch (guide_page_) {
+      case GuidePage::kSettings: {
+        ImGui::TextUnformatted("API Address");
+        ImGui::TextWrapped("%s", selected_api_address_item_
+                                     ? selected_api_address_item_
+                                     : "Unspecified API Address");
+        ImGui::BeginDisabled(!updatable);
+        if (focus_requested && updatable) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Change API Address")) {
+          OpenGuidePage(GuidePage::kAPIAddresses);
+        }
+        ImGui::EndDisabled();
+        if (!updatable) {
+          ImGui::TextWrapped(
+              "The API address cannot be changed while playing.");
+        }
+        if (focus_requested && !updatable) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Add API Address")) {
+          OpenGuidePage(GuidePage::kAddAPIAddress);
+        }
+        ImGui::BeginDisabled(!updatable || is_default);
+        if (GuideButton("Remove API Address")) {
+          OpenGuidePage(GuidePage::kRemoveAPIAddress);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        ImGui::Text("Network Mode: %s",
+                    selected_network_mode_index_ >= 0 &&
+                            selected_network_mode_index_ <
+                                static_cast<int>(std::size(network_modes_))
+                        ? network_modes_[selected_network_mode_index_]
+                        : "Unspecified");
+        if (GuideButton("Change Network Mode")) {
+          OpenGuidePage(GuidePage::kNetworkModes);
+        }
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Network Interface");
+        ImGui::TextWrapped("%s", selected_network_interface_item_
+                                     ? selected_network_interface_item_
+                                     : "Unspecified Network");
+        ImGui::BeginDisabled(!updatable);
+        if (GuideButton("Change Network Interface")) {
+          OpenGuidePage(GuidePage::kNetworkInterfaces);
+        }
+        ImGui::EndDisabled();
+        if (!updatable) {
+          ImGui::TextWrapped(
+              "The network interface cannot be changed while playing.");
+        }
+        if (GuideButton("Refresh Interfaces")) {
+          network_adapter_manager_->Initialize();
+          RefreshInterfaces();
+        }
+        ImGui::BeginDisabled(!updatable);
+        if (GuideButton("Reset Network Interface")) {
+          network_adapter_manager_->SelectBestInterface();
+          RefreshInterfaces();
+        }
+        if (ImGui::Checkbox("Bind Interface", &bind_interface_)) {
+          xlive_api->SetBindInterface(bind_interface_);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Auto Check for Updates",
+                            &auto_check_for_updates_)) {
+          emulator_window_->SetAutoCheckForUpdates(auto_check_for_updates_);
+        }
+        if (ImGui::Checkbox("NET Logging", &logging_)) {
+          xlive_api->SetLogging(logging_);
+        }
+        if (ImGui::Checkbox("XHTTP", &xhttp_)) {
+          xlive_api->SetXHttp(xhttp_);
+        }
+        break;
+      }
+      case GuidePage::kAPIAddresses: {
+        ImGui::TextUnformatted("Choose API Address");
+        const bool selected_address_present =
+            selected_api_address_item_ &&
+            std::ranges::find(api_addresses_, selected_api_address_item_) !=
+                api_addresses_.end();
+        ImGui::BeginDisabled(!updatable);
+        for (size_t index = 0; index < api_addresses_.size(); ++index) {
+          const auto& address = api_addresses_[index];
+          const bool selected = selected_api_address_item_ &&
+                                selected_api_address_item_ == address;
+          ImGui::PushID(static_cast<int>(index));
+          ImGui::TextWrapped("%s", address.c_str());
+          if (focus_requested && updatable &&
+              (selected || (!selected_address_present && index == 0))) {
+            ImGui::SetKeyboardFocusHere();
+          }
+          if (GuideButton(selected ? "Selected Address" : "Use Address")) {
+            selected_api_address_item_ = address.c_str();
+            xlive_api->SetAPIAddress(selected_api_address_item_);
+            xlive_api->StartWhoamiAsync();
+            OpenGuidePage(GuidePage::kSettings);
+          }
+          ImGui::PopID();
+          ImGui::Spacing();
+        }
+        ImGui::EndDisabled();
+        if (!updatable) {
+          ImGui::TextWrapped(
+              "The API address cannot be changed while playing.");
+        }
+        if (focus_requested && (!updatable || api_addresses_.empty())) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Back")) {
+          GoBackGuidePage();
+        }
+        break;
+      }
+      case GuidePage::kAddAPIAddress: {
+        ImGui::TextUnformatted("Add API Address");
+        ImGui::TextWrapped("Enter the address of the Netplay service.");
+        if (focus_requested) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(GuideContentWidth());
+        const bool enter_pressed = ImGui::InputTextWithHint(
+            "##AddAddress", "https://example.com", new_api_address_,
+            sizeof(new_api_address_), ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+          OpenGuidePage(GuidePage::kAddressActions);
+        }
+        if (GuideButton("Paste or Clear Address")) {
+          OpenGuidePage(GuidePage::kAddressActions);
+        }
+        if (GuideButton("Add") || enter_pressed) {
+          const std::string api_address(new_api_address_);
+          if (!api_address.empty()) {
+            xlive_api->AddAPIAddress(api_address);
+            UpdateAPIAddress();
+            UpdateSelectedAPIItem();
+            OpenGuidePage(GuidePage::kSettings);
+          }
+        }
+        if (GuideButton("Cancel")) {
+          GoBackGuidePage();
+        }
+        break;
+      }
+      case GuidePage::kAddressActions: {
+        ImGui::TextUnformatted("Edit API Address");
+        if (focus_requested) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Paste")) {
+          if (const char* clipboard = ImGui::GetClipboardText()) {
+            xe::string_util::copy_truncating(new_api_address_, clipboard,
+                                             sizeof(new_api_address_));
+          }
+          GoBackGuidePage();
+        }
+        if (GuideButton("Clear")) {
+          std::memset(new_api_address_, 0, sizeof(new_api_address_));
+          GoBackGuidePage();
+        }
+        if (GuideButton("Cancel")) {
+          GoBackGuidePage();
+        }
+        break;
+      }
+      case GuidePage::kRemoveAPIAddress: {
+        ImGui::TextUnformatted("Remove API Address");
+        ImGui::TextWrapped("Remove this address from the saved list?");
+        ImGui::TextWrapped("%s", selected_api_address_item_);
+        ImGui::Spacing();
+        // Default to Cancel to avoid accidental removal on activation.
+        if (focus_requested) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Cancel")) {
+          GoBackGuidePage();
+        }
+        ImGui::BeginDisabled(!updatable || is_default);
+        if (GuideButton("Remove")) {
+          xlive_api->RemoveAPIAddress(selected_api_address_item_);
+          UpdateAPIAddress();
+          UpdateSelectedAPIItem();
+          OpenGuidePage(GuidePage::kSettings);
+        }
+        ImGui::EndDisabled();
+        break;
+      }
+      case GuidePage::kNetworkModes: {
+        ImGui::TextUnformatted("Choose Network Mode");
+        const bool valid_selection =
+            selected_network_mode_index_ >= 0 &&
+            selected_network_mode_index_ <
+                static_cast<int>(std::size(network_modes_));
+        for (int index = 0; index < static_cast<int>(std::size(network_modes_));
+             ++index) {
+          if (focus_requested && (index == selected_network_mode_index_ ||
+                                  (!valid_selection && index == 0))) {
+            ImGui::SetKeyboardFocusHere();
+          }
+          if (GuideButton(network_modes_[index])) {
+            selected_network_mode_index_ = index;
+            if (xlive_api->SelectNetworkMode(index)) {
+              xlive_api->SetNetworkMode(index);
+            } else {
+              selected_network_mode_index_ = cvars::network_mode;
+            }
+            OpenGuidePage(GuidePage::kSettings);
+          }
+        }
+        if (GuideButton("Back")) {
+          GoBackGuidePage();
+        }
+        break;
+      }
+      case GuidePage::kNetworkInterfaces: {
+        ImGui::TextUnformatted("Choose Network Interface");
+        const bool selected_interface_present =
+            selected_network_interface_item_ &&
+            std::ranges::find(network_interfaces_,
+                              selected_network_interface_item_) !=
+                network_interfaces_.end();
+        ImGui::BeginDisabled(!updatable);
+        for (size_t index = 0; index < network_interfaces_.size(); ++index) {
+          const auto& interface_name = network_interfaces_[index];
+          const bool selected =
+              selected_network_interface_item_ &&
+              selected_network_interface_item_ == interface_name;
+          ImGui::PushID(static_cast<int>(index));
+          ImGui::TextWrapped("%s", interface_name.c_str());
+          if (focus_requested && updatable &&
+              (selected || (!selected_interface_present && index == 0))) {
+            ImGui::SetKeyboardFocusHere();
+          }
+          if (GuideButton(selected ? "Selected Interface" : "Use Interface")) {
+            selected_interface_index_ = index;
+            selected_network_interface_item_ = interface_name.c_str();
+            const auto guid_keys = std::views::keys(network_interface_guids_);
+            const std::vector<std::string> guids = {guid_keys.begin(),
+                                                    guid_keys.end()};
+            network_adapter_manager_->SetSelectedAdapterGUID(
+                guids.at(selected_interface_index_));
+            OpenGuidePage(GuidePage::kSettings);
+          }
+          ImGui::PopID();
+          ImGui::Spacing();
+        }
+        ImGui::EndDisabled();
+        if (!updatable) {
+          ImGui::TextWrapped(
+              "The network interface cannot be changed while playing.");
+        }
+        if (focus_requested && (!updatable || network_interfaces_.empty())) {
+          ImGui::SetKeyboardFocusHere();
+        }
+        if (GuideButton("Back")) {
+          GoBackGuidePage();
+        }
+        break;
+      }
+    }
+    ImGui::EndDisabled();
+
+    if (close_requested) {
+      dialog_opened_ = false;
+      ImGui::CloseCurrentPopup();
+    }
+    EndGuidePopup();
+  }
+
+  if (!dialog_opened_) {
+    Close();
+    emulator_window_->ToggleNetplaySettingsDialog();
+  }
+}
+#endif
 
 void NetplaySettingsDialog::UpdateInterfaceGUIDs() {
   for (const auto& adapter : network_adapter_manager_->GetAdapters()) {
@@ -439,11 +860,7 @@ void xe::app::NetplaySettingsDialog::UpdateSelectedAPIItem() {
   if (it != api_addresses_.end()) {
     selected_api_address_item_ = it->c_str();
   } else {
-    if (api_addresses_.empty()) {
-      selected_api_address_item_ = api_addresses_.front().c_str();
-    } else {
-      selected_api_address_item_ = "Unspecified API Address";
-    }
+    selected_api_address_item_ = "Unspecified API Address";
   }
 }
 
@@ -487,6 +904,9 @@ void NetplaySettingsDialog::ActivateDiscordState(bool state) {
 }
 
 void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  OnDrawGuide();
+#else
   if (!dialog_opened_) {
     dialog_opened_ = true;
     ImGui::OpenPopup("Netplay Status");
@@ -512,65 +932,25 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
     const auto kernel_state = emulator->kernel_state();
     const auto xlive_api = kernel_state->GetXboxLiveAPI();
 
-    std::string xlive_api_state;
-    std::string upnp_state;
-    std::string api_server_state;
-
-    const bool is_pending =
-        xlive_api->GetInitState() == xe::kernel::XLiveAPI::InitState::Pending;
-    const bool is_success = xlive_api->IsConnectedToServer();
-    const bool is_failed =
-        xlive_api->GetInitState() == xe::kernel::XLiveAPI::InitState::Failed;
-
-    if (is_pending) {
-      xlive_api_state = "XLiveAPI Initialized: Pending Initialization";
-      api_server_state = "API Server: Pending Initialization";
-    } else {
-      xlive_api_state = fmt::format("XLiveAPI Initialized: {}",
-                                    is_success ? "True" : "False");
-      api_server_state = fmt::format("Communication {} with API address:",
-                                     is_success ? "succeeded" : "failed");
-    }
-
-    if (cvars::upnp) {
-      const auto upnp = emulator->GetUPnP();
-
-      if (is_pending) {
-        upnp_state = "UPnP: Pending Initialization";
-      } else if (upnp && upnp->IsActive()) {
-        upnp_state = "UPnP: Device found";
-      } else {
-        upnp_state = "UPnP: Device search failed";
-      }
-    } else {
-      upnp_state = "UPnP: Disabled";
-    }
-
-    ImGui::Text(xlive_api_state.c_str());
+    const auto status = GetNetplayStatusText(emulator);
+    ImGui::Text("Network mode: %s", status.mode);
     ImGui::Spacing();
-
-    ImGui::Text(upnp_state.c_str());
+    ImGui::Text("Netplay services: %s", status.services);
     ImGui::Spacing();
-
-    if (is_failed) {
+    ImGui::Text("UPnP: %s", status.upnp);
+    ImGui::Spacing();
+    if (status.failed) {
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
     }
-
-    ImGui::Text(api_server_state.c_str());
-
-    if (!is_pending) {
-      // We need to use a separate thread otherwise window will freeze.
-      if (ImGui::TextLink(cvars::api_address.c_str())) {
-        std::jthread open_link(LaunchWebBrowser, cvars::api_address);
-        open_link.detach();
-      }
-    }
-
-    ImGui::Spacing();
-
-    if (is_failed) {
+    ImGui::Text("API Server: %s", status.api);
+    if (status.failed) {
       ImGui::PopStyleColor();
     }
+    if (ImGui::TextLink(cvars::api_address.c_str())) {
+      std::jthread open_link(LaunchWebBrowser, cvars::api_address);
+      open_link.detach();
+    }
+    ImGui::Spacing();
 
     if (xlive_api->IsXUIDMismatched()) {
       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
@@ -595,7 +975,75 @@ void NetplayStatusDialog::OnDraw(ImGuiIO& io) {
     Close();
     emulator_window_->ToggleNetplayStatusDialog();
   }
+#endif
 }
+
+#if XE_PLATFORM_WINRT
+void NetplayStatusDialog::OnDrawGuide() {
+  if (!dialog_opened_) {
+    dialog_opened_ = true;
+    ImGui::OpenPopup("Netplay Status");
+  }
+
+  if (BeginGuidePopup("Netplay Status", &dialog_opened_, guide_dialog_state_,
+                      imgui_drawer())) {
+    const bool close_requested = ConsumeGuideBackPress();
+    const bool focus_requested =
+        !guide_activation_armed_ && GuideActivationReleased();
+    if (focus_requested) {
+      guide_activation_armed_ = true;
+    }
+    ImGui::BeginDisabled(!guide_activation_armed_);
+    const auto emulator = emulator_window_->emulator();
+    const auto xlive_api = emulator->kernel_state()->GetXboxLiveAPI();
+    const auto status = GetNetplayStatusText(emulator);
+    ImGui::TextWrapped("Network mode: %s", status.mode);
+    ImGui::Spacing();
+    ImGui::TextWrapped("Netplay services: %s", status.services);
+    ImGui::Spacing();
+    ImGui::TextWrapped("UPnP: %s", status.upnp);
+    ImGui::Spacing();
+    if (status.failed) {
+      ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
+    }
+    ImGui::TextWrapped("API Server: %s", status.api);
+    if (status.failed) {
+      ImGui::PopStyleColor();
+    }
+    ImGui::TextWrapped("%s", cvars::api_address.c_str());
+    if (GuideButton("Open API Address")) {
+      std::jthread open_link(LaunchWebBrowser, cvars::api_address);
+      open_link.detach();
+    }
+
+    if (xlive_api->IsXUIDMismatched()) {
+      ImGui::Spacing();
+      ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 50, 50, 255));
+      ImGui::TextWrapped("XUID mismatch expect unstable netplay!");
+      ImGui::PopStyleColor();
+      ImGui::TextWrapped(
+          "Go to Netplay > Manager > Delete Netplay Profiles to fix this "
+          "issue.");
+    }
+
+    ImGui::Spacing();
+    if (focus_requested) {
+      ImGui::SetKeyboardFocusHere();
+    }
+    if (GuideButton("Close") || close_requested) {
+      dialog_opened_ = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    EndGuidePopup();
+  }
+
+  if (!dialog_opened_) {
+    Close();
+    emulator_window_->ToggleNetplayStatusDialog();
+  }
+}
+#endif
 
 }  // namespace app
 }  // namespace xe

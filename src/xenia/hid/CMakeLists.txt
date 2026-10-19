@@ -1,5 +1,9 @@
 add_library(xenia-hid STATIC)
 xe_platform_sources(xenia-hid ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32)
+  xe_platform_sources(xenia-hid ${CMAKE_CURRENT_SOURCE_DIR}/dsu)
+  target_link_libraries(xenia-hid PUBLIC ws2_32)
+endif()
 # Exclude demo files
 file(GLOB _hid_demo  "${CMAKE_CURRENT_SOURCE_DIR}/*_demo.cc")
 get_target_property(_hid_srcs xenia-hid SOURCES)

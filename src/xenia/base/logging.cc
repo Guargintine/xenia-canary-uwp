@@ -448,6 +448,13 @@ void InitializeLogging(const std::string_view app_name) {
     // Default to app name.
     auto file_name = fmt::format("{}.log", app_name);
     auto file_path = xe::filesystem::GetExecutableFolder() / file_name;
+#if XE_PLATFORM_WINRT
+    // Keeps the previous session's log as <name>.previous.log.
+    std::error_code rotate_error;
+    std::filesystem::path previous_path = file_path;
+    previous_path.replace_extension(".previous.log");
+    std::filesystem::rename(file_path, previous_path, rotate_error);
+#endif
     log_file = xe::filesystem::OpenFile(file_path, "wt");
   } else {
     xe::filesystem::CreateParentFolder(cvars::log_file);

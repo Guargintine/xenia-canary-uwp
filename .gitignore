@@ -58,9 +58,17 @@ obj/
 # ==============================================================================
 
 *.py[co]
+__pycache__/
+.venv/
+venv/
 .coverage
 *.o
 *.aps
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
 
 # Generated shader bytecode
 src/xenia/gpu/shaders/bytecode/d3d12_5_1/
@@ -77,6 +85,18 @@ private/
 *.trace
 imgui.ini
 *.log
+*.dmp
+*.mdmp
+*.binlog
+
+# Local credentials and signing keys
+.env
+.env.local
+.env.*.local
+*.pfx
+*.p12
+screenscraper_build_config.h
+private-identity/
 
 # ==============================================================================
 # Build system output
@@ -94,6 +114,17 @@ node_modules/.bin/
 /build/
 /build-arm64/
 /build-x64/
+/CMakeUserPresets.json
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/out/
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
 
 # ==============================================================================
 # Local-only paths
@@ -116,6 +147,19 @@ node_modules/.bin/
 /cache0
 /devkit
 recent.toml
-/xenia-canary-uwp/Generated Files/winrt
-/xenia-canary-uwp/x64/Release
+/xenia*.config.toml
+/xenia-canary-uwp/Generated Files/
+/xenia-canary-uwp/x64/
+/xenia-canary-uwp/ARM64/
+/xenia-canary-uwp/Win32/
+/xenia-canary-uwp/AppPackages/
 /xenia-canary-uwp/BundleArtifacts
+
+# Required packaged streaming runtime
+!/third_party/streaming-ffmpeg/bin/
+/third_party/streaming-ffmpeg/bin/*
+!/third_party/streaming-ffmpeg/bin/avcodec-60.dll
+!/third_party/streaming-ffmpeg/bin/avformat-60.dll
+!/third_party/streaming-ffmpeg/bin/avutil-58.dll
+!/third_party/streaming-ffmpeg/bin/swresample-4.dll
+!/third_party/streaming-ffmpeg/bin/swscale-7.dll

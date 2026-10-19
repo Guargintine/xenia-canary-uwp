@@ -13,34 +13,35 @@
 #include <map>
 
 #include "xenia/vfs/devices/xcontent_container_entry.h"
+#include "xenia/vfs/devices/xcontent_devices/svod_host_file.h"
 #include "xenia/vfs/file.h"
 
 namespace xe {
 namespace vfs {
 
-using MultiMemoryMap = std::map<size_t, std::unique_ptr<MappedMemory>>;
+using SvodHostFiles = std::map<size_t, std::unique_ptr<SvodHostFile>>;
 
 class XContentContainerDevice;
 
 class SvodContainerEntry : public XContentContainerEntry {
  public:
   SvodContainerEntry(Device* device, Entry* parent, const std::string_view path,
-                     MultiMemoryMap* files);
+                     SvodHostFiles* files);
   ~SvodContainerEntry() override;
 
   static std::unique_ptr<SvodContainerEntry> Create(Device* device,
                                                     Entry* parent,
                                                     const std::string_view name,
-                                                    MultiMemoryMap* files);
+                                                    SvodHostFiles* files);
 
-  MultiMemoryMap* files() const { return files_; }
+  SvodHostFiles* files() const { return files_; }
 
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
 
  private:
   bool DeleteEntryInternal(Entry* entry) override;
 
-  MultiMemoryMap* files_;
+  SvodHostFiles* files_;
 };
 
 }  // namespace vfs

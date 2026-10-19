@@ -36,6 +36,7 @@
 #include "xenia-canary-uwp/UWPUtil.h"
 #include "xenia-canary-uwp/WinRTKeyboard.h"
 #include "xenia-canary-uwp/XeniaUWP.h"
+#include "xenia/ui/guide_input.h"
 #endif
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -184,7 +185,7 @@ ImVec4 GetConfiguredUIAccentColor(float alpha = 1.0f) {
   if (accent == "yellow") {
     return ImVec4(214.0f / 255.0f, 195.0f / 255.0f, 82.0f / 255.0f, alpha);
   }
-  if (accent == "grey") {
+  if (accent == "silver" || accent == "grey") {
     return ImVec4(215.0f / 255.0f, 217.0f / 255.0f, 219.0f / 255.0f, alpha);
   }
   if (accent == "black") {
@@ -393,6 +394,10 @@ ImGuiDrawer::ImGuiDrawer(xe::ui::Window* window, size_t z_order)
 }
 
 ImGuiDrawer::~ImGuiDrawer() {
+  frame_textures_.clear();
+#if XE_PLATFORM_WINRT
+  UWP::SetUIOpen(false);
+#endif
   SetPresenter(nullptr);
   if (!dialogs_.empty()) {
     window_->RemoveInputListener(this);
@@ -427,6 +432,10 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+#if XE_PLATFORM_WINRT
+  // Capture every host dialog immediately, even before the first UI paint.
+  UWP::SetUIOpen(true);
+#endif
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -951,6 +960,7 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
   if (immediate_drawer_ == new_immediate_drawer) {
     return;
   }
+  frame_textures_.clear();
   if (immediate_drawer_) {
     GetIO().Fonts->TexID = reinterpret_cast<ImTextureID>(nullptr);
     font_texture_.reset();
@@ -1038,6 +1048,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     ClearInput();
   }
 
+#if XE_PLATFORM_WINRT
+  xe::app::SnapshotGuideBackTarget();
+#endif
   ImGui::NewFrame();
 
   assert_true(!IsDrawingDialogs());
@@ -1076,6 +1089,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   if (draw_data) {
     RenderDrawLists(draw_data, ui_draw_context);
   }
+  // Closing a dialog during Draw may drop its own texture references. Release
+  // these only after all raw IDs in the current frame have been consumed.
+  frame_textures_.clear();
 
   if (reset_mouse_position_after_next_frame_) {
     reset_mouse_position_after_next_frame_ = false;
@@ -1462,6 +1478,7 @@ void ImGuiDrawer::ClearInput() {
   }
   io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
   std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+  io.ClearEventsQueue();
   io.ClearInputKeys();
   io.ClearInputMouse();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;

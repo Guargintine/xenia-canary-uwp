@@ -16,6 +16,7 @@
 #include "third_party/libcurl/include/curl/curl.h"
 // clang-format on
 
+#include "xenia/base/curl_util.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
@@ -24,6 +25,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_net.h"
+#include "xenia/kernel/xam/xam_net_async.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
@@ -92,6 +94,13 @@ enum VERSION {
 namespace xe {
 namespace kernel {
 namespace xam {
+
+static void SignalLookupEvent(KernelState* state, uint32_t handle) {
+  auto event = state->object_table()->LookupObject<XEvent>(handle);
+  if (event && event->type() == XObject::Type::Event) {
+    event->Set(0, false);
+  }
+}
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -192,6 +201,21 @@ static void InitializeSockaddr(XSOCKADDR_IN* sockaddr_ptr) {
 }
 
 XNetStartupParams xnet_startup_params{};
+
+void ResetNetworkTitleState(XLiveAPI* api) {
+  std::scoped_lock lock(dns_lookup_mutex, qos_lookup_mutex);
+  dns_lookup_threads.clear();
+  qos_lookup_threads.clear();
+  upnp_actions_.clear();
+  initialized_xnet_ = false;
+  winsock_reference_count_ = 0;
+  xnet_startup_params = {};
+  EXPLICIT_XBOXLIVE_KEY = false;
+  download_mode_ = X_BACKGROUND_DOWNLOAD_MODE::AUTO;
+  if (api) {
+    api->ResetTitleState();
+  }
+}
 
 void Update_XNetStartupParams(XNetStartupParams& dest,
                               const XNetStartupParams& src) {
@@ -1088,23 +1112,29 @@ dword_result_t NetDll_XNetDnsLookup_entry(dword_t caller, lpstring_t host,
   dns->status = static_cast<uint32_t>(X_WSA_ERROR::X_WSAEINPROGRESS);
 
   *dns_ptr = dns_address;
+  auto* state = kernel_state();
+  const std::string host_name = host.value();
 
   auto run = [=](std::stop_token stop_token) {
     if (stop_token.stop_requested()) {
-      dns->status = X_ERROR_SUCCESS;
-      xboxkrnl::xeNtSetEvent(event_handle, nullptr);
       return;
     }
 
     ADDRINFOA hints = {.ai_family = XSocket::X_AF_INET};
     PADDRINFOA addr_info = {};
 
-    const int status = getaddrinfo(host, nullptr, &hints, &addr_info);
+    const int status = getaddrinfo(host_name.c_str(), nullptr, &hints, &addr_info);
+    if (stop_token.stop_requested()) {
+      if (addr_info) {
+        freeaddrinfo(addr_info);
+      }
+      return;
+    }
 
     if (status != 0 || !addr_info) {
       XELOGI("DNS Lookup: Failed ({})", status);
       dns->status = XSocket::XWSAGetLastError();
-      xboxkrnl::xeNtSetEvent(event_handle, nullptr);
+      SignalLookupEvent(state, event_handle);
       if (addr_info) {
         freeaddrinfo(addr_info);
       }
@@ -1129,15 +1159,19 @@ dword_result_t NetDll_XNetDnsLookup_entry(dword_t caller, lpstring_t host,
 
     freeaddrinfo(addr_info);
 
-    xboxkrnl::xeNtSetEvent(event_handle, nullptr);
+    if (!stop_token.stop_requested()) {
+      SignalLookupEvent(state, event_handle);
+    }
   };
 
-  std::jthread dns_lookup_thread(run);
-
   std::unique_lock lock(dns_lookup_mutex);
-  dns_lookup_threads[dns_address] = dns_lookup_thread.get_stop_source();
-
-  dns_lookup_thread.detach();
+  auto stop = state->async_work().Start(std::move(run));
+  if (!stop.stop_possible()) {
+    state->memory()->SystemHeapFree(dns_address);
+    *dns_ptr = 0;
+    return static_cast<uint32_t>(X_WSA_ERROR::X_WSAECANCELLED);
+  }
+  dns_lookup_threads[dns_address] = std::move(stop);
 
   return X_ERROR_SUCCESS;
 }
@@ -1160,7 +1194,7 @@ dword_result_t NetDll_XNetDnsRelease_entry(dword_t caller,
     return X_ERROR_SUCCESS;
   }
 
-  dns_lookup_threads.at(dns_address).request_stop();
+  kernel_state()->async_work().CancelAndWait(dns_lookup_threads.at(dns_address));
 
   kernel_memory()->SystemHeapFree(dns_ptr.guest_address());
 
@@ -1186,13 +1220,14 @@ dword_result_t NetDll_XNetQosServiceLookup_entry(dword_t caller, dword_t flags,
   *qos_ptr = qos_address;
 
   qos->count_pending = 1;
+  auto* state = kernel_state();
 
   auto run = [=](std::stop_token stop_token) {
     if (stop_token.stop_requested()) {
       return;
     }
 
-    if (!kernel_state()->xam_state()->user_tracker()->LoggedInToLive()) {
+    if (!state->xam_state()->user_tracker()->LoggedInToLive()) {
       qos->count_pending = 0;
       return;
     }
@@ -1217,15 +1252,19 @@ dword_result_t NetDll_XNetQosServiceLookup_entry(dword_t caller, dword_t flags,
 
     // If COMPLETE, TARGET_CONTACTED or PARTIAL_COMPLETE flag is set then set
     // event.
-    xboxkrnl::xeNtSetEvent(event_handle, nullptr);
+    if (!stop_token.stop_requested()) {
+      SignalLookupEvent(state, event_handle);
+    }
   };
 
-  std::jthread qos_lookup_thread(run);
-
   std::unique_lock lock(qos_lookup_mutex);
-  qos_lookup_threads[qos_address] = qos_lookup_thread.get_stop_source();
-
-  qos_lookup_thread.detach();
+  auto stop = state->async_work().Start(std::move(run));
+  if (!stop.stop_possible()) {
+    state->memory()->SystemHeapFree(qos_address);
+    *qos_ptr = 0;
+    return static_cast<uint32_t>(X_WSA_ERROR::X_WSAECANCELLED);
+  }
+  qos_lookup_threads[qos_address] = std::move(stop);
 
   return X_ERROR_SUCCESS;
 }
@@ -1248,7 +1287,7 @@ dword_result_t NetDll_XNetQosRelease_entry(dword_t caller,
     return X_ERROR_SUCCESS;
   }
 
-  qos_lookup_threads.at(qos_address).request_stop();
+  kernel_state()->async_work().CancelAndWait(qos_lookup_threads.at(qos_address));
 
   for (uint32_t i = 0; i < qos_ptr->count; i++) {
     const XNQOSINFO& qos_info = qos_ptr->info[i];
@@ -1315,13 +1354,15 @@ dword_result_t NetDll_XNetQosListen_entry(
                                                          qos_buffer)) {
       XELOGI("XNetQosListen LISTEN_SET_DATA");
 
-      auto run = [](uint64_t sessionId, std::vector<uint8_t> qosData) {
-        kernel_state()->GetXboxLiveAPI()->QoSPost(sessionId, qosData.data(),
-                                                  qosData.size());
-      };
-
-      std::thread qos_thread(run, session_id, qos_buffer);
-      qos_thread.detach();
+      auto* state = kernel_state();
+      state->async_work().Start(
+          [state, session_id, qos_buffer = std::move(qos_buffer)](
+              std::stop_token stop) mutable {
+            if (!stop.stop_requested()) {
+              state->GetXboxLiveAPI()->QoSPost(
+                  session_id, qos_buffer.data(), qos_buffer.size(), stop);
+            }
+          });
     }
   }
 
@@ -1429,6 +1470,7 @@ dword_result_t NetDll_XNetQosLookup_entry(
   // Therefore it expects qos->count_pending != 0 on return, otherwise will
   // cause QoS lookup spam.
   qos->count_pending = count;
+  auto* state = kernel_state();
 
   auto run = [=, shared_session_ids = session_ids](std::stop_token stop_token) {
     for (uint32_t i = 0; i < count && !stop_token.stop_requested(); i++) {
@@ -1438,14 +1480,17 @@ dword_result_t NetDll_XNetQosLookup_entry(
 
       if (i < shared_session_ids->size()) {
         const uint64_t session_id = shared_session_ids->at(i).as_uintBE64();
-        chunk = kernel_state()->GetXboxLiveAPI()->QoSGet(session_id);
+        chunk = state->GetXboxLiveAPI()->QoSGet(session_id, stop_token);
+      }
+      if (stop_token.stop_requested()) {
+        break;
       }
 
       if (chunk.http_code == HTTP_STATUS_CODE::HTTP_OK) {
         if (chunk.response && chunk.size) {
-          uint32_t data_ptr = kernel_memory()->SystemHeapAlloc(
+          uint32_t data_ptr = state->memory()->SystemHeapAlloc(
               static_cast<uint16_t>(chunk.size));
-          uint8_t* data = kernel_memory()->TranslateVirtual<uint8_t*>(data_ptr);
+          uint8_t* data = state->memory()->TranslateVirtual<uint8_t*>(data_ptr);
 
           std::memcpy(data, chunk.response, chunk.size);
 
@@ -1471,23 +1516,25 @@ dword_result_t NetDll_XNetQosLookup_entry(
     }
 
     // If COMPLETE or TARGET_CONTACTED flag is then set event.
-    if (qos->count > 0) {
-      xboxkrnl::xeNtSetEvent(event_handle, nullptr);
+    if (!stop_token.stop_requested() && qos->count > 0) {
+      SignalLookupEvent(state, event_handle);
     }
   };
 
-  std::jthread qos_lookup_thread(run);
-
   std::unique_lock lock(qos_lookup_mutex);
-  qos_lookup_threads[qos_address] = qos_lookup_thread.get_stop_source();
+  auto stop = state->async_work().Start(std::move(run));
+  if (!stop.stop_possible()) {
+    state->memory()->SystemHeapFree(qos_address);
+    *qos_ptr = 0;
+    return static_cast<uint32_t>(X_WSA_ERROR::X_WSAECANCELLED);
+  }
+  qos_lookup_threads[qos_address] = stop;
 
   // 5345081A expects QoS results immediately on return, assume this behavior is
   // expected due to probes count of 0.
-  if (probes_count) {
-    qos_lookup_thread.detach();
-  } else {
+  if (!probes_count) {
     XELOGI("XNetQosLookup: Sync Lookup!");
-    qos_lookup_thread.join();
+    state->async_work().Wait(stop);
   }
 
   return X_ERROR_SUCCESS;
@@ -1648,7 +1695,7 @@ dword_result_t NetDll_XHttpCrackUrl_entry(
           !url_components_ptr->extra_info_length;
 
   auto decode_string = [](const std::string& encoded_component) -> std::string {
-    CURL* curl = curl_easy_init();
+    CURL* curl = xe::CreateCurlHandle();
 
     if (!curl) {
       return "";

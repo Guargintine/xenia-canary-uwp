@@ -53,6 +53,11 @@ class GraphicsSystem {
                          ui::WindowedAppContext* app_context,
                          bool with_presentation);
   virtual void Shutdown();
+  // Call before stopping guest threads that an active callback may wait for.
+  void StopGuestCallbacks();
+  void ShutdownGuestState();
+  X_STATUS ReinitializeGuestState(cpu::Processor* processor,
+                                 kernel::KernelState* kernel_state);
 
   // May be called from any thread any number of times, even during recovery
   // from a device loss.
@@ -117,8 +122,8 @@ class GraphicsSystem {
   ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<ui::GraphicsProvider> provider_;
 
-  uint32_t interrupt_callback_ = 0;
-  uint32_t interrupt_callback_data_ = 0;
+  std::atomic<uint64_t> interrupt_callback_{0};
+  std::atomic<uint32_t> interrupt_callbacks_state_{0};
 
   std::atomic<bool> frame_limiter_worker_running_;
   kernel::object_ref<kernel::XHostThread> frame_limiter_worker_thread_;

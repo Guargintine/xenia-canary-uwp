@@ -26,6 +26,10 @@
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/xbox.h"
 
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
+
 DEFINE_int32(
     license_mask, 1 ,
     "Set license mask for activated content.\n"
@@ -747,7 +751,16 @@ dword_result_t XamSwapDisc_entry(
   XELOGI("GetNewDiscPath returned path {}.", new_disc_path.string().c_str());
 
   // TODO(Gliniak): Implement checking if inserted file is requested one
+#if XE_PLATFORM_WINRT
+  if (kernel_state()->emulator()->MountPath(new_disc_path, mount_path) ==
+      X_STATUS_SUCCESS) {
+    // A later XEX restart must reopen the currently mounted disc.
+    auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+    xam->loader_data().host_path = xe::path_to_utf8(new_disc_path);
+  }
+#else
   kernel_state()->emulator()->MountPath(new_disc_path, mount_path);
+#endif
   completion_event();
 
   return X_ERROR_SUCCESS;
@@ -834,19 +847,31 @@ dword_result_t xeXamContentLaunchImage(dword_t user_index,
   loader_data.host_path = xe::path_to_utf8(host_path);
   loader_data.launch_path = xex_path.value();
 
+#if XE_PLATFORM_WINRT
+  const bool saved = xam->SaveLoaderData();
+  auto emulator = kernel_state()->emulator();
+  emulator->display_window()->app_context().CallInUIThreadSynchronous(
+      [drawer = emulator->imgui_drawer(), saved]() {
+        UWP::RequestTitleRestart(drawer, saved);
+      });
+#else
+  std::string title = "Launching new title!";
+  std::string message =
+      "Launching new title. \nPlease close Xenia and launch it again. Game "
+      "should load automatically.";
   xam->SaveLoaderData();
 
   auto display_window = kernel_state()->emulator()->display_window();
   auto imgui_drawer = kernel_state()->emulator()->imgui_drawer();
 
   if (display_window && imgui_drawer) {
-    display_window->app_context().CallInUIThreadSynchronous([imgui_drawer]() {
+    display_window->app_context().CallInUIThreadSynchronous([imgui_drawer, title,
+                                                          message]() {
       xe::ui::ImGuiDialog::ShowMessageBox(
-          imgui_drawer, "Launching new title!",
-          "Launching new title. \nPlease close Xenia and launch it again. Game "
-          "should load automatically.");
+          imgui_drawer, title, message);
     });
   }
+#endif
 
   kernel_state()->TerminateTitle();
   return X_ERROR_SUCCESS;

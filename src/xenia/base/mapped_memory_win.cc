@@ -148,6 +148,8 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
 #endif
                          create_mode, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (mm->file_handle == Win32MappedMemory::kFileHandleInvalid) {
+    const DWORD error = GetLastError();
+    XELOGE("Unable to open mapped file {}: Windows error {}", path, error);
     return nullptr;
   }
 
@@ -161,6 +163,9 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
                                ULONG64(aligned_length), nullptr);
 #endif
   if (mm->mapping_handle == Win32MappedMemory::kMappingHandleInvalid) {
+    const DWORD error = GetLastError();
+    XELOGE("Unable to create file mapping for {} (length {}): Windows error {}",
+           path, aligned_length, error);
     return nullptr;
   }
 
@@ -174,6 +179,10 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
                            ULONG64(aligned_offset), aligned_length));
 #endif
   if (!mm->data_) {
+    const DWORD error = GetLastError();
+    XELOGE("Unable to map file view for {} (offset {}, length {}): Windows "
+           "error {}",
+           path, aligned_offset, aligned_length, error);
     return nullptr;
   }
 
@@ -181,8 +190,15 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
     mm->size_ = aligned_length;
   } else {
     LARGE_INTEGER map_length;
-    if (!GetFileSizeEx(mm->file_handle, &map_length) ||
-        uint64_t(map_length.QuadPart) < aligned_offset) {
+    if (!GetFileSizeEx(mm->file_handle, &map_length)) {
+      const DWORD error = GetLastError();
+      XELOGE("Unable to get mapped file size for {}: Windows error {}", path,
+             error);
+      return nullptr;
+    }
+    if (uint64_t(map_length.QuadPart) < aligned_offset) {
+      XELOGE("Mapped file offset {} exceeds file size {} for {}", aligned_offset,
+             map_length.QuadPart, path);
       return nullptr;
     }
     mm->size_ = size_t(map_length.QuadPart) - aligned_offset;

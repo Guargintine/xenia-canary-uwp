@@ -52,6 +52,18 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   return false;
 }
 
+bool VirtualFileSystem::UnregisterDevice(Device* device) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto it = devices_.begin(); it != devices_.end(); ++it) {
+    if (it->get() == device) {
+      XELOGD("Unregistered device: {}", (*it)->mount_path());
+      devices_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();

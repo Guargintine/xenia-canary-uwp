@@ -28,6 +28,7 @@ PatchDB::PatchDB(const std::filesystem::path patches_root) {
 PatchDB::~PatchDB() {}
 
 void PatchDB::LoadPatches() {
+  loaded_patches_.clear();
   if (!cvars::apply_patches) {
     return;
   }

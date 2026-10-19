@@ -953,7 +953,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // control instruction needs to do some code which needs to respect the exec's
   // conditional, but can't itself be predicated.
   void CloseInstructionPredication();
-  void JumpToLabel(uint32_t address);
+  // counts_towards_guard counts the jump against the control flow guard.
+  void JumpToLabel(uint32_t address, bool counts_towards_guard = false);
 
   uint32_t FindOrAddTextureBinding(uint32_t fetch_constant,
                                    xenos::FetchOpDimension dimension,
@@ -1246,6 +1247,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // .w stores `base + index * stride` in bytes from the last vfetch_full as it
   // may be needed by vfetch_mini.
   uint32_t system_temp_grad_v_vfetch_address_;
+  // .x is the number of backward jumps taken, .y the limit test result.
+  // Allocated only when control_flow_guard_max_jumps_ is non-zero.
+  uint32_t system_temp_control_flow_guard_;
+  // Maximum number of backward jumps before the shader is ended, 0 if not
+  // guarded.
+  uint32_t control_flow_guard_max_jumps_ = 0;
 
   // The bool constant number containing the condition for the currently
   // processed exec (or the last - unless a label has reset this), or

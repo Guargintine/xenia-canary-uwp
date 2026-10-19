@@ -28,6 +28,7 @@
 
 #include "version.h"
 #include "xenia/app/updater.h"
+#include "xenia/base/curl_util.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/xnet.h"
 
@@ -45,7 +46,7 @@ uint32_t Updater::GetRequest(const std::string& endpoint,
   CURL* curl;
   CURLcode result;
 
-  curl = curl_easy_init();
+  curl = xe::CreateCurlHandle();
 
   if (!curl) {
     return false;
@@ -530,7 +531,7 @@ uint32_t Updater::DownloadFile(
     std::function<void(double, double)> progress_callback) const {
   std::vector<uint8_t> response_buffer = {};
 
-  CURL* curl = curl_easy_init();
+  CURL* curl = xe::CreateCurlHandle();
 
   if (!curl) {
     return -1;

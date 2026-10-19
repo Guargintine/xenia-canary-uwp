@@ -73,9 +73,17 @@ bool UWPWindow::OpenImpl() {
   return true; 
 }
 
-void UWPWindow::RequestPaintImpl() { 
+void UWPWindow::RequestPaintImpl() {
+  paint_requested_.store(true, std::memory_order_relaxed);
+}
+
+void UWPWindow::PaintIfRequestedFromUIThread() {
+  assert_true(app_context().IsInUIThread());
+  if (!paint_requested_.exchange(false, std::memory_order_relaxed)) {
+    return;
+  }
   UWP::UpdateImGuiIO();
-  OnPaint(); 
+  OnPaint();
 }
 
 void UWPWindow::RequestCloseImpl() {

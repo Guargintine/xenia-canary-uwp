@@ -19,6 +19,15 @@
 #include "xenia/hid/portal/portal.h"
 #include "xenia/xbox.h"
 
+#if XE_PLATFORM_WIN32
+#include "xenia/hid/dsu/dsu_input_driver.h"
+#include "xenia/hid/dsu/dsu_input_merge.h"
+#endif
+
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/guest_input_capture.h"
+#endif
+
 namespace xe {
 namespace ui {
 class Window;
@@ -38,6 +47,12 @@ class InputSystem {
   X_STATUS Setup();
 
   void AddDriver(std::unique_ptr<InputDriver> driver);
+
+#if XE_PLATFORM_WIN32
+  dsu::DSUInputDriver* dsu_driver(uint32_t player) const {
+    return player < dsu_drivers_.size() ? dsu_drivers_[player].get() : nullptr;
+  }
+#endif
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps);
@@ -60,6 +75,11 @@ class InputSystem {
 
   std::unique_lock<xe_unlikely_mutex> lock();
 
+#if XE_PLATFORM_WINRT
+  // Guest exports only; callers must hold lock(). Raw host input is unchanged.
+  UWP::GuestInputCapture& guest_input_capture() { return guest_input_capture_; }
+#endif
+
  private:
   typedef std::pair<uint16_t, uint16_t> joystick_value;
 
@@ -77,6 +97,12 @@ class InputSystem {
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 
+#if XE_PLATFORM_WIN32
+  std::array<std::unique_ptr<dsu::DSUInputDriver>, XUserMaxUserCount>
+      dsu_drivers_;
+  std::array<dsu::MergedInputState, XUserMaxUserCount> merged_input_;
+#endif
+
   std::unique_ptr<Portal> portal_;
 
   std::bitset<XUserMaxUserCount> connected_slots = {};
@@ -85,6 +111,9 @@ class InputSystem {
   uint32_t last_used_slot = 0;
 
   xe_unlikely_mutex lock_;
+#if XE_PLATFORM_WINRT
+  UWP::GuestInputCapture guest_input_capture_;
+#endif
 };
 
 }  // namespace hid

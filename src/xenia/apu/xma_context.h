@@ -238,9 +238,19 @@ class XmaContext {
     }
   }
   // Blocks until the worker has finished processing this context.
-  void WaitForWorkDone() {
+  void WaitForWorkDone(const std::atomic<bool>* stopping = nullptr) {
     if (work_completion_event_) {
-      xe::threading::Wait(work_completion_event_.get(), false);
+      if (!stopping) {
+        xe::threading::Wait(work_completion_event_.get(), false);
+        return;
+      }
+      while (!stopping->load()) {
+        if (xe::threading::Wait(work_completion_event_.get(), false,
+                                std::chrono::milliseconds(20)) !=
+            xe::threading::WaitResult::kTimeout) {
+          break;
+        }
+      }
     }
   }
 

@@ -90,8 +90,13 @@ class D3D12TextureCache final : public TextureCache {
 
   ~D3D12TextureCache();
 
+  // Whether tiled resources back the draw resolution scaling memory. Otherwise
+  // it is committed per resolved range.
+  static bool IsScaledResolveTiled(const ui::d3d12::D3D12Provider& provider);
+
   void ClearCache() override;
 
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
@@ -167,6 +172,10 @@ class D3D12TextureCache final : public TextureCache {
   }
   uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
     assert_true(IsDrawResolutionScaled());
+    if (scaled_resolve_committed_) {
+      assert_not_null(scaled_resolve_current_segment_);
+      return scaled_resolve_current_segment_start_scaled_;
+    }
     return uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
   }
 
@@ -810,6 +819,10 @@ class D3D12TextureCache final : public TextureCache {
         [scaled_resolve_current_range_start_scaled_ >> 30];
   }
   ScaledResolveVirtualBuffer& GetCurrentScaledResolveBuffer() {
+    if (scaled_resolve_committed_) {
+      assert_not_null(scaled_resolve_current_segment_);
+      return *scaled_resolve_current_segment_;
+    }
     ScaledResolveVirtualBuffer* scaled_resolve_buffer =
         scaled_resolve_2gb_buffers_[GetCurrentScaledResolveBufferIndex()].get();
     assert_not_null(scaled_resolve_buffer);
@@ -905,6 +918,33 @@ class D3D12TextureCache final : public TextureCache {
   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> scaled_resolve_heaps_;
   // Number of currently resident portions of the tiled buffer, for profiling.
   uint32_t scaled_resolve_heap_count_ = 0;
+  // Committed buffers backing scaled address intervals when tiled resources
+  // are not used. Sorted by start_scaled and disjoint. A range is accessed
+  // through the one segment containing it.
+  struct ScaledResolveSegment {
+    uint64_t start_scaled;
+    uint64_t length_scaled;
+    std::unique_ptr<ScaledResolveVirtualBuffer> buffer;
+  };
+  bool scaled_resolve_committed_ = false;
+  std::vector<ScaledResolveSegment> scaled_resolve_segments_;
+  // Segment of the current range in committed mode.
+  ScaledResolveVirtualBuffer* scaled_resolve_current_segment_ = nullptr;
+  uint64_t scaled_resolve_current_segment_start_scaled_ = 0;
+  // Buffers of merged segments, released once their copy submission completes.
+  struct RetiredScaledResolveBuffer {
+    uint64_t submission;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint64_t length;
+  };
+  std::vector<RetiredScaledResolveBuffer> scaled_resolve_retired_buffers_;
+  uint64_t scaled_resolve_committed_bytes_ = 0;
+  uint64_t scaled_resolve_retired_bytes_ = 0;
+  uint32_t scaled_resolve_allocation_failures_ = 0;
+  // Ensures one segment contains [first_scaled, last_scaled], merging existing
+  // ones if needed (copies are recorded to the current submission).
+  bool EnsureScaledResolveSegment(uint64_t first_scaled, uint64_t last_scaled,
+                                  size_t& segment_index_out);
   // Current scaled resolve state.
   // For aliasing barrier placement, last owning buffer index for each of 1 GB.
   size_t

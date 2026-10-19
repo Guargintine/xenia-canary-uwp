@@ -837,10 +837,10 @@ bool D3D12CommandProcessor::SetupContext() {
       TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x,
                                                  draw_resolution_scale_y);
 
-  bool has_tiled_resources =
-      provider.GetTiledResourcesTier() >= D3D12_TILED_RESOURCES_TIER_1;
+  // Without tiled resources, the texture cache commits scaled resolve memory
+  // per resolved range, so only the virtual address space limits the scale.
   if (!TextureCache::ClampDrawResolutionScaleToMaxSupported(
-          draw_resolution_scale_x, draw_resolution_scale_y, has_tiled_resources,
+          draw_resolution_scale_x, draw_resolution_scale_y, true,
           provider.GetVirtualAddressBitsPerResource())) {
     draw_resolution_scale_not_clamped = false;
   }

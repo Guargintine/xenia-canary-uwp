@@ -17,6 +17,9 @@
 #include "xenia/app/ui_text_effect_helpers.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/ui/file_picker.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/ui/guide_input.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -75,24 +78,9 @@ void DrawUwpSeparatorText(const char* text, float width) {
       std::max(ImGui::GetTextLineHeight(), text_size.y + style.FramePadding.y);
   const float text_x = pos.x + style.ItemSpacing.x * 0.5f;
   const float text_y = pos.y + (height - text_size.y) * 0.5f;
-  const float line_y = pos.y + height * 0.5f;
-  const float left_line_end = text_x - (style.ItemSpacing.x * 0.25f);
-  const float right_line_start = text_x + text_size.x + style.ItemSpacing.x;
-  const float right_line_end = pos.x + separator_width;
-
   ImGui::Dummy(ImVec2(separator_width, height));
 
   ImDrawList* draw_list = ImGui::GetWindowDrawList();
-  const ImU32 separator_color = ImGui::GetColorU32(ImGuiCol_Separator);
-  if (left_line_end > pos.x) {
-    draw_list->AddLine(ImVec2(pos.x, line_y), ImVec2(left_line_end, line_y),
-                       separator_color, 1.0f);
-  }
-  if (right_line_end > right_line_start) {
-    draw_list->AddLine(ImVec2(right_line_start, line_y),
-                       ImVec2(right_line_end, line_y), separator_color, 1.0f);
-  }
-
   xe::app::DrawTextWithConfiguredEffect(
       draw_list, ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(text_x, text_y),
       ImGui::GetColorU32(ImGuiCol_Text), text);
@@ -537,8 +525,13 @@ void GamercardUI::DrawBaseSettings(ImGuiIO& io, bool draw_header) {
 }
 
 void GamercardUI::DrawOnlineSettings(ImGuiIO& io) {
-  ImGui::SeparatorText("Online Profile Settings");
   const bool use_uwp_layout = IsPackagedAppProcess();
+  if (use_uwp_layout) {
+    DrawUwpSeparatorText("Online Profile Settings",
+                         GetUwpLeftSettingsSeparatorWidth(io));
+  } else {
+    ImGui::SeparatorText("Online Profile Settings");
+  }
   const float online_settings_alignment =
       use_uwp_layout ? GetUwpLeftColumnControlAlignment(io)
                      : leftSideTextObjectAlignment;
@@ -698,17 +691,10 @@ void GamercardUI::OnDraw(ImGuiIO& io) {
             ? fmt::format("{} - Gamercard",
                           std::string(gamercardOriginalValues_.gamertag))
             : std::string("Gamercard");
-    static std::shared_ptr<xe::ui::ImmediateTexture> guide_bg_tex = nullptr;
+    static xe::app::GuideBackgroundTextureCache guide_background;
+    const auto guide_bg_tex = guide_background.Get(imgui_drawer(), true);
     static std::shared_ptr<xe::ui::ImmediateTexture> button_a_tex = nullptr;
     static std::shared_ptr<xe::ui::ImmediateTexture> button_b_tex = nullptr;
-    static std::string cached_guide_asset_path;
-    const std::string guide_asset_path =
-        xe::app::ResolveConfiguredGuideBackgroundAssetPath(true);
-    if (!guide_bg_tex || cached_guide_asset_path != guide_asset_path) {
-      guide_bg_tex =
-          xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer(), true);
-      cached_guide_asset_path = guide_asset_path;
-    }
     if (!button_a_tex) {
       button_a_tex = xe::app::LoadButtonTexture(imgui_drawer(), 'A');
     }
@@ -766,8 +752,12 @@ void GamercardUI::OnDraw(ImGuiIO& io) {
                                    gamercard_title.c_str());
 
     bool dialog_open = true;
+#if XE_PLATFORM_WINRT
+    if (xe::app::ConsumeGuideBackPress()) {
+#else
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
         ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+#endif
       dialog_open = false;
     }
 
@@ -810,8 +800,10 @@ void GamercardUI::OnDraw(ImGuiIO& io) {
 
     ImGui::SetCursorScreenPos(ImVec2(content_left, scroll_top));
     ImGui::PushItemWidth(235.0f * ux);
+    // Flattened, so navigation continues from the settings to Save and Cancel.
     if (ImGui::BeginChild("##gamercard_overlay_scroll",
-                          ImVec2(content_width, content_height), true,
+                          ImVec2(content_width, content_height),
+                          ImGuiChildFlags_NavFlattened,
                           ImGuiWindowFlags_NoScrollbar)) {
       if (ImGui::BeginTable("###GamercardTable", 2, section_table_flags,
                             ImVec2(content_width - (12.0f * ux), 0.0f))) {

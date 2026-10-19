@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include "xenia/ui/window.h"
 #include "xenia/hid/xinput/xinput_input_driver.h"
 
@@ -14,6 +16,7 @@ class UWPWindow : public Window {
   void SetXInputDriver(xe::hid::xinput::XInputInputDriver* driver);
   xe::hid::xinput::XInputInputDriver* xinputdriver();
   void ClearXInputDriver();
+  void PaintIfRequestedFromUIThread();
 
 protected:
     uint32_t GetLatestDpiImpl() const override;
@@ -28,6 +31,9 @@ protected:
     void RequestPaintImpl() override;
 
     xe::hid::xinput::XInputInputDriver* input_driver = nullptr;
+
+ private:
+  std::atomic<bool> paint_requested_{false};
 };
 }  // namespace ui
 }  // namespace xe

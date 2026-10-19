@@ -36,6 +36,10 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/fmt/include/fmt/xchar.h"
 
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
+
 DEFINE_int32(avpack, 8,
              "Video modes\n"
              " 0 = PAL-60 Component (SD)\n"
@@ -567,6 +571,25 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   auto& loader_data = xam->loader_data();
   loader_data.launch_flags = flags;
 
+#if XE_PLATFORM_WINRT
+  const bool restart = raw_name_ptr && !raw_name_ptr.value().empty();
+  bool saved = false;
+  if (restart) {
+    loader_data.launch_path = xe::path_to_utf8(raw_name_ptr.value());
+    saved = xam->SaveLoaderData();
+    XELOGI("UWP title restart requested: {}; saved: {}",
+           loader_data.launch_path, saved);
+  }
+  auto emulator = kernel_state()->emulator();
+  emulator->display_window()->app_context().CallInUIThreadSynchronous(
+      [drawer = emulator->imgui_drawer(), restart, saved]() {
+        if (restart) {
+          UWP::RequestTitleRestart(drawer, saved);
+        } else {
+          UWP::RequestQuit();
+        }
+      });
+#else
   std::string title;
   std::string message;
 
@@ -589,22 +612,27 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 
   if (display_window && imgui_drawer) {
     display_window->app_context().CallInUIThreadSynchronous(
-        [imgui_drawer, title, message]() {
+        [imgui_drawer, title, message,
+         stop = kernel_state()->async_work().stop_token()]() {
+          if (stop.stop_requested()) {
+            return;
+          }
           auto dialog = xe::ui::ImGuiDialog::ShowMessageBox(
               imgui_drawer, title.c_str(), message.c_str());
 
-          std::jthread([dialog]() {
-            while (!dialog->IsClosing()) {
-              std::this_thread::yield();
+          dialog->Then([stop]() {
+            if (stop.stop_requested()) {
+              return;
             }
 
             config::SaveConfig();
             xe::FlushLog();
 
             std::quick_exit(0);
-          }).detach();
+          });
         });
   }
+#endif
 
   // This function does not return.
   kernel_state()->TerminateTitle();
@@ -612,6 +640,10 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
 void XamLoaderTerminateTitle_entry() {
+#if XE_PLATFORM_WINRT
+  kernel_state()->emulator()->display_window()->app_context()
+      .CallInUIThreadSynchronous([]() { UWP::RequestQuit(); });
+#else
   std::string title = "Title terminated";
   std::string message = "Game requested exit to dashboard.";
   assert_always("Game requested exit to dashboard via XamLoaderTerminateTitle");
@@ -621,22 +653,27 @@ void XamLoaderTerminateTitle_entry() {
 
   if (display_window && imgui_drawer) {
     display_window->app_context().CallInUIThreadSynchronous(
-        [imgui_drawer, title, message]() {
+        [imgui_drawer, title, message,
+         stop = kernel_state()->async_work().stop_token()]() {
+          if (stop.stop_requested()) {
+            return;
+          }
           auto dialog = xe::ui::ImGuiDialog::ShowMessageBox(
               imgui_drawer, title.c_str(), message.c_str());
 
-          std::jthread([dialog]() {
-            while (!dialog->IsClosing()) {
-              std::this_thread::yield();
+          dialog->Then([stop]() {
+            if (stop.stop_requested()) {
+              return;
             }
 
             config::SaveConfig();
             xe::FlushLog();
 
             std::quick_exit(0);
-          }).detach();
+          });
         });
   }
+#endif
 
   // This function does not return.
   kernel_state()->TerminateTitle();

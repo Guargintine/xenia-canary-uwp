@@ -27,6 +27,14 @@
 #include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
+DEFINE_bool(
+    d3d12_tiled_scaled_resolve, !XE_PLATFORM_WINRT,
+    "Use Direct3D 12 tiled resources for the draw resolution scaling memory. "
+    "When disabled or unsupported, memory is committed per resolved range. "
+    "Off by default on UWP, where the Xbox driver crashes in "
+    "UpdateTileMappings.",
+    "D3D12");
+
 namespace xe {
 namespace gpu {
 namespace d3d12 {
@@ -107,10 +115,214 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       command_processor_(command_processor),
       bindless_resources_used_(bindless_resources_used) {}
 
+bool D3D12TextureCache::IsScaledResolveTiled(
+    const ui::d3d12::D3D12Provider& provider) {
+  return cvars::d3d12_tiled_scaled_resolve &&
+         provider.GetTiledResourcesTier() >= D3D12_TILED_RESOURCES_TIER_1;
+}
+
+bool D3D12TextureCache::EnsureScaledResolveSegment(uint64_t first_scaled,
+                                                   uint64_t last_scaled,
+                                                   size_t& segment_index_out) {
+  assert_true(scaled_resolve_committed_);
+  const uint64_t address_space_size =
+      uint64_t(SharedMemory::kBufferSize) *
+      (draw_resolution_scale_x() * draw_resolution_scale_y());
+  if (first_scaled > last_scaled || first_scaled >= address_space_size) {
+    return false;
+  }
+  last_scaled = std::min(last_scaled, address_space_size - 1);
+  // Round the range outward to whole kScaledResolveHeapSize granules.
+  constexpr uint64_t kGranularityBits = uint64_t(kScaledResolveHeapSize) - 1;
+  const uint64_t segment_first = first_scaled & ~kGranularityBits;
+  const uint64_t segment_last =
+      std::min(address_space_size - 1, last_scaled | kGranularityBits);
+
+  // Segments are sorted and disjoint, so the overlapping ones are contiguous.
+  size_t overlap_first = SIZE_MAX;
+  size_t overlap_last = 0;
+  for (size_t i = 0; i < scaled_resolve_segments_.size(); ++i) {
+    const ScaledResolveSegment& segment = scaled_resolve_segments_[i];
+    const uint64_t segment_end = segment.start_scaled + segment.length_scaled;
+    if (segment_end <= segment_first || segment.start_scaled > segment_last) {
+      continue;
+    }
+    if (segment.start_scaled <= first_scaled && segment_end > last_scaled) {
+      // Already fully backed by one segment.
+      segment_index_out = i;
+      return true;
+    }
+    if (overlap_first == SIZE_MAX) {
+      overlap_first = i;
+    }
+    overlap_last = i;
+  }
+  const bool merging = overlap_first != SIZE_MAX;
+  uint64_t union_first = segment_first;
+  uint64_t union_last = segment_last;
+  if (merging) {
+    union_first = std::min(
+        union_first, scaled_resolve_segments_[overlap_first].start_scaled);
+    const ScaledResolveSegment& last_overlapping =
+        scaled_resolve_segments_[overlap_last];
+    union_last = std::max(union_last, last_overlapping.start_scaled +
+                                          last_overlapping.length_scaled - 1);
+  }
+  if (merging) {
+    // Size the merged segment to twice the largest merged one, capped at 2 GB
+    // but never below the union, with the extra space split around the union.
+    uint64_t largest_merged = 0;
+    for (size_t i = overlap_first; i <= overlap_last; ++i) {
+      largest_merged =
+          std::max(largest_merged, scaled_resolve_segments_[i].length_scaled);
+    }
+    const uint64_t union_length_needed = union_last - union_first + 1;
+    const uint64_t headroom_length = std::max(
+        union_length_needed, std::min(largest_merged * 2, uint64_t(1) << 31));
+    const uint64_t extra_below =
+        (headroom_length - (union_last - union_first + 1)) / 2;
+    union_first = (union_first >= extra_below ? union_first - extra_below : 0) &
+                  ~kGranularityBits;
+    union_last =
+        std::min(address_space_size - 1,
+                 (union_first + headroom_length - 1) | kGranularityBits);
+    // Clamp the extra space to the neighbouring segments.
+    if (overlap_first > 0) {
+      const ScaledResolveSegment& previous =
+          scaled_resolve_segments_[overlap_first - 1];
+      union_first =
+          std::max(union_first, previous.start_scaled + previous.length_scaled);
+    }
+    if (overlap_last + 1 < scaled_resolve_segments_.size()) {
+      union_last =
+          std::min(union_last,
+                   scaled_resolve_segments_[overlap_last + 1].start_scaled - 1);
+    }
+  }
+  const uint64_t union_length = union_last - union_first + 1;
+
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, union_length, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  const D3D12_RESOURCE_STATES initial_state =
+      merging ? D3D12_RESOURCE_STATE_COPY_DEST
+              : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  ID3D12Resource* resource;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc, initial_state,
+          nullptr, IID_PPV_ARGS(&resource)))) {
+    // Only the first failures are logged, as every access to the range
+    // retries.
+    if (++scaled_resolve_allocation_failures_ <= 4) {
+      XELOGE(
+          "D3D12TextureCache: Failed to create a {} MB committed buffer for "
+          "draw resolution scaling ({} MB in use, {} MB awaiting release)",
+          union_length >> 20, scaled_resolve_committed_bytes_ >> 20,
+          scaled_resolve_retired_bytes_ >> 20);
+    }
+    return false;
+  }
+  ScaledResolveSegment new_segment;
+  new_segment.start_scaled = union_first;
+  new_segment.length_scaled = union_length;
+  new_segment.buffer = std::unique_ptr<ScaledResolveVirtualBuffer>(
+      new ScaledResolveVirtualBuffer(resource, initial_state));
+  resource->Release();
+  scaled_resolve_committed_bytes_ += union_length;
+
+  size_t insert_index = 0;
+  if (merging) {
+    // Copy the overlapping segments into the new buffer in this submission.
+    // Their buffers are released once it has completed.
+    for (size_t i = overlap_first; i <= overlap_last; ++i) {
+      ScaledResolveVirtualBuffer& old_buffer =
+          *scaled_resolve_segments_[i].buffer;
+      command_processor_.PushTransitionBarrier(
+          old_buffer.resource(),
+          old_buffer.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    command_processor_.SubmitBarriers();
+    auto& command_list = command_processor_.GetDeferredCommandList();
+    const uint64_t retire_submission =
+        command_processor_.GetCurrentSubmission();
+    for (size_t i = overlap_first; i <= overlap_last; ++i) {
+      ScaledResolveSegment& old_segment = scaled_resolve_segments_[i];
+      command_list.D3DCopyBufferRegion(new_segment.buffer->resource(),
+                                       old_segment.start_scaled - union_first,
+                                       old_segment.buffer->resource(), 0,
+                                       old_segment.length_scaled);
+      if (scaled_resolve_current_segment_ == old_segment.buffer.get()) {
+        // Move the current range to the merged segment.
+        scaled_resolve_current_segment_ = new_segment.buffer.get();
+        scaled_resolve_current_segment_start_scaled_ = union_first;
+      }
+      scaled_resolve_retired_buffers_.push_back(
+          RetiredScaledResolveBuffer{retire_submission,
+                                     Microsoft::WRL::ComPtr<ID3D12Resource>(
+                                         old_segment.buffer->resource()),
+                                     old_segment.length_scaled});
+      scaled_resolve_committed_bytes_ -= old_segment.length_scaled;
+      scaled_resolve_retired_bytes_ += old_segment.length_scaled;
+    }
+    XELOGI(
+        "D3D12TextureCache: Merged {} scaled resolve segments into a {} MB one "
+        "({} MB total)",
+        overlap_last - overlap_first + 1, union_length >> 20,
+        scaled_resolve_committed_bytes_ >> 20);
+    scaled_resolve_segments_.erase(
+        scaled_resolve_segments_.begin() + overlap_first,
+        scaled_resolve_segments_.begin() + (overlap_last + 1));
+    insert_index = overlap_first;
+  } else {
+    while (insert_index < scaled_resolve_segments_.size() &&
+           scaled_resolve_segments_[insert_index].start_scaled < union_first) {
+      ++insert_index;
+    }
+    XELOGI(
+        "D3D12TextureCache: Allocated a {} MB scaled resolve segment at {} MB "
+        "({} MB total)",
+        union_length >> 20, union_first >> 20,
+        scaled_resolve_committed_bytes_ >> 20);
+  }
+  scaled_resolve_segments_.insert(
+      scaled_resolve_segments_.begin() + insert_index, std::move(new_segment));
+  COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb",
+                    uint32_t((scaled_resolve_committed_bytes_ +
+                              scaled_resolve_retired_bytes_) >>
+                             20));
+  segment_index_out = insert_index;
+  return true;
+}
+
+void D3D12TextureCache::CompletedSubmissionUpdated(
+    uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+  // Release the buffers of merged segments whose copy submission completed.
+  std::erase_if(scaled_resolve_retired_buffers_,
+                [this, completed_submission_index](
+                    const RetiredScaledResolveBuffer& retired) {
+                  if (retired.submission > completed_submission_index) {
+                    return false;
+                  }
+                  scaled_resolve_retired_bytes_ -= retired.length;
+                  return true;
+                });
+}
+
 D3D12TextureCache::~D3D12TextureCache() {
   // While the texture descriptor cache still exists (referenced by
   // ~D3D12Texture), destroy all textures.
   DestroyAllTextures(true);
+
+  // The command processor has awaited the GPU before destroying the caches.
+  scaled_resolve_current_segment_ = nullptr;
+  scaled_resolve_segments_.clear();
+  scaled_resolve_retired_buffers_.clear();
 
   // First release the buffers to detach them from the heaps.
   for (std::unique_ptr<ScaledResolveVirtualBuffer>& scaled_resolve_buffer_ptr :
@@ -137,6 +349,12 @@ bool D3D12TextureCache::Initialize() {
         (draw_resolution_scale_x() * draw_resolution_scale_y());
     scaled_resolve_heaps_.resize(size_t(scaled_resolve_address_space_size >>
                                         kScaledResolveHeapSizeLog2));
+    scaled_resolve_committed_ = !IsScaledResolveTiled(provider);
+    if (scaled_resolve_committed_) {
+      XELOGI(
+          "D3D12TextureCache: Draw resolution scaling memory is committed per "
+          "resolved range because tiled resources are not used");
+    }
   }
   scaled_resolve_heap_count_ = 0;
 
@@ -449,7 +667,11 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
 
   // ExecuteCommandLists is a full UAV and aliasing barrier.
-  if (IsDrawResolutionScaled()) {
+  if (IsDrawResolutionScaled() && scaled_resolve_committed_) {
+    for (ScaledResolveSegment& segment : scaled_resolve_segments_) {
+      segment.buffer->ClearUAVBarrierPending();
+    }
+  } else if (IsDrawResolutionScaled()) {
     size_t scaled_resolve_buffer_count = GetScaledResolveBufferCount();
     for (size_t i = 0; i < scaled_resolve_buffer_count; ++i) {
       ScaledResolveVirtualBuffer* scaled_resolve_buffer =
@@ -993,6 +1215,11 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(
                           length_scaled_alignment_bits) &
                          ~length_scaled_alignment_bits;
 
+  if (scaled_resolve_committed_) {
+    // Segments are allocated by MakeScaledResolveRangeCurrent.
+    return true;
+  }
+
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -1123,6 +1350,21 @@ bool D3D12TextureCache::MakeScaledResolveRangeCurrent(
       ~length_scaled_alignment_bits;
   uint64_t last_scaled = start_scaled + (length_scaled - 1);
 
+  if (scaled_resolve_committed_) {
+    // Bind the committed segment containing the whole range.
+    size_t segment_index;
+    if (!EnsureScaledResolveSegment(start_scaled, last_scaled, segment_index)) {
+      return false;
+    }
+    const ScaledResolveSegment& segment =
+        scaled_resolve_segments_[segment_index];
+    scaled_resolve_current_segment_ = segment.buffer.get();
+    scaled_resolve_current_segment_start_scaled_ = segment.start_scaled;
+    scaled_resolve_current_range_start_scaled_ = start_scaled;
+    scaled_resolve_current_range_length_scaled_ = length_scaled;
+    return true;
+  }
+
   // Get one or two buffers that can hold the whole range.
   std::array<size_t, 2> possible_buffer_indices_first =
       GetPossibleScaledResolveBufferIndices(start_scaled);
@@ -1227,6 +1469,12 @@ void D3D12TextureCache::TransitionCurrentScaledResolveRange(
 D3D12_GPU_VIRTUAL_ADDRESS
 D3D12TextureCache::GetCurrentScaledResolveRangeGPUAddress() const {
   assert_true(IsDrawResolutionScaled());
+  if (scaled_resolve_committed_) {
+    assert_not_null(scaled_resolve_current_segment_);
+    return scaled_resolve_current_segment_->resource()->GetGPUVirtualAddress() +
+           (scaled_resolve_current_range_start_scaled_ -
+            scaled_resolve_current_segment_start_scaled_);
+  }
   const size_t buffer_index = GetCurrentScaledResolveBufferIndex();
   const ScaledResolveVirtualBuffer* buffer =
       scaled_resolve_2gb_buffers_[buffer_index].get();

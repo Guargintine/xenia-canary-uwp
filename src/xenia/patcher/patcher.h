@@ -25,6 +25,7 @@ class Patcher {
                             const std::optional<uint64_t> hash);
 
   bool IsAnyPatchApplied() { return is_any_patch_applied_; }
+  void ReloadPatches() { patch_db_->LoadPatches(); }
 
  private:
   PatchDB* patch_db_;

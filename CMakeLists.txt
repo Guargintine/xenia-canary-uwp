@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# UWP is configured in a separate build tree because its system ABI and
-# permitted Windows APIs also apply to every static library it links.
+# Keep UWP build artifacts and App SDK settings separate from desktop builds.
 option(XENIA_BUILD_UWP "Build the UWP/Xbox application" OFF)
 if(XENIA_BUILD_UWP)
   if(NOT CMAKE_HOST_WIN32 OR NOT CMAKE_GENERATOR MATCHES "Visual Studio")

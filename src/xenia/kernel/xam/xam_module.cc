@@ -12,6 +12,9 @@
 #include "xenia/base/math.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_private.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/kernel/xam/xam_title_restart.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -63,6 +66,10 @@ void XamModule::RegisterExportTable(xe::cpu::ExportResolver* export_resolver) {
 XamModule::~XamModule() {}
 
 void XamModule::LoadLoaderData() {
+#if XE_PLATFORM_WINRT
+  LoadLoaderDataFile(PersistentLoaderDataPath(emulator_->storage_root()),
+                     loader_data_);
+#else
   FILE* file = xe::filesystem::OpenFile(kXamModuleLoaderDataFileName, "rb");
 
   if (!file) {
@@ -96,15 +103,21 @@ void XamModule::LoadLoaderData() {
   fclose(file);
   // We read launch data. Let's remove it till next request.
   std::filesystem::remove(kXamModuleLoaderDataFileName);
+#endif
 }
 
-void XamModule::SaveLoaderData() {
+bool XamModule::SaveLoaderData() {
+#if XE_PLATFORM_WINRT
+  const auto persisted = PrepareTitleRestartData(loader_data_);
+  return persisted &&
+         SaveLoaderDataFile(PersistentLoaderDataPath(emulator_->storage_root()),
+                            *persisted);
+#else
   FILE* file = xe::filesystem::OpenFile(kXamModuleLoaderDataFileName, "wb");
 
   if (!file) {
-    return;
+    return false;
   }
-
   std::filesystem::path host_path = loader_data_.host_path;
   std::string launch_path = loader_data_.launch_path;
 
@@ -144,7 +157,9 @@ void XamModule::SaveLoaderData() {
 
   fwrite(loader_data_.launch_data.data(), launch_data_size, 1, file);
 
-  fclose(file);
+  const bool written = !ferror(file);
+  return fclose(file) == 0 && written;
+#endif
 }
 
 }  // namespace xam

@@ -16,6 +16,10 @@
 #include "xenia/hid/input_driver.h"
 #include "xenia/kernel/util/shim_utils.h"
 
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/UWPUtil.h"
+#endif
+
 #if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
 #include "xenia/hid/portal/hardware_portal.h"
 #endif  // XE_PLATFORM_WIN32
@@ -40,7 +44,13 @@ DEFINE_double(
     "Defines deadzone level for right trigger. Allowed range [0.0-1.0].",
     "HID");
 
-InputSystem::InputSystem(xe::ui::Window* window) : window_(window) {
+InputSystem::InputSystem(xe::ui::Window* window)
+    : window_(window)
+#if XE_PLATFORM_WINRT
+      ,
+      guest_input_capture_(UWP::GetUIInputCaptureState())
+#endif
+{
 #if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
   portal_ = std::make_unique<HardwarePortal>();
 #endif  // XE_PLATFORM_WIN32
@@ -48,7 +58,20 @@ InputSystem::InputSystem(xe::ui::Window* window) : window_(window) {
 
 InputSystem::~InputSystem() = default;
 
-X_STATUS InputSystem::Setup() { return X_STATUS_SUCCESS; }
+X_STATUS InputSystem::Setup() {
+#if XE_PLATFORM_WIN32
+  for (uint32_t player = 0; player < XUserMaxUserCount; ++player) {
+    auto& driver = dsu_drivers_[player];
+    driver = std::make_unique<dsu::DSUInputDriver>(window_, 0);
+    if (XFAILED(driver->Reconfigure(
+            dsu::DSUInputDriver::ReadConfiguration(player)))) {
+      XELOGW("DSU player {}: {}", player + 1,
+             driver->GetConnectionStatus().error);
+    }
+  }
+#endif
+  return X_STATUS_SUCCESS;
+}
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
   drivers_.push_back(std::move(driver));
@@ -117,6 +140,12 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
       return result;
     }
   }
+#if XE_PLATFORM_WIN32
+  if (auto* driver = dsu_driver(user_index);
+      driver && (flags & InputType::Controller)) {
+    return driver->GetCapabilities(user_index, flags, out_caps);
+  }
+#endif
   return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -124,23 +153,55 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
                                X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
 
-  std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
-  if (filtered_drivers.empty()) {
-    return X_ERROR_DEVICE_NOT_CONNECTED;
+  if (!out_state || user_index >= XUserMaxUserCount) {
+    return X_ERROR_INVALID_PARAMETER;
   }
-
+  *out_state = {};
+  std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
+  InputDriver* active_driver = nullptr;
   for (auto& driver : filtered_drivers) {
     X_RESULT result = driver->GetState(user_index, out_state);
     if (result == X_ERROR_SUCCESS) {
-      UpdateUsedSlot(driver, user_index, true);
-      AdjustDeadzoneLevels(user_index, &out_state->gamepad);
-
-      if (out_state->gamepad.buttons != 0) {
-        last_used_slot = user_index;
-      }
-      return result;
+      active_driver = driver;
+      break;
     }
   }
+  if (!active_driver) {
+    *out_state = {};
+  }
+#if XE_PLATFORM_WIN32
+  if (auto* driver = dsu_driver(user_index);
+      driver && (flags & InputType::Controller)) {
+    X_INPUT_STATE remote{};
+    if (driver->GetState(user_index, &remote) == X_ERROR_SUCCESS) {
+      dsu::MergeGamepads(out_state->gamepad, remote.gamepad);
+      if (!active_driver) {
+        active_driver = driver;
+      }
+    }
+  }
+#endif
+  if (active_driver) {
+    UpdateUsedSlot(active_driver, user_index, true);
+    AdjustDeadzoneLevels(user_index, &out_state->gamepad);
+#if XE_PLATFORM_WIN32
+    if (auto* driver = dsu_driver(user_index);
+        driver && (flags & InputType::Controller)) {
+      dsu::AddRightStickMotion(out_state->gamepad,
+                               driver->GetMotion(user_index));
+    }
+#endif
+    if (out_state->gamepad.buttons != 0) {
+      last_used_slot = user_index;
+    }
+#if XE_PLATFORM_WIN32
+    merged_input_[user_index].Update(true, *out_state);
+#endif
+    return X_ERROR_SUCCESS;
+  }
+#if XE_PLATFORM_WIN32
+  merged_input_[user_index].Update(false, *out_state);
+#endif
   UpdateUsedSlot(nullptr, user_index, false);
   return X_ERROR_DEVICE_NOT_CONNECTED;
 }
@@ -149,13 +210,22 @@ X_RESULT InputSystem::SetState(uint32_t user_index,
                                X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
   X_INPUT_VIBRATION modified_vibration = ModifyVibrationLevel(vibration);
+  bool connected = false;
   for (auto& driver : drivers_) {
     X_RESULT result = driver->SetState(user_index, &modified_vibration);
     if (result == X_ERROR_SUCCESS) {
-      return result;
+      connected = true;
+      break;
     }
   }
-  return X_ERROR_DEVICE_NOT_CONNECTED;
+#if XE_PLATFORM_WIN32
+  if (auto* driver = dsu_driver(user_index);
+      driver &&
+      driver->SetState(user_index, &modified_vibration) == X_ERROR_SUCCESS) {
+    connected = true;
+  }
+#endif
+  return connected ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
@@ -184,6 +254,22 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
       continue;
     }
   }
+#if XE_PLATFORM_WIN32
+  if (flags & InputType::Controller) {
+    for (const auto& driver : dsu_drivers_) {
+      if (!driver) {
+        continue;
+      }
+      const X_RESULT result =
+          driver->GetKeystroke(user_index, flags, out_keystroke);
+      if (result == X_ERROR_SUCCESS) {
+        last_used_slot = out_keystroke->user_index;
+        return result;
+      }
+      any_connected |= result == X_ERROR_EMPTY;
+    }
+  }
+#endif
   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 

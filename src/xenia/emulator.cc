@@ -8,6 +8,7 @@
  */
 
 #include <future>
+#include <mutex>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -46,6 +47,7 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
+#include "xenia/kernel/xam/xam_net_async.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
@@ -73,6 +75,9 @@
 #if XE_PLATFORM_WINRT
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.Pickers.h>
+
+#include "xenia-canary-uwp/XeniaUWP.h"
+#include "xenia/app/guide_dialog.h"
 #endif
 
 DEFINE_double(time_scalar, 1.0,
@@ -93,6 +98,15 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DECLARE_bool(allow_plugins);
+DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
+
+DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
+UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
+
+DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
+            "Storage");
+
+DECLARE_bool(force_mount_devkit);
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -193,6 +207,7 @@ Emulator::~Emulator() {
   if (graphics_system_) {
     graphics_system_->Shutdown();
   }
+  audio_media_player_.reset();
   if (audio_system_) {
     audio_system_->Shutdown();
   }
@@ -200,7 +215,6 @@ Emulator::~Emulator() {
   input_system_.reset();
   graphics_system_.reset();
   audio_system_.reset();
-  audio_media_player_.reset();
 
   kernel_state_.reset();
   file_system_.reset();
@@ -228,6 +242,9 @@ X_STATUS Emulator::Setup(
 
   display_window_ = display_window;
   imgui_drawer_ = imgui_drawer;
+  require_cpu_backend_ = require_cpu_backend;
+  audio_system_factory_ = audio_system_factory;
+  const bool reinitializing = graphics_system_ != nullptr;
 
   // Initialize clock.
   // 360 uses a 50MHz clock.
@@ -297,33 +314,34 @@ X_STATUS Emulator::Setup(
 
   XELOGI("{}: Initializing Graphics...", __func__);
   // Initialize the GPU.
-  graphics_system_ = graphics_system_factory();
+  if (!graphics_system_) graphics_system_ = graphics_system_factory();
   if (!graphics_system_) {
     XELOGE("{}: Cannot initalize graphics_system!", __func__);
     return X_STATUS_NOT_IMPLEMENTED;
   }
 
-  XELOGI("{}: Initializing HID...", __func__);
-  // Initialize the HID.
-  input_system_ = std::make_unique<xe::hid::InputSystem>(display_window_);
   if (!input_system_) {
-    XELOGE("{}: Cannot initalize input_system!", __func__);
-    return X_STATUS_NOT_IMPLEMENTED;
-  }
-  if (input_driver_factory) {
-    auto input_drivers = input_driver_factory(display_window_);
-    for (size_t i = 0; i < input_drivers.size(); ++i) {
-      input_system_->AddDriver(std::move(input_drivers[i]));
+    XELOGI("{}: Initializing HID...", __func__);
+    input_system_ = std::make_unique<xe::hid::InputSystem>(display_window_);
+    if (!input_system_) {
+      XELOGE("{}: Cannot initalize input_system!", __func__);
+      return X_STATUS_NOT_IMPLEMENTED;
     }
-  }
+    if (input_driver_factory) {
+      auto input_drivers = input_driver_factory(display_window_);
+      for (size_t i = 0; i < input_drivers.size(); ++i) {
+        input_system_->AddDriver(std::move(input_drivers[i]));
+      }
+    }
 
-  result = input_system_->Setup();
-  if (result) {
-    return result;
-  }
+    result = input_system_->Setup();
+    if (result) {
+      return result;
+    }
 
-  // Add inputSystem to UI
-  imgui_drawer_->LoadInputSystem(input_system_.get());
+    imgui_drawer_->LoadInputSystem(input_system_.get());
+
+  }
 
   XELOGI("{}: Initializing VFS...", __func__);
   // Bring up the virtual filesystem used by the kernel.
@@ -350,10 +368,13 @@ X_STATUS Emulator::Setup(
 
   XELOGI("{}: Starting graphics_system...", __func__);
   // Setup the core components.
-  result = graphics_system_->Setup(
-      processor_.get(), kernel_state_.get(),
-      display_window_ ? &display_window_->app_context() : nullptr,
-      display_window_ != nullptr);
+  result = reinitializing
+               ? graphics_system_->ReinitializeGuestState(processor_.get(),
+                                                          kernel_state_.get())
+               : graphics_system_->Setup(
+                     processor_.get(), kernel_state_.get(),
+                     display_window_ ? &display_window_->app_context() : nullptr,
+                     display_window_ != nullptr);
   if (result) {
     XELOGE("{}: Failed to setup graphics_system!", __func__);
     return result;
@@ -373,7 +394,163 @@ X_STATUS Emulator::Setup(
 
   // Initialize emulator fallback exception handling last.
   ExceptionHandler::Install(Emulator::ExceptionCallbackThunk, this);
+  SetupFileSystem();
 
+  return result;
+}
+
+void Emulator::SetupFileSystem() {
+  const auto fs = file_system();
+
+  if (cvars::mount_scratch) {
+    auto scratch_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\SCRATCH", storage_root() / "scratch", false);
+    if (!scratch_device->Initialize()) {
+      XELOGE("Unable to scan scratch path");
+    } else {
+      if (!fs->RegisterDevice(std::move(scratch_device))) {
+        XELOGE("Unable to register scratch path");
+      } else {
+        fs->RegisterSymbolicLink("scratch:", "\\SCRATCH");
+      }
+    }
+  }
+
+  if (cvars::mount_cache) {
+    auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE0", storage_root() / "cache0", false);
+    if (!cache0_device->Initialize()) {
+      XELOGE("Unable to scan cache0 path");
+    } else {
+      if (!fs->RegisterDevice(std::move(cache0_device))) {
+        XELOGE("Unable to register cache0 path");
+      } else {
+        fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
+      }
+    }
+
+    auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE1", storage_root() / "cache1", false);
+    if (!cache1_device->Initialize()) {
+      XELOGE("Unable to scan cache1 path");
+    } else {
+      if (!fs->RegisterDevice(std::move(cache1_device))) {
+        XELOGE("Unable to register cache1 path");
+      } else {
+        fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
+      }
+    }
+
+    // Register cache after cache0/cache1 so prefix matching resolves the
+    // numbered cache devices first.
+    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE", storage_root() / "cache", false);
+    if (!cache_device->Initialize()) {
+      XELOGE("Unable to scan cache path");
+    } else {
+      if (!fs->RegisterDevice(std::move(cache_device))) {
+        XELOGE("Unable to register cache path");
+      } else {
+        fs->RegisterSymbolicLink("cache:", "\\CACHE");
+      }
+    }
+
+    auto xstorage_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\XSTORAGE", storage_root() / "xstorage", false);
+    if (!xstorage_device->Initialize()) {
+      XELOGE("Unable to scan xstorage path");
+    } else {
+      if (!fs->RegisterDevice(std::move(xstorage_device))) {
+        XELOGE("Unable to register xstorage path");
+      } else {
+        fs->RegisterSymbolicLink("xstorage:", "\\XSTORAGE");
+      }
+    }
+  }
+
+  if (cvars::force_mount_devkit) {
+    auto devkit_device =
+        std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
+
+    if (!devkit_device->Initialize()) {
+      XELOGE("Unable to scan devkit path");
+    }
+
+    if (!fs->RegisterDevice(std::move(devkit_device))) {
+      XELOGE("Unable to register devkit path");
+    }
+
+    fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
+    fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+  }
+
+  if (cvars::mount_memory_unit) {
+    auto mu_device =
+        std::make_unique<xe::vfs::HostPathDevice>("\\MU", "MU", false);
+
+    if (!mu_device->Initialize()) {
+      XELOGE("Unable to scan MU path");
+    }
+
+    if (!fs->RegisterDevice(std::move(mu_device))) {
+      XELOGE("Unable to register MU path");
+    }
+
+    fs->RegisterSymbolicLink("MU:", "\\MU");
+  }
+}
+
+X_STATUS Emulator::ResetTitle() {
+  if (!is_title_open()) return X_STATUS_UNSUCCESSFUL;
+  if (is_paused()) Resume();
+
+  XELOGI("Closing title: draining guest callbacks");
+  xe::FlushLog();
+  kernel_state_->xam_state()->StopPeriodicMaintenance();
+  if (audio_media_player_) audio_media_player_->StopWorkers();
+  if (audio_system_) audio_system_->StopWorkers();
+  graphics_system_->StopGuestCallbacks();
+  kernel_state_->StopDispatch();
+  kernel_state_->async_work().Stop();
+
+  XELOGI("Closing title: stopping guest threads");
+  xe::FlushLog();
+  if (!kernel_state_->TerminateTitleThreads()) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  kernel_state_->xam_state()->StopPeriodicMaintenance();
+  graphics_system_->ShutdownGuestState();
+  {
+    std::lock_guard lock(main_thread_mutex_);
+    main_thread_.reset();
+  }
+  plugin_loader_thread_.reset();
+  audio_media_player_.reset();
+  if (audio_system_) audio_system_->Shutdown();
+  audio_system_.reset();
+  xbox_live_api_->DeleteAllSessionsByMac(2);
+  kernel::xam::ResetNetworkTitleState(xbox_live_api_.get());
+  game_info_database_.reset();
+  plugin_loader_.reset();
+  patcher_.reset();
+  kernel_state_.reset();
+  file_system_.reset();
+  ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);
+  processor_.reset();
+  export_resolver_.reset();
+  memory_.reset();
+  title_id_ = std::nullopt;
+  title_name_.clear();
+  title_version_.clear();
+
+  XELOGI("Closing title: creating idle guest runtime");
+  xe::FlushLog();
+  auto result = Setup(display_window_, imgui_drawer_, require_cpu_backend_,
+                      audio_system_factory_, {}, {});
+  if (XSUCCEEDED(result)) {
+    XELOGI("Title closed; guest runtime ready");
+    xe::FlushLog();
+  }
   return result;
 }
 
@@ -382,7 +559,7 @@ X_STATUS Emulator::TerminateTitle() {
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  kernel_state_->TerminateTitle();
+  if (!kernel_state_->TerminateTitle()) return X_STATUS_UNSUCCESSFUL;
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
@@ -469,9 +646,22 @@ void Emulator::SetPersistentEmulatorFlags(uint64_t new_flags) {
 }
 
 X_STATUS Emulator::MountPath(const std::filesystem::path& path,
-                             const std::string_view mount_path) {
+                             const std::string_view mount_path,
+                             vfs::Device** out_device) {
+  if (out_device) {
+    *out_device = nullptr;
+  }
   auto device = CreateVfsDevice(path, mount_path);
   if (!device || !device->Initialize()) {
+    if (device) {
+      // Content packages are tracked before their devices are initialized.
+      // Release the failed device before its package, whose header it borrows.
+      // A null device may indicate an existing package, so don't close it.
+      const std::string failed_mount_path(device->mount_path());
+      device.reset();
+      kernel_state_->content_manager()->CloseContentByDeviceName(
+          failed_mount_path);
+    }
     XELOGE(
         "Unable to mount the selected file, it is an unsupported format or "
         "corrupted.");
@@ -480,7 +670,8 @@ X_STATUS Emulator::MountPath(const std::filesystem::path& path,
 
   const std::string mpath = std::string(device->mount_path());
 
-  if (!file_system_->RegisterDevice(std::move(device))) {
+  auto mounted_device = file_system_->RegisterDevice(std::move(device));
+  if (!mounted_device) {
     XELOGE("Unable to register the input file to {}.", mount_path);
     return X_STATUS_NO_SUCH_FILE;
   }
@@ -492,6 +683,9 @@ X_STATUS Emulator::MountPath(const std::filesystem::path& path,
   // Create symlinks to the device.
   file_system_->RegisterSymbolicLink(kDefaultGameSymbolicLink, mpath);
   file_system_->RegisterSymbolicLink(kDefaultPartitionSymbolicLink, mpath);
+  if (out_device) {
+    *out_device = mounted_device;
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -596,9 +790,43 @@ Emulator::FileSignatureType GetFileSignature(
   return Emulator::GetFileSignature(path);
 }
 
-X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
-  X_STATUS mount_result = X_STATUS_SUCCESS;
+X_STATUS Emulator::LaunchWithMount(
+    const std::filesystem::path& path, std::string_view mount_path,
+    X_STATUS (Emulator::*launch)(const std::filesystem::path&)) {
+  const std::string_view links[] = {kDefaultGameSymbolicLink,
+                                  kDefaultPartitionSymbolicLink, "plugins:"};
+  std::optional<std::string> previous_links[xe::countof(links)];
+  for (size_t i = 0; i < xe::countof(links); ++i) {
+    std::string target;
+    if (file_system_->FindSymbolicLink(links[i], target)) {
+      previous_links[i] = std::move(target);
+    }
+  }
 
+  vfs::Device* device = nullptr;
+  X_STATUS result = MountPath(path, mount_path, &device);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  result = (this->*launch)(path);
+  // Per-title state may retain module data before the main thread starts.
+  // Roll back only early load failures, before that initialization begins.
+  if (XFAILED(result) && !is_title_open()) {
+    const std::string device_path(device->mount_path());
+    file_system_->UnregisterDevice(device);
+    kernel_state_->content_manager()->CloseContentByDeviceName(device_path);
+    for (size_t i = 0; i < xe::countof(links); ++i) {
+      file_system_->UnregisterSymbolicLink(links[i]);
+      if (previous_links[i]) {
+        file_system_->RegisterSymbolicLink(links[i], *previous_links[i]);
+      }
+    }
+  }
+  return result;
+}
+
+X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   switch (GetFileSignature(path)) {
     case FileSignatureType::XEX0:
     case FileSignatureType::XEXQ:
@@ -607,26 +835,26 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
-      mount_result = MountPath(path, "\\Device\\Harddisk0\\Partition1");
-      return mount_result ? mount_result : LaunchXexFile(path);
+      return LaunchWithMount(path, "\\Device\\Harddisk0\\Partition1",
+                             &Emulator::LaunchXexFile);
     } break;
     case FileSignatureType::LIVE:
     case FileSignatureType::CON:
     case FileSignatureType::PIRS: {
-      mount_result = MountPath(path, "\\Device\\Package_0");
-      return mount_result ? mount_result : LaunchStfsContainer(path);
+      return LaunchWithMount(path, "\\Device\\Package_0",
+                             &Emulator::LaunchStfsContainer);
     } break;
     case FileSignatureType::XISO: {
-      mount_result = MountPath(path, "\\Device\\Cdrom0");
-      return mount_result ? mount_result : LaunchDiscImage(path);
+      return LaunchWithMount(path, "\\Device\\Cdrom0",
+                             &Emulator::LaunchDiscImage);
     } break;
     case FileSignatureType::XBE: {
       XELOGE("OG Xbox games are not supported");
       return X_STATUS_NOT_SUPPORTED;
     } break;
     case FileSignatureType::ZAR: {
-      mount_result = MountPath(path, "\\Device\\Cdrom0");
-      return mount_result ? mount_result : LaunchDiscArchive(path);
+      return LaunchWithMount(path, "\\Device\\Cdrom0",
+                             &Emulator::LaunchDiscArchive);
     } break;
     case FileSignatureType::EXE:
     case FileSignatureType::Unknown:
@@ -891,7 +1119,7 @@ X_STATUS Emulator::ProcessContentPackageHeader(
   installation_info.content_type_ = XContentType::kInvalid;
   installation_info.data_installation_path_ = xe::path_to_utf8(path.filename());
 
-  auto package = kernel_state_->content_manager()->OpenPackage(path);
+  auto package = kernel_state_->content_manager()->OpenPackage(path, true);
   if (!package) {
     installation_info.installation_state_ = InstallState::failed;
     installation_info.installation_result_ = X_STATUS_INVALID_PARAMETER;
@@ -968,16 +1196,17 @@ X_STATUS Emulator::InstallContentPackage(
     installation_info.installation_state_ = InstallState::preparing;
   }
 
+  // Opens the source package read-only.
   auto package =
-      kernel_state_->content_manager()->OpenAndMountPackage(path, "");
+      kernel_state_->content_manager()->OpenAndMountPackage(path, "", "", true);
 
   if (!package) {
     installation_info.installation_state_ = InstallState::failed;
     installation_info.installation_error_message_ =
         "Device initialization failed!";
     installation_info.installation_result_ = X_STATUS_ACCESS_DENIED;
-    XELOGE("Failed to initialize device");
-    return X_STATUS_INVALID_PARAMETER;
+    XELOGE("{}: Failed to open and mount package: {}", __func__, path);
+    return X_STATUS_ACCESS_DENIED;
   }
 
   if (!std::filesystem::exists(content_root())) {
@@ -1054,8 +1283,9 @@ X_STATUS Emulator::ExtractContentPackage(
     const std::filesystem::path& path, ContentInstallEntry& installation_info) {
   installation_info.installation_state_ = InstallState::preparing;
 
+  // Opens the source package read-only.
   auto package =
-      kernel_state_->content_manager()->OpenAndMountPackage(path, "");
+      kernel_state_->content_manager()->OpenAndMountPackage(path, "", "", true);
 
   if (!package) {
     installation_info.installation_state_ = InstallState::failed;
@@ -1282,7 +1512,7 @@ void Emulator::Resume() {
       continue;
     }
 
-    if (!thread->is_running()) {
+    if (thread->is_running()) {
       thread->thread()->Resume(nullptr);
     }
   }
@@ -1329,7 +1559,11 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
 
   // Terminate any loaded titles.
   Pause();
-  kernel_state_->TerminateTitle();
+  if (!kernel_state_->TerminateTitle()) {
+    restoring_ = false;
+    Resume();
+    return false;
+  }
 
   auto lock = global_critical_region::AcquireDirect();
   ByteStream stream(map->data(), map->size());
@@ -1390,35 +1624,132 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
   return true;
 }
 
+#if XE_PLATFORM_WINRT
+namespace {
+
+class DiscPickerDialog final : public ui::ImGuiDialog {
+ public:
+  DiscPickerDialog(ui::ImGuiDrawer* drawer, std::string message,
+                   std::shared_ptr<std::promise<std::filesystem::path>> result)
+      : ImGuiDialog(drawer),
+        message_(std::move(message)),
+        result_(std::move(result)) {}
+
+  ~DiscPickerDialog() override { Complete(); }
+
+ private:
+  struct PickerResult {
+    std::mutex mutex;
+    std::filesystem::path path;
+    bool ready = false;
+  };
+
+  void OpenPicker() {
+    picker_result_ = std::make_shared<PickerResult>();
+    previous_ignore_input_ = imgui_drawer()->GetIgnoreInput();
+    imgui_drawer()->SetIgnoreInput(true);
+    const auto result = picker_result_;
+    try {
+      winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+      picker.FileTypeFilter().Append(L"*");
+      // The native picker may outlive the dialog; completion owns only data.
+      picker.PickSingleFileAsync().Completed(
+          [result](const auto& operation, const auto&) {
+            std::filesystem::path path;
+            try {
+              auto file = operation.GetResults();
+              if (file) {
+                path = file.Path().c_str();
+              }
+            } catch (const winrt::hresult_error&) {
+            }
+            std::lock_guard lock(result->mutex);
+            result->path = std::move(path);
+            result->ready = true;
+          });
+    } catch (const winrt::hresult_error&) {
+      std::lock_guard lock(result->mutex);
+      result->ready = true;
+    }
+  }
+
+  void OnDraw(ImGuiIO&) override {
+    constexpr const char* kTitle = "Change disc##disc_picker";
+    if (!opened_) {
+      ImGui::OpenPopup(kTitle);
+      opened_ = true;
+    }
+    if (!app::BeginGuidePopup(kTitle, nullptr, guide_state_, imgui_drawer())) {
+      Close();
+      return;
+    }
+    ImGui::TextWrapped("%s", message_.empty()
+                                 ? "Select the disc requested by the game."
+                                 : message_.c_str());
+    bool complete = false;
+    if (picker_result_) {
+      ImGui::TextUnformatted("Selecting disc...");
+      std::lock_guard lock(picker_result_->mutex);
+      // ImGui clears its input history while the picker is open. Wait for the
+      // physical release before returning its A/B press to the game.
+      if (picker_result_->ready && UWP::ArePickerControlsReleased()) {
+        path_ = picker_result_->path;
+        complete = true;
+      }
+    } else {
+      if (app::GuideButton("Select disc")) {
+        OpenPicker();
+      }
+      ImGui::SetItemDefaultFocus();
+      if (!picker_result_ &&
+          (app::GuideButton("Cancel") || app::ConsumeGuideBackPress())) {
+        complete = true;
+      }
+    }
+    if (complete) {
+      ImGui::CloseCurrentPopup();
+      Close();
+    }
+    app::EndGuidePopup();
+  }
+
+  void OnClose() override { Complete(); }
+
+  void Complete() {
+    if (picker_result_) {
+      imgui_drawer()->SetIgnoreInput(previous_ignore_input_);
+      picker_result_.reset();
+    }
+    if (result_) {
+      result_->set_value(std::move(path_));
+      result_.reset();
+    }
+  }
+
+  std::string message_;
+  std::shared_ptr<std::promise<std::filesystem::path>> result_;
+  std::shared_ptr<PickerResult> picker_result_;
+  std::filesystem::path path_;
+  app::GuideDialogState guide_state_;
+  bool opened_ = false;
+  bool previous_ignore_input_ = false;
+};
+
+}  // namespace
+#endif
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
 #if XE_PLATFORM_WINRT
-  // Disc swapping is requested by a guest thread. The picker must be created
-  // on the UI thread while the guest waits for its asynchronous result.
-  if (!display_window_ || display_window_->app_context().IsInUIThread()) {
+  if (!display_window_ || !imgui_drawer_ ||
+      display_window_->app_context().IsInUIThread()) {
     return {};
   }
   auto result = std::make_shared<std::promise<std::filesystem::path>>();
   auto future = result->get_future();
-  if (!display_window_->app_context().CallInUIThread([result]() {
-        try {
-          winrt::Windows::Storage::Pickers::FileOpenPicker picker;
-          picker.FileTypeFilter().Append(L"*");
-          picker.PickSingleFileAsync().Completed([result](const auto& operation,
-                                                          const auto&) {
-            try {
-              auto file = operation.GetResults();
-              result->set_value(file
-                                    ? std::filesystem::path(file.Path().c_str())
-                                    : std::filesystem::path());
-            } catch (const winrt::hresult_error&) {
-              result->set_value({});
-            }
-          });
-        } catch (const winrt::hresult_error&) {
-          result->set_value({});
-        }
-      })) {
+  if (!display_window_->app_context().CallInUIThread(
+          [drawer = imgui_drawer_, message = std::move(window_message), result]() {
+            new DiscPickerDialog(drawer, message, result);
+          })) {
     return {};
   }
   return future.get();
@@ -1509,6 +1840,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   } else if (ex->code() == Exception::Code::kIllegalInstruction) {
     crash_msg.append("Illegal Instruction\n");
   }
+  // The registers follow; the summary above is what fits in a dialog.
+  const std::string crash_summary = crash_msg;
   crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
@@ -1526,16 +1859,37 @@ bool Emulator::ExceptionCallback(Exception* ex) {
                     context->v[i].u32[2], context->v[i].u32[3]));
   }
   XELOGE("{}", crash_msg);
+#if XE_PLATFORM_WINRT
+  // The full register dump does not fit on a TV and the paused game cannot
+  // continue, so show the summary and close Xenia when it is dismissed.
+  std::string crash_dlg = fmt::format(
+      "{} ({:08X}) crashed, so Xenia has stopped it.\n\n"
+      "Select OK to close Xenia, then start the game again. The full crash "
+      "details are in xenia.log.\n\n"
+      "{}",
+      title_name_.empty() ? std::string("The game") : title_name_,
+      title_id_.value_or(0), crash_summary);
+#else
   std::string crash_dlg = fmt::format(
       "The guest has crashed.\n\n"
       "Xenia has now paused itself.\n\n"
       "{}",
       crash_msg);
+#endif
   // Display a dialog telling the user the guest has crashed.
   if (display_window_ && imgui_drawer_) {
     display_window_->app_context().CallInUIThreadSynchronous([this,
                                                               &crash_dlg]() {
-      xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_, "Uh-oh!", crash_dlg);
+      auto* dialog = xe::ui::ImGuiDialog::ShowMessageBox(
+          imgui_drawer_, "Uh-oh!", crash_dlg);
+#if XE_PLATFORM_WINRT
+      dialog->Then([]() {
+        xe::FlushLog();
+        UWP::RequestQuit();
+      });
+#else
+      (void)dialog;
+#endif
     });
   }
 
@@ -1551,6 +1905,7 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 }
 
 void Emulator::WaitUntilExit() {
+  std::lock_guard lock(main_thread_mutex_);
   while (true) {
     if (main_thread_) {
       xe::threading::Wait(main_thread_->thread(), false);
@@ -1564,17 +1919,6 @@ void Emulator::WaitUntilExit() {
     }
   }
 
-#if XE_PLATFORM_WINRT
-  // A restore replaces the main thread inside the loop. Reset title state only
-  // after the final exit, and avoid repeating TerminateTitle's notification.
-  main_thread_ = nullptr;
-  if (is_title_open()) {
-    title_id_ = std::nullopt;
-    title_name_.clear();
-    title_version_.clear();
-    on_terminate();
-  }
-#endif
   on_exit();
 }
 
@@ -1684,9 +2028,30 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                      std::string("\\Cache1")};
   auto null_device =
       std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
+  vfs::Device* mounted_null_device = nullptr;
   if (null_device->Initialize()) {
-    file_system_->RegisterDevice(std::move(null_device));
+    mounted_null_device = file_system_->RegisterDevice(std::move(null_device));
   }
+
+  const auto retained_modules = kernel_state_->GetLoadedUserModules();
+  const bool retained_title_update =
+      kernel_state_->content_manager()->IsContentOpen("UPDATE");
+  kernel::object_ref<kernel::UserModule> module;
+  const auto fail_launch = [&](X_STATUS status) {
+    kernel_state_->RollbackUserModuleLoads(retained_modules);
+    module.reset();
+    if (!retained_title_update) {
+      kernel_state_->content_manager()->CloseContent("UPDATE");
+    }
+    if (mounted_null_device) {
+      file_system_->UnregisterDevice(mounted_null_device);
+    }
+    title_id_ = std::nullopt;
+    title_name_.clear();
+    title_version_.clear();
+    display_window_->SetIcon(nullptr, 0);
+    return status;
+  };
 
   // Reset state.
   title_id_ = std::nullopt;
@@ -1698,28 +2063,27 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
 
   XELOGI("Loading module {}", module_path);
-  auto module = kernel_state_->LoadUserModule(module_path);
+  module = kernel_state_->LoadUserModule(module_path);
   if (!module) {
     XELOGE("Failed to load user module {}", path);
-    return X_STATUS_NOT_FOUND;
+    return fail_launch(X_STATUS_NOT_FOUND);
   }
 
   if (!module->is_executable()) {
-    kernel_state_->UnloadUserModule(module, false);
     XELOGE("Failed to load user module {}", path);
-    return X_STATUS_NOT_SUPPORTED;
+    return fail_launch(X_STATUS_NOT_SUPPORTED);
   }
 
   X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
   if (XFAILED(result)) {
     XELOGE("Failed to apply title update! Cannot run module {}", path);
-    return result;
+    return fail_launch(result);
   }
 
   result = kernel_state_->FinishLoadingUserModule(module);
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}", path);
-    return result;
+    return fail_launch(result);
   }
   // Grab the current title ID.
   xex2_opt_execution_info* info = nullptr;

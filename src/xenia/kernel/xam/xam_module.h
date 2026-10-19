@@ -15,6 +15,7 @@
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/xam_loader_data.h"
 
 namespace xe {
 namespace kernel {
@@ -30,17 +31,10 @@ class XamModule : public KernelModule {
 
   static void RegisterExportTable(xe::cpu::ExportResolver* export_resolver);
 
-  struct LoaderData {
-    std::string host_path;  // Full host path to next title to load
-    std::string
-        launch_path;  // Full guest path to next xex. might be default.xex
-
-    uint32_t launch_flags = 0;
-    std::vector<uint8_t> launch_data;
-  };
+  using LoaderData = xe::kernel::xam::LoaderData;
 
   void LoadLoaderData();
-  void SaveLoaderData();
+  bool SaveLoaderData();
 
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }

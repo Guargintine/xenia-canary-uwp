@@ -28,6 +28,9 @@ class AudioMediaPlayer {
   ~AudioMediaPlayer();
 
   void Setup();
+  // Join the host worker before terminating guests, then call Shutdown after.
+  void StopWorkers();
+  void Shutdown();
 
   X_STATUS Play(uint32_t playlist_handle, uint32_t song_handle, bool force);
   X_STATUS Next();
@@ -42,7 +45,7 @@ class AudioMediaPlayer {
   bool IsIdle() const { return state_ == XmpApp::State::kIdle; }
   bool IsPlaying() const { return state_ == XmpApp::State::kPlaying; }
   bool IsPaused() const { return state_ == XmpApp::State::kPaused; }
-  bool IsSongLoaded() const { return active_song_; }
+  bool IsSongLoaded() const { return !stopping_ && active_song_; }
 
   bool IsInRepeatMode() const {
     return repeat_mode_ == XmpApp::RepeatMode::kPlaylist;
@@ -139,6 +142,7 @@ class AudioMediaPlayer {
 
   xe::global_critical_region global_critical_region_;
   std::atomic<bool> worker_running_ = {false};
+  std::atomic<bool> stopping_ = {false};
   std::unique_ptr<threading::Thread> worker_thread_;
   xe::threading::Fence resume_fence_;  // Signaled when resume requested.
   xe::threading::Fence processing_end_fence_;

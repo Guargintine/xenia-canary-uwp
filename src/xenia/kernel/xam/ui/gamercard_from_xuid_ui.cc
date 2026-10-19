@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xam/ui/gamercard_from_xuid_ui.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/xam/ui/friend_removal_confirmation.h"
 
 namespace xe {
 namespace kernel {
@@ -100,27 +101,33 @@ void GamercardFromXUIDUI::OnDraw(ImGuiIO& io) {
   ImGuiViewport* viewport = ImGui::GetMainViewport();
   ImVec2 center = viewport->GetCenter();
 
-  std::shared_ptr<xe::ui::ImmediateTexture> gamerpic_texture = {};
-
-  if (immediate_gamerpic_.valid()) {
-    if (immediate_gamerpic_.wait_for(0s) == std::future_status::ready) {
-      gamerpic_texture = immediate_gamerpic_.get();
-    }
+  if (immediate_gamerpic_.valid() &&
+      immediate_gamerpic_.wait_for(0s) == std::future_status::ready) {
+    gamerpic_texture_ = immediate_gamerpic_.get();
   }
 
-  ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-  if (ImGui::BeginPopupModal(title_.c_str(), &dialog_open,
-                             ImGuiWindowFlags_AlwaysAutoResize)) {
-    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+  FriendDialogPresentation guide;
+  const FriendDialogPresentation* presentation = nullptr;
+#if XE_PLATFORM_WINRT
+  guide = xeMakeNetplayGuidePresentation(imgui_drawer());
+  presentation = &guide;
+#endif
+  if (!presentation) {
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  }
+  if (BeginFriendPopup(title_.c_str(), &dialog_open,
+                       ImGuiWindowFlags_AlwaysAutoResize, presentation)) {
+    if (ConsumeFriendPopupBackPress(presentation)) {
+      dialog_open = false;
       ImGui::CloseCurrentPopup();
+    } else {
+      friend_presence_ = presence_.GetFriendPresence();
+      ImGui::BeginDisabled(presentation && FriendPopupOpeningInputHeld());
+      xeDrawFriendContent(imgui_drawer(), profile_, gamerpic_texture_,
+                          friend_presence_, nullptr, nullptr, presentation);
+      ImGui::EndDisabled();
     }
-
-    friend_presence_ = presence_.GetFriendPresence();
-
-    xeDrawFriendContent(imgui_drawer(), profile_, gamerpic_texture,
-                        friend_presence_, nullptr, nullptr);
-
-    ImGui::EndPopup();
+    EndFriendPopup(presentation);
   }
 
   if (!dialog_open) {

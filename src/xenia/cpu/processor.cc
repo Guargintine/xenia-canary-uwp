@@ -86,6 +86,17 @@ class BuiltinModule : public Module {
   std::string name_;
 };
 
+struct Processor::GuestStep {
+  uint32_t thread_id = 0;
+  uint32_t reached_address = 0;
+  threading::Fence reached;
+  std::unique_ptr<threading::Event> released =
+      threading::Event::CreateManualResetEvent(false);
+  std::vector<std::unique_ptr<Breakpoint>> breakpoints;
+  std::map<uintptr_t, uint32_t> addresses;
+  std::set<uint32_t> pending_threads;
+};
+
 Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
@@ -187,6 +198,17 @@ void Processor::RemoveModule(const std::string_view name) {
       [name](std::unique_ptr<xe::cpu::Module> const& module) {
         return module->name() == name;
       });
+
+  if (itr != modules_.cend()) {
+    RemoveModule(itr->get());
+  }
+}
+
+void Processor::RemoveModule(Module* module) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto itr = std::ranges::find_if(
+      std::as_const(modules_),
+      [module](const auto& entry) { return entry.get() == module; });
 
   if (itr != modules_.cend()) {
     const std::vector<uint32_t> addressed_functions =
@@ -474,7 +496,25 @@ void Processor::OnFunctionDefined(Function* function) {
     if (breakpoint->address_type() == Breakpoint::AddressType::kGuest) {
       if (function->ContainsAddress(breakpoint->guest_address())) {
         if (breakpoint->is_installed()) {
+          const bool synchronous_step = guest_step_ &&
+              std::ranges::any_of(guest_step_->breakpoints, [&](const auto& bp) {
+                return bp.get() == breakpoint;
+              });
+          if (synchronous_step && function->is_guest() &&
+              guest_step_->addresses.contains(
+                  static_cast<GuestFunction*>(function)
+                      ->MapGuestAddressToMachineCode(
+                          breakpoint->guest_address()))) {
+            continue;
+          }
           backend_->InstallBreakpoint(breakpoint, function);
+          if (synchronous_step) {
+            for (const auto& [host_address, original_bytes] :
+                 breakpoint->backend_data()) {
+              guest_step_->addresses.emplace(host_address,
+                                             breakpoint->guest_address());
+            }
+          }
         }
       }
     }
@@ -491,6 +531,9 @@ void Processor::OnThreadCreated(uint32_t thread_handle,
   thread_info->suspended = false;
   thread_info->thread_handle = thread_handle;
   thread_debug_infos_.emplace(thread_info->thread_id, std::move(thread_info));
+  if (guest_step_ && thread_state->thread_id() != guest_step_->thread_id) {
+    guest_step_->pending_threads.insert(thread_state->thread_id());
+  }
 }
 
 void Processor::OnThreadExit(uint32_t thread_id) {
@@ -507,6 +550,15 @@ void Processor::OnThreadDestroyed(uint32_t thread_id) {
   assert_true(it != thread_debug_infos_.end());
   it->second->thread_handle = 0;
   thread_debug_infos_.erase(it);
+  for (auto retry = guest_step_retries_.begin();
+       retry != guest_step_retries_.end();) {
+    retry->second.erase(thread_id);
+    if (retry->second.empty()) {
+      retry = guest_step_retries_.erase(retry);
+    } else {
+      ++retry;
+    }
+  }
 }
 
 void Processor::OnThreadEnteringWait(uint32_t thread_id) {
@@ -686,6 +738,47 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
 #endif  // XE_ARCH
 
   // Resume execution.
+  return true;
+}
+
+bool Processor::OnGuestStepBreakpointHit(Exception* ex) {
+  auto global_lock = global_critical_region_.Acquire();
+  const uint32_t thread_id = ThreadState::GetThreadID();
+  const uintptr_t host_address = ex->pc();
+  auto step = guest_step_;
+  if (!step || !step->addresses.contains(host_address)) {
+    auto retry = guest_step_retries_.find(host_address);
+    if (retry == guest_step_retries_.end() ||
+        !retry->second.erase(thread_id)) {
+      return false;
+    }
+    if (retry->second.empty()) {
+      guest_step_retries_.erase(retry);
+    }
+    // A different thread may have restored the instruction before this
+    // already-raised exception reached the handler.
+    return true;
+  }
+
+  if (thread_id != step->thread_id) {
+    step->pending_threads.erase(thread_id);
+    global_lock.unlock();
+    threading::Wait(step->released.get(), false);
+    return true;
+  }
+
+  auto thread_info = QueryThreadDebugInfo(thread_id);
+  auto thread = thread_info->thread->thread();
+  thread_info->host_context = *ex->thread_context();
+  step->reached_address = step->addresses.at(host_address);
+  for (auto& breakpoint : step->breakpoints) {
+    breakpoint->Suspend();
+  }
+  global_lock.unlock();
+  step->reached.Signal();
+  step.reset();
+  thread->Suspend();
+  // UD2 replaced the original bytes; resume at the restored instruction.
   return true;
 }
 
@@ -980,36 +1073,101 @@ void Processor::StepGuestInstruction(uint32_t thread_id) {
 }
 
 bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc) {
-  auto functions = FindFunctionsWithAddress(pc);
-  if (functions.empty()) {
-    // Function hasn't been generated yet. Generate it.
-    if (!ResolveFunction(pc)) {
-      XELOGE(
-          "Processor::StepToAddress({:08X}) - Function could not be resolved",
-          pc);
-      return false;
+  return pc && StepToGuestAddresses(thread_id, {pc}) == pc;
+}
+
+uint32_t Processor::StepToGuestAddresses(
+    uint32_t thread_id, const std::vector<uint32_t>& addresses) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto thread_info = QueryThreadDebugInfo(thread_id);
+  if (guest_step_ || !thread_info || thread_id == ThreadState::GetThreadID()) {
+    return 0;
+  }
+  std::set<uint32_t> unique_addresses(addresses.begin(), addresses.end());
+  if (unique_addresses.empty()) {
+    return 0;
+  }
+  for (uint32_t address : unique_addresses) {
+    if (!ResolveFunction(address)) {
+      XELOGE("Processor::StepToAddress({:08X}) - Function could not be resolved",
+             address);
+      return 0;
     }
   }
 
-  // Instruct the thread to step forwards.
-  threading::Fence fence;
-  cpu::Breakpoint bp(
-      this, Breakpoint::AddressType::kGuest, pc,
-      [&fence](Breakpoint* breakpoint, ThreadDebugInfo* thread_info,
-               uint64_t host_address) { fence.Signal(); });
-  bp.Resume();
+  auto step = std::make_shared<GuestStep>();
+  if (!step->released) {
+    return 0;
+  }
+  step->thread_id = thread_id;
+  for (const auto& [id, info] : thread_debug_infos_) {
+    if (id != thread_id && info->state != ThreadDebugInfo::State::kExited &&
+        info->state != ThreadDebugInfo::State::kZombie) {
+      step->pending_threads.insert(id);
+    }
+  }
+  guest_step_ = step;
+  for (uint32_t address : unique_addresses) {
+    auto breakpoint = std::make_unique<Breakpoint>(
+        this, Breakpoint::AddressType::kGuest, address, nullptr);
+    uintptr_t host_address = 0;
+    breakpoint->ForEachHostAddress(
+        [&](uintptr_t mapped_address) { host_address = mapped_address; });
+    if (step->addresses.contains(host_address)) {
+      continue;
+    }
+    AddBreakpoint(breakpoint.get());
+    if (execution_state_ != ExecutionState::kRunning) {
+      breakpoint->Resume();
+    }
+    for (const auto& [host_address, original_bytes] : breakpoint->backend_data()) {
+      step->addresses.emplace(host_address, address);
+    }
+    step->breakpoints.push_back(std::move(breakpoint));
+  }
+  auto thread = thread_info->thread->thread();
+  global_lock.unlock();
 
-  // HACK
-  auto thread_info = QueryThreadDebugInfo(thread_id);
-  uint32_t suspend_count = 1;
-  while (suspend_count) {
-    thread_info->thread->thread()->Resume(&suspend_count);
+  uint32_t suspend_count = 0;
+  bool success = true;
+  do {
+    if (!thread->Resume(&suspend_count)) {
+      success = false;
+      break;
+    }
+  } while (suspend_count > 1);
+  if (success) {
+    step->reached.Wait();
+
+    // The callback signals before self-suspending. Wait for that suspension,
+    // without leaving an extra suspend count, before its caller can terminate it.
+    do {
+      if (!thread->Suspend(&suspend_count) || !thread->Resume()) {
+        success = false;
+        break;
+      }
+      if (!suspend_count) {
+        threading::MaybeYield();
+      }
+    } while (!suspend_count);
   }
 
-  fence.Wait();
-  bp.Suspend();
-
-  return true;
+  global_lock.lock();
+  if (!step->pending_threads.empty()) {
+    for (const auto& [host_address, guest_address] : step->addresses) {
+      auto& pending = guest_step_retries_[host_address];
+      pending.insert(step->pending_threads.begin(), step->pending_threads.end());
+    }
+  }
+  for (auto& breakpoint : step->breakpoints) {
+    RemoveBreakpoint(breakpoint.get());
+    if (breakpoint->is_installed()) {
+      breakpoint->Suspend();
+    }
+  }
+  guest_step_.reset();
+  step->released->Set();
+  return success ? step->reached_address : 0;
 }
 
 uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
@@ -1023,38 +1181,35 @@ uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
               xe::cpu::ppc::PPCOpcodeGroup::kB);
 
   auto thread_info = QueryThreadDebugInfo(thread_id);
+  if (!thread_info) {
+    return 0;
+  }
   auto thread = thread_info->thread;
   auto context = thread->thread_state()->context();
 
   if (d.code == 0x4E800020) {
     // blr
     uint32_t nia = uint32_t(context->lr);
-    StepToGuestAddress(thread_id, nia);
+    if (!StepToGuestAddress(thread_id, nia)) {
+      return 0;
+    }
     pc = nia;
   } else if (d.code == 0x4E800420) {
     // bctr
     uint32_t nia = uint32_t(context->ctr);
-    StepToGuestAddress(thread_id, nia);
+    if (!StepToGuestAddress(thread_id, nia)) {
+      return 0;
+    }
     pc = nia;
   } else if (opcode == PPCOpcode::bx) {
     // bx
     uint32_t nia = d.I.ADDR();
-    StepToGuestAddress(thread_id, nia);
+    if (!StepToGuestAddress(thread_id, nia)) {
+      return 0;
+    }
     pc = nia;
   } else if (opcode == PPCOpcode::bcx || opcode == PPCOpcode::bcctrx ||
              opcode == PPCOpcode::bclrx) {
-    threading::Fence fence;
-    auto callback = [&fence, &pc](Breakpoint* breakpoint,
-                                  ThreadDebugInfo* thread_info,
-                                  uint64_t host_address) {
-      pc = breakpoint->guest_address();
-      fence.Signal();
-    };
-
-    cpu::Breakpoint bpf(this, Breakpoint::AddressType::kGuest, pc + 4,
-                        callback);
-    bpf.Resume();
-
     uint32_t nia = 0;
     if (opcode == PPCOpcode::bcx) {
       // bcx
@@ -1067,18 +1222,7 @@ uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
       nia = uint32_t(context->lr);
     }
 
-    cpu::Breakpoint bpt(this, Breakpoint::AddressType::kGuest, nia, callback);
-    bpt.Resume();
-
-    // HACK
-    uint32_t suspend_count = 1;
-    while (suspend_count) {
-      thread->thread()->Resume(&suspend_count);
-    }
-
-    fence.Wait();
-    bpt.Suspend();
-    bpf.Suspend();
+    pc = StepToGuestAddresses(thread_id, {pc + 4, nia});
   }
 
   return pc;
@@ -1092,6 +1236,9 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     return 0;
   }
   auto thread_info = QueryThreadDebugInfo(thread_id);
+  if (!thread_info) {
+    return 0;
+  }
   auto thread = thread_info->thread;
 
   // Now the fun part begins: Registers are only guaranteed to be synchronized
@@ -1125,16 +1272,22 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     auto& frame = first_frame;
     if (!frame.guest_pc) {
       // Lame. The guest->host thunk is a "guest" function.
+      if (count < 2) {
+        return 0;
+      }
       frame = cpu_frames[1];
     }
 
     pc = frame.guest_pc;
+    if (!pc) {
+      return 0;
+    }
 
     // We're in guest code.
     // First: Find a synchronizing instruction and go to it.
     xe::cpu::ppc::PPCDecodeData d;
     const xe::cpu::ppc::PPCOpcodeInfo* sync_info = nullptr;
-    d.address = cpu_frames[0].guest_pc - 4;
+    d.address = pc - 4;
     do {
       d.address += 4;
       d.code =
@@ -1147,7 +1300,9 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     } while (true);
 
     if (d.address != pc) {
-      StepToGuestAddress(thread_id, d.address);
+      if (!StepToGuestAddress(thread_id, d.address)) {
+        return 0;
+      }
       pc = d.address;
     }
 
@@ -1191,7 +1346,9 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     } else if (export_data) {
       // Non-blocking. Run until we return from the thunk.
       pc = static_cast<uint32_t>(thread->thread_state()->context()->lr);
-      StepToGuestAddress(thread_id, pc);
+      if (!StepToGuestAddress(thread_id, pc)) {
+        return 0;
+      }
     } else if (first_pc) {
       // We're in the MMIO handler/mfmsr/something calling out of the guest
       // that doesn't use an export. If the current instruction is
@@ -1205,21 +1362,15 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
         pc = first_pc;
       } else {
         // Step forward and run this logic again.
-        StepToGuestAddress(thread_id, first_pc + 4);
+        if (!StepToGuestAddress(thread_id, first_pc + 4)) {
+          return 0;
+        }
         return StepToGuestSafePoint(thread_id, true);
       }
     } else {
-      // We've managed to catch a thread before it called into the guest.
-      // Set a breakpoint on its startup procedure and capture it there.
-      // TODO(DrChat): Reimplement
-      assert_always("Unimplemented");
-      /*
-      auto creation_params = thread->creation_params();
-      pc = creation_params->xapi_thread_startup
-               ? creation_params->xapi_thread_startup
-               : creation_params->start_address;
-      StepToGuestAddress(thread_id, pc);
-      */
+      XELOGW("Processor::StepToSafePoint({:08X}): no guest frame available",
+             thread_id);
+      return 0;
     }
   }
 

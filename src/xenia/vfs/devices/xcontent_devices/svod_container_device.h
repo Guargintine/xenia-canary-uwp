@@ -24,7 +24,9 @@ class SvodContainerDevice : public XContentContainerDevice {
   SvodContainerDevice(const std::string_view mount_path,
                       const std::filesystem::path& host_path,
                       const size_t data_file_count,
-                      const SvodDeviceDescriptor* descriptor);
+                      const SvodDeviceDescriptor* descriptor,
+                      SvodHostFile::Storage storage =
+                          SvodHostFile::kDefaultStorage);
   ~SvodContainerDevice() override;
 
   bool is_read_only() const override { return true; }
@@ -68,7 +70,8 @@ class SvodContainerDevice : public XContentContainerDevice {
 
   size_t svod_base_offset_;
   SvodLayoutType svod_layout_;
-  MultiMemoryMap files_;
+  SvodHostFiles files_;
+  const SvodHostFile::Storage storage_;
 
   const SvodDeviceDescriptor* descriptor_;
 };

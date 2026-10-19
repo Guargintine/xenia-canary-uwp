@@ -52,8 +52,9 @@ class ContentManager {
       const XContentContainerHeader& container_header);
 
   // Host specific methods
+  // read_only opens the package without requesting write access.
   std::unique_ptr<ContentPackage> OpenPackage(
-      const std::filesystem::path host_path);
+      const std::filesystem::path host_path, bool read_only = false);
   std::unique_ptr<ContentPackage> OpenPackage(
       const uint64_t xuid, const XCONTENT_DATA_INTERNAL& data);
   std::unique_ptr<ContentPackage> CreatePackage(
@@ -62,7 +63,8 @@ class ContentManager {
 
   ContentPackage* OpenAndMountPackage(const std::filesystem::path host_path,
                                       const std::string_view root_name,
-                                      const std::string_view root_path = "");
+                                      const std::string_view root_path = "",
+                                      bool read_only = false);
   ContentPackage* CreateAndMountPackage(const std::filesystem::path host_path,
                                         const std::string_view root_name,
                                         const XCONTENT_DATA_INTERNAL& data);

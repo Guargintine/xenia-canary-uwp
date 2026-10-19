@@ -40,6 +40,12 @@ class GameAchievementsUI final : public XamDialog {
                                 const Achievement& achievement_entry) const;
 
   void OnDraw(ImGuiIO& io) override;
+#if XE_PLATFORM_WINRT
+  void OnDrawGuide(ImGuiIO& io);
+  bool guide_initialized_ = false;
+  bool guide_open_ = true;
+  bool guide_activation_armed_ = false;
+#endif
 
  private:
   bool show_locked_info_ = false;

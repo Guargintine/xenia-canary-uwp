@@ -17,6 +17,9 @@ namespace ui {
 
 FriendsUI::FriendsUI(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile)
     : XamDialog(imgui_drawer), profile_(profile) {
+#if XE_PLATFORM_WINRT
+  friends_ui_args_.content_args.guide_style = true;
+#endif
   friends_ui_args_.friends_presence =
       kernel_state()->xam_state()->presence_manager()->GetFriendsPresenceSorted(
           profile_->xuid());

@@ -33,7 +33,7 @@ DECLARE_bool(record_mmio_access_exceptions);
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
 
-DEFINE_bool(enable_host_guest_stack_synchronization, !XE_PLATFORM_WINRT,
+DEFINE_bool(enable_host_guest_stack_synchronization, true,
             "Records entries for guest/host stack mappings at function starts "
             "and checks for reentry at return sites. Has slight performance "
             "impact, but fixes crashes in games that use setjmp/longjmp.",
@@ -568,11 +568,12 @@ uint64_t X64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 }
 
 void X64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
     assert_true(original_bytes != 0x0F0B);
-    xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
+    xe::store_and_swap<uint16_t>(code_cache()->GetWritableAddress(host_address),
+                                 0x0F0B);
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
 }
@@ -592,7 +593,8 @@ void X64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
   auto ptr = reinterpret_cast<void*>(host_address);
   auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
   assert_true(original_bytes != 0x0F0B);
-  xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
+  xe::store_and_swap<uint16_t>(code_cache()->GetWritableAddress(host_address),
+                               0x0F0B);
   breakpoint->backend_data().emplace_back(host_address, original_bytes);
 }
 
@@ -601,7 +603,8 @@ void X64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
     auto ptr = reinterpret_cast<uint8_t*>(pair.first);
     auto instruction_bytes = xe::load_and_swap<uint16_t>(ptr);
     assert_true(instruction_bytes == 0x0F0B);
-    xe::store_and_swap<uint16_t>(ptr, static_cast<uint16_t>(pair.second));
+    xe::store_and_swap<uint16_t>(code_cache()->GetWritableAddress(pair.first),
+                                 static_cast<uint16_t>(pair.second));
   }
   breakpoint->backend_data().clear();
 }
@@ -641,6 +644,10 @@ bool X64Backend::ExceptionCallback(Exception* ex) {
   }
 
   // processor_->memory()->LookupVirtualMappedRange()
+
+  if (processor()->OnGuestStepBreakpointHit(ex)) {
+    return true;
+  }
 
   // Verify an expected illegal instruction.
   auto instruction_bytes =

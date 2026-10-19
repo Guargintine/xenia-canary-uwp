@@ -432,6 +432,7 @@ class XThread : public XObject, public cpu::Thread {
   X_STATUS Create();
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
+  bool TerminateForTitleShutdown();
 
   virtual void Execute();
 
@@ -530,7 +531,12 @@ class XThread : public XObject, public cpu::Thread {
   uint32_t stack_limit_ = 0;       // Low address
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
-  bool running_ = false;
+  std::atomic<bool> running_ = false;
+  enum class StartState { kPending, kStarted, kExiting, kCancelled };
+  std::atomic<StartState> start_state_ = StartState::kPending;
+  std::mutex creation_mutex_;
+  bool shutdown_requested_ = false;
+  bool registered_with_processor_ = false;
 
   int32_t priority_ = 0;       // current effective priority (may be decayed)
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this

@@ -31,6 +31,8 @@ namespace kernel {
 
 class UPnP {
  public:
+  enum class DiscoveryState { NotStarted, Searching, DeviceFound, Failed };
+
   // https://openconnectivity.org/developer/specifications/upnp-resources/upnp/internet-gateway-device-igd-v-2-0/
   // http://upnp.org/specs/gw/UPnP-gw-WANIPConnection-v2-Service.pdf
   enum class UPnPErrorCodes : int32_t {
@@ -73,6 +75,8 @@ class UPnP {
   ~UPnP();
 
   bool IsActive() const { return active_; }
+
+  DiscoveryState GetDiscoveryState() const { return discovery_state_; }
 
   bool IsVariableLeaseSupported() const { return leases_supported_; }
 
@@ -149,6 +153,7 @@ class UPnP {
   std::future<std::optional<std::string>> get_valid_IGD_;
 
   std::atomic<bool> active_ = false;
+  std::atomic<DiscoveryState> discovery_state_ = DiscoveryState::NotStarted;
   std::atomic<bool> leases_supported_ = true;
 
   std::mutex igd_mutex_;

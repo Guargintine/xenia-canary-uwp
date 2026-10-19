@@ -17,6 +17,7 @@
 // clang-format on
 
 #include "xenia/base/cvar.h"
+#include "xenia/base/curl_util.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/emulator.h"
@@ -367,6 +368,7 @@ void XLiveAPI::Init() {
 }
 
 NETWORK_MODE XLiveAPI::RefreshNetworkMode(bool lan_limit) {
+  initialization_started_ = true;
   const bool is_initialized = initialized_ != InitState::Pending;
 
   const auto adapter_manager =
@@ -456,11 +458,42 @@ void XLiveAPI::clearXnaddrCache() {
   macAddressCache.clear();
 }
 
+void XLiveAPI::ResetTitleState() {
+  initialized_ = InitState::Pending;
+  initialization_started_ = false;
+  clearXnaddrCache();
+  qos_payload_cache_.clear();
+  systemlink_id_ = 0;
+  xlsp_servers_.clear();
+  xlsp_servers_cached_ = false;
+  cached_gamerpics.clear();
+  dummy_friends_count_ = 0;
+}
+
+static void ConfigureRequestCancellation(CURL* curl, std::stop_token& stop) {
+  if (!stop.stop_possible()) {
+    return;
+  }
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(
+      curl, CURLOPT_XFERINFOFUNCTION,
+      +[](void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        return static_cast<std::stop_token*>(userdata)->stop_requested() ? 1 : 0;
+      });
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &stop);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+}
+
 // Request data from the server
 std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
-                                                      uint32_t timeout) {
+                                                      uint32_t timeout,
+                                                      std::stop_token stop) {
   response_data chunk = {};
-  CURL* curl_handle = curl_easy_init();
+  if (stop.stop_requested()) {
+    return PraseResponse(chunk);
+  }
+  CURL* curl_handle = xe::CreateCurlHandle();
   CURLcode result;
 
   if (!curl_handle) {
@@ -478,11 +511,13 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
   headers = curl_slist_append(headers, "charset: utf-8");
 
   if (headers == NULL) {
+    curl_easy_cleanup(curl_handle);
     return PraseResponse(chunk);
   }
 
+  ConfigureRequestCancellation(curl_handle, stop);
   if (timeout > 0) {
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, timeout);
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, static_cast<long>(timeout));
   }
 
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
@@ -496,6 +531,12 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
 
   if (result != CURLE_OK) {
     XELOGE("XLiveAPI::Get: CURL Error Code: {}", static_cast<uint32_t>(result));
+    curl_easy_cleanup(curl_handle);
+    curl_slist_free_all(headers);
+    if (stop.stop_requested()) {
+      free(chunk.response);
+      chunk = {};
+    }
     return PraseResponse(chunk);
   }
 
@@ -518,13 +559,18 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
 // Send data to the server
 std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
                                                        const uint8_t* data,
-                                                       size_t data_size) {
+                                                       size_t data_size,
+                                                       std::stop_token stop) {
   response_data chunk = {};
-  CURL* curl_handle = curl_easy_init();
+  if (stop.stop_requested()) {
+    return PraseResponse(chunk);
+  }
+  CURL* curl_handle = xe::CreateCurlHandle();
   CURLcode result;
 
   if (GetInitState() == InitState::Failed) {
     XELOGE("XLiveAPI::Post: Initialization failed");
+    curl_easy_cleanup(curl_handle);
     return PraseResponse(chunk);
   }
 
@@ -539,6 +585,7 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
 
   curl_slist* headers = NULL;
 
+  ConfigureRequestCancellation(curl_handle, stop);
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "POST");
   curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xenia");
@@ -553,6 +600,7 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
     headers = curl_slist_append(headers, "charset: utf-8");
 
     if (headers == NULL) {
+      curl_easy_cleanup(curl_handle);
       return PraseResponse(chunk);
     }
 
@@ -568,6 +616,12 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
   if (result != CURLE_OK) {
     XELOGE("XLiveAPI::Post: CURL Error Code: {}",
            static_cast<uint32_t>(result));
+    curl_easy_cleanup(curl_handle);
+    curl_slist_free_all(headers);
+    if (stop.stop_requested()) {
+      free(chunk.response);
+      chunk = {};
+    }
     return PraseResponse(chunk);
   }
 
@@ -586,13 +640,15 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Post(std::string endpoint,
 }
 
 // Delete data from the server
-std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
+std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint,
+                                                       uint32_t timeout) {
   response_data chunk = {};
-  CURL* curl_handle = curl_easy_init();
+  CURL* curl_handle = xe::CreateCurlHandle();
   CURLcode result;
 
   if (GetInitState() == InitState::Failed) {
     XELOGE("XLiveAPI::Delete: Initialization failed");
+    curl_easy_cleanup(curl_handle);
     return PraseResponse(chunk);
   }
 
@@ -612,6 +668,9 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
 
   curl_easy_setopt(curl_handle, CURLOPT_URL, endpoint.c_str());
 
+  if (timeout > 0) {
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, static_cast<long>(timeout));
+  }
   curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "DELETE");
   curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "xenia");
@@ -621,6 +680,8 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
   if (result != CURLE_OK) {
     XELOGE("XLiveAPI::Delete: CURL Error Code: {}",
            static_cast<uint32_t>(result));
+    curl_easy_cleanup(curl_handle);
+    curl_slist_free_all(headers);
     return PraseResponse(chunk);
   }
 
@@ -667,7 +728,11 @@ std::vector<HTTPResponseObjectJSON> XLiveAPI::GetMulti(
     const std::string& url = urls[i];
     std::unique_ptr<response_data> task = std::make_unique<response_data>();
 
-    CURL* curl_handle = curl_easy_init();
+    CURL* curl_handle = xe::CreateCurlHandle();
+    if (!curl_handle) {
+      XELOGE("XLiveAPI::GetMulti: Cannot initialize CURL");
+      continue;
+    }
 
     if (per_request_timeout > 0) {
       curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, per_request_timeout);
@@ -994,13 +1059,22 @@ bool XLiveAPI::UpdateQoSCache(const uint64_t sessionId,
 }
 
 // Send QoS binary data to the server
-void XLiveAPI::QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength) {
+void XLiveAPI::QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength,
+                      std::stop_token stop) {
+  if (stop.stop_requested()) {
+    return;
+  }
   std::string endpoint =
       BuildEndpoint(fmt::format("title/{:08X}/sessions/{:016x}/qos",
                                 kernel_state()->title_id(), sessionId));
 
   std::unique_ptr<HTTPResponseObjectJSON> response =
-      Post(endpoint, qosData, qosLength);
+      Post(endpoint, qosData, qosLength, stop);
+
+  if (stop.stop_requested()) {
+    free(response->RawResponse().response);
+    return;
+  }
 
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_CREATED) {
     assert_always();
@@ -1011,12 +1085,20 @@ void XLiveAPI::QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength) {
 }
 
 // Get QoS binary data from the server
-response_data XLiveAPI::QoSGet(uint64_t sessionId) {
+response_data XLiveAPI::QoSGet(uint64_t sessionId, std::stop_token stop) {
+  if (stop.stop_requested()) {
+    return {};
+  }
   std::string endpoint =
       BuildEndpoint(fmt::format("title/{:08X}/sessions/{:016x}/qos",
                                 kernel_state()->title_id(), sessionId));
 
-  std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
+  std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint, 0, stop);
+
+  if (stop.stop_requested()) {
+    free(response->RawResponse().response);
+    return {};
+  }
 
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_OK &&
       response->StatusCode() != HTTP_STATUS_CODE::HTTP_NO_CONTENT) {
@@ -1117,47 +1199,6 @@ const std::vector<std::unique_ptr<SessionObjectJSON>> XLiveAPI::SessionSearch(
   doc.AddMember("resultsCount", data->num_results, doc.GetAllocator());
   doc.AddMember("numUsers", num_users, doc.GetAllocator());
 
-  const xam::XUSER_CONTEXT* contexts_ptr =
-      kernel_memory()->TranslateVirtual<xam::XUSER_CONTEXT*>(data->ctx_ptr);
-
-  const xam::XUSER_PROPERTY* properties_ptr =
-      kernel_memory()->TranslateVirtual<xam::XUSER_PROPERTY*>(data->props_ptr);
-
-  std::vector<xam::XUSER_CONTEXT> guest_contexts(contexts_ptr,
-                                                 contexts_ptr + data->num_ctx);
-
-  std::vector<xam::XUSER_PROPERTY> guest_properties(
-      properties_ptr, properties_ptr + data->num_props);
-
-  std::vector<xam::Property> property_filters;
-  std::vector<std::string> serialized_property_filters;
-
-  for (const auto& guest_context : guest_contexts) {
-    const xam::Property context(guest_context.context_id, guest_context.value);
-
-    if (context.IsContext()) {
-      property_filters.push_back(context);
-    }
-  }
-
-  for (auto& guest_property : guest_properties) {
-    const xam::Property property(
-        guest_property.property_id.get(), sizeof(xam::X_USER_DATA),
-        reinterpret_cast<uint8_t*>(&guest_property.data.data));
-
-    if (!property.IsContext()) {
-      property_filters.push_back(property);
-    }
-  }
-
-  for (const auto& property : property_filters) {
-    const auto serialize_prop = property.SerializeToBase64();
-
-    if (serialize_prop.has_value()) {
-      serialized_property_filters.push_back(serialize_prop.value());
-    }
-  }
-
   // Filter own sessions from search.
   if (user_profile) {
     const std::string searcher_xuid_str =
@@ -1165,16 +1206,6 @@ const std::vector<std::unique_ptr<SessionObjectJSON>> XLiveAPI::SessionSearch(
 
     doc.AddMember("searcher_xuid", searcher_xuid_str, doc.GetAllocator());
   }
-
-  Value properties_array(kArrayType);
-
-  for (const auto& serialized_property : serialized_property_filters) {
-    Value serialized_value(serialized_property, doc.GetAllocator());
-
-    properties_array.PushBack(serialized_value.Move(), doc.GetAllocator());
-  }
-
-  doc.AddMember("filters", properties_array, doc.GetAllocator());
 
   rapidjson::StringBuffer buffer;
   PrettyWriter<rapidjson::StringBuffer> writer(buffer);
@@ -1393,7 +1424,7 @@ void XLiveAPI::DeleteSession(uint64_t sessionId) {
   qos_payload_cache_.erase(sessionId);
 }
 
-void XLiveAPI::DeleteAllSessionsByMac() {
+void XLiveAPI::DeleteAllSessionsByMac(uint32_t timeout) {
   const std::string endpoint = BuildEndpoint(
       fmt::format("DeleteSessions/{}", GetConsoleMacAddress().to_string()));
 
@@ -1403,7 +1434,7 @@ void XLiveAPI::DeleteAllSessionsByMac() {
     return;
   }
 
-  std::unique_ptr<HTTPResponseObjectJSON> response = Delete(endpoint);
+  std::unique_ptr<HTTPResponseObjectJSON> response = Delete(endpoint, timeout);
 
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_OK) {
     XELOGE("Failed to delete all sessions");
@@ -1446,18 +1477,7 @@ void XLiveAPI::XSessionCreate(uint64_t sessionId, XGI_SESSION_CREATE* data) {
 
   const std::string xuid_str = fmt::format("{:016X}", xuid.get());
 
-  const auto xlast =
-      kernel_state()->emulator()->game_info_database()->GetXLast();
-
-  // Technically we could just send the matchmaking query instead of complete
-  // XLast source.
-  std::optional<std::string> xlast_source_base64;
-
-  if (xlast) {
-    xlast_source_base64 = xlast->SerializeSourceToBase64();
-  }
-
-  SessionObjectJSON session;
+  SessionObjectJSON session = SessionObjectJSON();
 
   session.SessionID(sessionId_str);
   session.XUID(xuid_str);
@@ -1471,10 +1491,6 @@ void XLiveAPI::XSessionCreate(uint64_t sessionId, XGI_SESSION_CREATE* data) {
   session.HostAddress(OnlineIP_str());
   session.MacAddress(GetConsoleMacAddress().to_string());
   session.Port(GetPlayerPort());
-
-  if (xlast_source_base64.has_value()) {
-    session.XLast(xlast_source_base64.value());
-  }
 
   std::string session_output;
   bool valid = session.Serialize(session_output);
@@ -1517,7 +1533,8 @@ bool XLiveAPI::SessionPropertiesSet(uint64_t session_id, uint64_t xuid) {
   std::vector<xam::Property> properties = {};
 
   // XMAT Filtering:
-  // Only send properties that are used in matchmaking queries.
+  // We do not filter returned properties via XSessionSearch procedure index
+  // which is defined in XLAST. In the meantime we can filter by XMAT instead.
   //
   // This prevents 4D5307D5 trying to set property XPROPERTY_GAMER_MU and
   // XPROPERTY_GAMER_SIGMA without data_address in XGIUserSetPropertyEx when
@@ -1551,6 +1568,21 @@ bool XLiveAPI::SessionPropertiesSet(uint64_t session_id, uint64_t xuid) {
         XELOGI("{}: Property {:08X} is unset!", __func__,
                property_attribute.value);
       }
+    } else {
+      std::string description;
+
+      if (property.has_value()) {
+        description =
+            string_util::remove_eol(string_util::trim(property->description));
+      }
+
+      if (description.empty()) {
+        XELOGI("{}: Skipping non-matchmaking property: {:08X}", __func__,
+               property_attribute.value);
+      } else {
+        XELOGI("{}: Skipping non-matchmaking property: {} - {:08X}", __func__,
+               description, property_attribute.value);
+      }
     }
   }
 
@@ -1558,6 +1590,9 @@ bool XLiveAPI::SessionPropertiesSet(uint64_t session_id, uint64_t xuid) {
       kernel_state()->xam_state()->user_tracker()->GetUserContextIds(
           user_profile->xuid());
 
+  // XMAT Filtering:
+  // We do not filter returned contexts via XSessionSearch procedure index which
+  // is defined in XLAST. In the mean time we can filter by XMAT instead.
   for (const auto& context_attribute : contexts_ids) {
     const auto context_property =
         kernel_state()->emulator()->game_info_database()->GetContext(
@@ -1574,6 +1609,17 @@ bool XLiveAPI::SessionPropertiesSet(uint64_t session_id, uint64_t xuid) {
         } else {
           XELOGI("{}: Context {:08X} is unset!", __func__,
                  context_attribute.value);
+        }
+      } else {
+        const std::string description = string_util::remove_eol(
+            string_util::trim(context_property->description));
+
+        if (description.empty()) {
+          XELOGI("{}: Skipping non-matchmaking context: {:08X}", __func__,
+                 context_attribute.value);
+        } else {
+          XELOGI("{}: Skipping non-matchmaking context: {} {:08X}", __func__,
+                 description, context_attribute.value);
         }
       }
     } else {
@@ -1602,12 +1648,11 @@ bool XLiveAPI::SessionPropertiesSet(uint64_t session_id, uint64_t xuid) {
   return true;
 }
 
-// Ordered Properties
 const std::vector<xam::Property> XLiveAPI::SessionPropertiesGet(
-    uint64_t session_id, uint32_t query_id) {
-  std::string endpoint = BuildEndpoint(
-      fmt::format("title/{:08X}/sessions/{:016x}/properties/{}",
-                  kernel_state()->title_id(), session_id, query_id));
+    uint64_t session_id) {
+  std::string endpoint =
+      BuildEndpoint(fmt::format("title/{:08X}/sessions/{:016x}/properties",
+                                kernel_state()->title_id(), session_id));
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
 
@@ -1711,7 +1756,7 @@ std::unique_ptr<ServicesObjectJSON> XLiveAPI::GetServices() {
 }
 
 bool XLiveAPI::Heartbeat() const {
-  CURL* curl = curl_easy_init();
+  CURL* curl = xe::CreateCurlHandle();
 
   if (!curl) {
     return false;
@@ -1990,7 +2035,7 @@ X_STORAGE_UPLOAD_RESULT XLiveAPI::XStorageUpload(std::string server_path,
 
 std::pair<std::unique_ptr<XStorageFilesInfoObjectJSON>, bool>
 XLiveAPI::XStorageEnumerate(std::string server_path, uint32_t max_items) {
-  CURL* curl = curl_easy_init();
+  CURL* curl = xe::CreateCurlHandle();
 
   if (!curl) {
     return {};

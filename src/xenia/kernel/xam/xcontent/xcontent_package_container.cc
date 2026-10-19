@@ -58,9 +58,9 @@ class BufferedPackageMemory final : public MappedMemory {
 
 ContentPackageContainer::ContentPackageContainer(
     vfs::VirtualFileSystem* file_system, const std::string_view device_path,
-    const std::filesystem::path& package_path)
+    const std::filesystem::path& package_path, bool read_only)
     : ContentPackage(file_system, device_path, package_path) {
-  LoadAndVerifyHeader(package_path);
+  LoadAndVerifyHeader(package_path, read_only);
 }
 
 ContentPackageContainer::ContentPackageContainer(
@@ -174,22 +174,26 @@ bool ContentPackageContainer::CreatePackage(
 }
 
 bool ContentPackageContainer::LoadAndVerifyHeader(
-    const std::filesystem::path& package_path) {
+    const std::filesystem::path& package_path, bool read_only) {
   if (!LoadPackage(package_path)) {
     return false;
   }
 
-  // We need to remap data again in case header tells us to open package in
-  // different mode.
-  if (!header_.is_package_readonly()) {
-    package_->Close();
-
-    if (!LoadPackage(package_path, MappedMemory::Mode::kReadWrite)) {
-      return false;
-    }
+  if (read_only || header_.is_package_readonly()) {
+    return true;
   }
 
-  return true;
+  // We need to remap data again in case header tells us to open package in
+  // different mode.
+  package_->Close();
+  if (LoadPackage(package_path, MappedMemory::Mode::kReadWrite)) {
+    return true;
+  }
+
+  // Fall back to a read-only mapping if the file cannot be opened for writing.
+  XELOGW("{}: Cannot open package {} for writing, using a read-only mapping",
+         __func__, package_path);
+  return LoadPackage(package_path);
 }
 
 std::unique_ptr<vfs::Device> ContentPackageContainer::MountPackage() {

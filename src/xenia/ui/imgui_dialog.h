@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_IMGUI_DIALOG_H_
 #define XENIA_UI_IMGUI_DIALOG_H_
 
+#include <functional>
 #include <memory>
 
 #include "xenia/base/threading.h"
@@ -31,6 +32,7 @@ class ImGuiDialog {
 
   // A fence to signal when the dialog is closed.
   void Then(xe::threading::Fence* fence);
+  void Then(std::function<void()> callback);
 
   void Draw();
 
@@ -56,6 +58,7 @@ class ImGuiDialog {
   ImGuiDrawer* imgui_drawer_ = nullptr;
   bool has_close_pending_ = false;
   std::vector<xe::threading::Fence*> waiting_fences_;
+  std::vector<std::function<void()>> close_callbacks_;
 };
 
 }  // namespace ui

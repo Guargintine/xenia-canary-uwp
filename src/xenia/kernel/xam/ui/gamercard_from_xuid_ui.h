@@ -34,6 +34,7 @@ class GamercardFromXUIDUI : public XamDialog {
   const uint64_t xuid_;
   std::shared_future<std::shared_ptr<xe::ui::ImmediateTexture>>
       immediate_gamerpic_;
+  std::shared_ptr<xe::ui::ImmediateTexture> gamerpic_texture_;
   UserProfile* profile_;
   FriendPresenceObjectJSON presence_;
   X_ONLINE_FRIEND friend_presence_ = {};

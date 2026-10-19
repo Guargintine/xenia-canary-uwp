@@ -1,11 +1,18 @@
 #include "UWPUtil.h"
+#include "content_execution_info.h"
+#include "download_http.h"
+#include "patch_archive.h"
+#include "guest_input_capture.h"
+#include "title_update_catalogue.h"
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
+#include "xenia/config.h"
 #include "xenia/cpu/xex_module.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/util/xex2_info.h"
+#include "xenia/kernel/xam/xcontent/xcontent_package_container.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
@@ -35,6 +42,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.Pickers.h>
+#include <winrt/Windows.Storage.AccessCache.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Composition.h>
@@ -50,14 +58,13 @@
 #include <winrt/Windows.Web.Http.Headers.h>
 
 #include "third_party/zarchive/include/zarchive/zarchivereader.h"
-#include "third_party/zlib-ng/zlib-ng.h"
 
 using namespace winrt::Windows::Storage::Pickers;
 namespace UWP {
 std::string m_game_path;
 std::mutex m_game_path_mutex;
 int m_DPI = 96;
-std::atomic_bool m_ui_open{false};
+UIInputCaptureState m_ui_input_capture;
 
 winrt::fire_and_forget PickGame(xe::Emulator* emu) {
   FileOpenPicker openPicker;
@@ -69,7 +76,7 @@ winrt::fire_and_forget PickGame(xe::Emulator* emu) {
   if (file) {
     std::string path = winrt::to_string(file.Path().data());
 
-    emu->LaunchPath(path);
+    emu->LaunchPath(std::filesystem::u8path(path));
   }
 }
 
@@ -138,12 +145,60 @@ void SelectGameFromWinRT(xe::Emulator* emu) {
   if (game_path.empty()) {
     PickGame(emu);
   } else {
-    emu->LaunchPath(game_path);
+    emu->LaunchPath(std::filesystem::u8path(game_path));
   }
 }
 
 void SelectFolder(std::function<void(std::string)> callback) {
   PickFolderAsync(callback);
+}
+
+winrt::fire_and_forget PickStorageFolderAsync(
+    std::wstring access_token,
+    std::function<void(std::string, std::string)> callback) {
+  static std::atomic_bool picker_open{false};
+  if (picker_open.exchange(true)) {
+    callback({}, "A folder picker is already open.");
+    co_return;
+  }
+  std::string path;
+  std::string error;
+  try {
+    co_await winrt::resume_foreground(
+        winrt::Windows::ApplicationModel::Core::CoreApplication::MainView()
+            .CoreWindow().Dispatcher());
+    FolderPicker picker;
+    picker.ViewMode(PickerViewMode::List);
+    picker.SuggestedStartLocation(PickerLocationId::ComputerFolder);
+    picker.FileTypeFilter().Append(L"*");
+    if (auto folder = co_await picker.PickSingleFolderAsync()) {
+      // Keep grants for every additional directory rather than replacing the
+      // previous additional directory's token when another folder is added.
+      if (access_token == L"xenia-additional-game-folder") {
+        access_token += L"-" + std::to_wstring(
+            std::hash<std::string>{}(winrt::to_string(folder.Path())));
+      }
+      winrt::Windows::Storage::AccessCache::StorageApplicationPermissions::
+          FutureAccessList().AddOrReplace(access_token, folder);
+      path = winrt::to_string(folder.Path());
+    }
+  } catch (const winrt::hresult_canceled&) {
+    // Cancelling the picker leaves the existing storage selection untouched.
+  } catch (const winrt::hresult_error& e) {
+    error = winrt::to_string(e.message());
+    XELOGW("Storage folder picker failed: {}", error);
+  } catch (const std::exception& e) {
+    error = e.what();
+    XELOGW("Storage folder picker failed: {}", error);
+  }
+  picker_open.store(false);
+  callback(std::move(path), std::move(error));
+}
+
+void SelectStorageFolder(
+    const std::wstring& access_token,
+    std::function<void(std::string, std::string)> callback) {
+  PickStorageFolderAsync(access_token, std::move(callback));
 }
 
 void SelectFile(std::function<void(std::string)> callback) {
@@ -190,6 +245,13 @@ std::string GetLocalState() {
       winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path());
 }
 
+std::string GetPackageVersion() {
+  const auto version =
+      winrt::Windows::ApplicationModel::Package::Current().Id().Version();
+  return fmt::format("{}.{}.{}.{}", version.Major, version.Minor,
+                     version.Build, version.Revision);
+}
+
 int GetCoreDPI() { return m_DPI; }
 
 void SetAutomaticLaunch(std::string game_path) {
@@ -197,8 +259,11 @@ void SetAutomaticLaunch(std::string game_path) {
   m_game_path = std::move(game_path);
 }
 void SetDPI(int DPI) { m_DPI = DPI; }
-bool IsUIOpen() { return m_ui_open.load(); }
-void SetUIOpen(bool is_open) { m_ui_open.store(is_open); }
+bool IsUIOpen() {
+  return UIInputCaptureState::IsOpen(m_ui_input_capture.snapshot());
+}
+void SetUIOpen(bool is_open) { m_ui_input_capture.SetOpen(is_open); }
+uint64_t GetUIInputCaptureState() { return m_ui_input_capture.snapshot(); }
 
 winrt::fire_and_forget LaunchUriAsync(std::string url) {
   auto uri = winrt::Windows::Foundation::Uri(winrt::to_hstring(url));
@@ -207,8 +272,8 @@ winrt::fire_and_forget LaunchUriAsync(std::string url) {
 
 void LaunchUri(const std::string& url) { LaunchUriAsync(url); }
 
-static bool s_download_in_progress = false;
-static float s_download_progress = 0.0f;
+static std::atomic<bool> s_download_in_progress = false;
+static std::atomic<float> s_download_progress = 0.0f;
 static std::unordered_map<std::string, UWP::UnityGameMetadata>
     s_unity_metadata_cache;
 static std::mutex s_unity_metadata_mutex;
@@ -216,158 +281,48 @@ static std::mutex s_unity_metadata_mutex;
 bool IsDownloadInProgress() { return s_download_in_progress; }
 float GetDownloadProgress() { return s_download_progress; }
 
-static int ExtractZipFromMemory(const uint8_t* data, size_t data_size,
-                                const std::string& dest_folder) {
-  if (data_size < 4) {
-    return -1;
-  }
-
-  int extracted = 0;
-  size_t pos = 0;
-
-  while (pos + 30 <= data_size) {
-    uint32_t sig;
-    memcpy(&sig, data + pos, 4);
-
-    if (sig != 0x04034b50) {
-      break;
-    }
-
-    uint16_t version_needed, flags, compression;
-    uint32_t crc32_val, comp_size, uncomp_size;
-    uint16_t fname_len, extra_len;
-
-    memcpy(&version_needed, data + pos + 4, 2);
-    memcpy(&flags, data + pos + 6, 2);
-    memcpy(&compression, data + pos + 8, 2);
-    memcpy(&crc32_val, data + pos + 14, 4);
-    memcpy(&comp_size, data + pos + 18, 4);
-    memcpy(&uncomp_size, data + pos + 22, 4);
-    memcpy(&fname_len, data + pos + 26, 2);
-    memcpy(&extra_len, data + pos + 28, 2);
-
-    pos += 30;
-    if (pos + fname_len > data_size) {
-      break;
-    }
-
-    std::string fname(reinterpret_cast<const char*>(data + pos), fname_len);
-    pos += fname_len + extra_len;
-
-    bool is_dir = !fname.empty() && fname.back() == '/';
-
-    bool has_data_desc = (flags & 0x08) != 0;
-
-    const uint8_t* file_data = data + pos;
-    uint32_t file_comp_size = comp_size;
-
-    if (!is_dir && (pos + file_comp_size <= data_size)) {
-      std::filesystem::path out_path = dest_folder;
-
-      std::string part;
-      for (char c : fname) {
-        if (c == '/') {
-          if (!part.empty()) {
-            out_path /= part;
-          }
-          part.clear();
-        } else {
-          part += c;
-        }
-      }
-      if (!part.empty()) {
-        out_path /= part;
-      }
-
-      if (out_path.extension() == ".toml") {
-        std::filesystem::path flat_out = dest_folder / out_path.filename();
-
-        std::filesystem::create_directories(dest_folder);
-
-        if (compression == 0) {
-          std::ofstream ofs(flat_out, std::ios::binary);
-          ofs.write(reinterpret_cast<const char*>(file_data), file_comp_size);
-          extracted++;
-        } else if (compression == 8) {
-          std::vector<uint8_t> out_buf(uncomp_size > 0 ? uncomp_size
-                                                       : 1024 * 1024);
-          zng_stream strm{};
-          strm.next_in = const_cast<uint8_t*>(file_data);
-          strm.avail_in = file_comp_size;
-          strm.next_out = out_buf.data();
-          strm.avail_out = static_cast<uint32_t>(out_buf.size());
-          if (zng_inflateInit2(&strm, -MAX_WBITS) == Z_OK) {
-            int ret = zng_inflate(&strm, Z_FINISH);
-            if (ret == Z_STREAM_END || ret == Z_OK) {
-              std::ofstream ofs(flat_out, std::ios::binary);
-              ofs.write(reinterpret_cast<const char*>(out_buf.data()),
-                        strm.total_out);
-              extracted++;
-            }
-            zng_inflateEnd(&strm);
-          }
-        }
-      }
-    }
-
-    pos += file_comp_size;
-
-    if (has_data_desc && pos + 4 <= data_size) {
-      uint32_t desc_sig;
-      memcpy(&desc_sig, data + pos, 4);
-      if (desc_sig == 0x08074b50) {
-        pos += 4;
-      }
-      pos += 12;
-    }
-  }
-
-  return extracted;
-}
-
 winrt::fire_and_forget DownloadAndExtractZipAsync(
     std::string url, std::string dest_folder,
     std::function<void(bool, std::string)> callback) {
-  s_download_in_progress = true;
-  s_download_progress = 0.0f;
-
-  try {
-    winrt::Windows::Web::Http::HttpClient client;
-    auto uri = winrt::Windows::Foundation::Uri(winrt::to_hstring(url));
-
-    auto response = co_await client.GetAsync(
-        uri,
-        winrt::Windows::Web::Http::HttpCompletionOption::ResponseHeadersRead);
-
-    response.EnsureSuccessStatusCode();
-
-    auto content = response.Content();
-    auto buffer = co_await content.ReadAsBufferAsync();
-
-    s_download_progress = 0.8f;
-
-    auto reader =
-        winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
-    std::vector<uint8_t> zip_data(buffer.Length());
-    reader.ReadBytes(winrt::array_view<uint8_t>(zip_data));
-
-    s_download_progress = 0.9f;
-
-    int count =
-        ExtractZipFromMemory(zip_data.data(), zip_data.size(), dest_folder);
-
-    s_download_progress = 1.0f;
-    s_download_in_progress = false;
-
-    if (count >= 0) {
-      callback(true, std::to_string(count) + " patch files installed.");
-    } else {
-      callback(false, "Failed to parse patch archive.");
-    }
-  } catch (...) {
-    s_download_in_progress = false;
-    callback(false, "Download failed. Check your internet connection.");
+  winrt::apartment_context caller;
+  if (s_download_in_progress.exchange(true)) {
+    callback(false, "Another download is already in progress.");
+    co_return;
   }
+  s_download_progress = 0.0f;
+  size_t count = 0;
+  std::string error;
+  try {
+    co_await winrt::resume_background();
+    PatchArchiveWorkspace download(std::filesystem::u8path(GetLocalCache()));
+    const auto archive = download.path() / "patches.zip";
+    winrt::Windows::Web::Http::HttpClient client;
+    client.DefaultRequestHeaders().Append(L"User-Agent", L"xenia-uwp/1.0");
+    auto response = co_await client.GetAsync(
+        winrt::Windows::Foundation::Uri(winrt::to_hstring(url)),
+        winrt::Windows::Web::Http::HttpCompletionOption::ResponseHeadersRead);
+    co_await SaveHttpResponse(
+        response, archive,
+        [](uint64_t received, std::optional<uint64_t> total) {
+          if (total && *total) {
+            s_download_progress = float(std::min(0.8, 0.8 * double(received) / *total));
+          }
+        });
+    s_download_progress = 0.8f;
+    count = ExtractPatchArchive(archive, std::filesystem::u8path(dest_folder));
+    s_download_progress = 1.0f;
+  } catch (const winrt::hresult_error& e) {
+    error = winrt::to_string(e.message());
+  } catch (const std::exception& e) {
+    error = e.what();
+  } catch (...) {
+    error = "Unknown patch download error.";
+  }
+  s_download_in_progress = false;
+  co_await caller;
+  callback(error.empty(), error.empty()
+                              ? std::to_string(count) + " patch files installed."
+                              : "Patch download failed: " + error);
 }
 
 void UWP::DownloadAndExtractZip(
@@ -602,9 +557,8 @@ static xe::vfs::Entry* FindDefaultXexInDiscEntryTree(xe::vfs::Entry* entry) {
   return nullptr;
 }
 
-static bool TryReadXexExecutionInfoFromDiscImage(
-    const std::filesystem::path& path, xe::xex2_opt_execution_info* out_info) {
-  xe::vfs::DiscImageDevice device("", path);
+static bool TryReadXexExecutionInfoFromDevice(
+    xe::vfs::Device& device, xe::xex2_opt_execution_info* out_info) {
   if (!device.Initialize()) {
     return false;
   }
@@ -637,11 +591,37 @@ static bool TryReadXexExecutionInfoFromDiscImage(
                                             out_info);
 }
 
+static bool TryReadXexExecutionInfoFromDiscImage(
+    const std::filesystem::path& path, xe::xex2_opt_execution_info* out_info) {
+  xe::vfs::DiscImageDevice device("", path);
+  return TryReadXexExecutionInfoFromDevice(device, out_info);
+}
+
+static std::optional<xe::xex2_opt_execution_info> ReadContainerXexExecutionInfo(
+    const std::filesystem::path& path) {
+  try {
+    xe::vfs::VirtualFileSystem file_system;
+    xe::kernel::xam::ContentPackageContainer package(&file_system, "", path);
+    auto device = package.MountPackage();
+    xe::xex2_opt_execution_info info{};
+    if (device && TryReadXexExecutionInfoFromDevice(*device, &info)) {
+      return info;
+    }
+  } catch (const std::exception& error) {
+    XELOGE("Could not read game executable metadata: {}", error.what());
+  }
+  return std::nullopt;
+}
+
 static std::string GetTitleAndMediaFromPath(const std::string& game_path,
-                                            uint32_t* out_media_id) {
-  const std::filesystem::path path = game_path;
+                                           uint32_t* out_media_id,
+                                           std::string* out_base_version = nullptr) {
+  const std::filesystem::path path = std::filesystem::u8path(game_path);
   uint32_t title_id = 0;
   uint32_t media_id = 0;
+  if (out_base_version) {
+    out_base_version->clear();
+  }
 
   switch (xe::GetFileSignature(path)) {
     case xe::Emulator::FileSignatureType::XEX25:
@@ -649,6 +629,10 @@ static std::string GetTitleAndMediaFromPath(const std::string& game_path,
     case xe::Emulator::FileSignatureType::XEX2: {
       xe::xex2_opt_execution_info info = {};
       if (TryExtractExecutionInfoFromXexFile(path, &info)) {
+        if (out_base_version) {
+          *out_base_version =
+              fmt::format("{:08X}", uint32_t(info.base_version_value));
+        }
         if (out_media_id) {
           *out_media_id = info.media_id;
         }
@@ -663,26 +647,34 @@ static std::string GetTitleAndMediaFromPath(const std::string& game_path,
     case xe::Emulator::FileSignatureType::CON:
     case xe::Emulator::FileSignatureType::LIVE:
     case xe::Emulator::FileSignatureType::PIRS: {
-      FILE* file = xe::filesystem::OpenFile(path, "rb");
-      if (file) {
-        if (xe::filesystem::Seek(file, 0x360, SEEK_SET)) {
-          uint8_t bytes[4] = {};
-          if (fread(bytes, 1, sizeof(bytes), file) == sizeof(bytes)) {
-            title_id = (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
-                       (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
-          }
+      // Converted containers may omit the executable's version fields.
+      const auto executable = out_base_version
+                                  ? ReadContainerXexExecutionInfo(path)
+                                  : std::nullopt;
+      const auto info = executable ? executable : ReadContentExecutionInfo(path);
+      if (info) {
+        if (out_base_version && executable) {
+          *out_base_version =
+              fmt::format("{:08X}", uint32_t(info->base_version_value));
         }
-        fclose(file);
+        title_id = info->title_id;
+        if (out_media_id) {
+          *out_media_id = info->media_id;
+        }
       }
       if (title_id) {
         return FormatTitleId(title_id);
       }
-      XELOGE("[UWP] Failed to read STFS title_id from '{}'.", game_path);
+      XELOGE("[UWP] Failed to read content execution info from '{}'.", game_path);
       break;
     }
     case xe::Emulator::FileSignatureType::ZAR: {
       xe::xex2_opt_execution_info info = {};
       if (TryReadXexExecutionInfoFromZar(path, &info)) {
+        if (out_base_version) {
+          *out_base_version =
+              fmt::format("{:08X}", uint32_t(info.base_version_value));
+        }
         if (out_media_id) {
           *out_media_id = info.media_id;
         }
@@ -696,6 +688,10 @@ static std::string GetTitleAndMediaFromPath(const std::string& game_path,
     case xe::Emulator::FileSignatureType::XISO: {
       xe::xex2_opt_execution_info info = {};
       if (TryReadXexExecutionInfoFromDiscImage(path, &info)) {
+        if (out_base_version) {
+          *out_base_version =
+              fmt::format("{:08X}", uint32_t(info.base_version_value));
+        }
         if (out_media_id) {
           *out_media_id = info.media_id;
         }
@@ -711,12 +707,12 @@ static std::string GetTitleAndMediaFromPath(const std::string& game_path,
   }
 
   std::string maybe_title_id;
-  const std::string stem = path.stem().string();
+  const std::string stem = xe::path_to_utf8(path.stem());
   if (TryParseTitleIdPrefix(stem, &maybe_title_id)) {
     return maybe_title_id;
   }
 
-  const std::string file_name = path.filename().string();
+  const std::string file_name = xe::path_to_utf8(path.filename());
   if (TryParseTitleIdPrefix(file_name, &maybe_title_id)) {
     return maybe_title_id;
   }
@@ -739,6 +735,18 @@ std::string UWP::GetMediaIdFromPath(const std::string& game_path) {
     return "";
   }
   return FormatMediaId(media_id);
+}
+
+UWP::TitleUpdateGameInfo UWP::GetTitleUpdateGameInfo(
+    const std::string& game_path) {
+  TitleUpdateGameInfo info;
+  uint32_t media_id = 0;
+  info.title_id = GetTitleAndMediaFromPath(game_path, &media_id,
+                                         &info.base_version);
+  if (media_id) {
+    info.media_id = FormatMediaId(media_id);
+  }
+  return info;
 }
 
 static std::vector<std::string> ExtractDownloadUrlsForTitleId(
@@ -786,64 +794,58 @@ static std::vector<std::string> ExtractDownloadUrlsForTitleId(
 winrt::fire_and_forget DownloadFilesFromUrlsAsync(
     std::vector<std::string> urls, std::string dest_folder,
     std::function<void(bool, std::string)> callback) {
-  s_download_in_progress = true;
+  // Continues the operation reserved by FetchAndDownloadForTitleIdAsync.
   s_download_progress = 0.0f;
-
-  int downloaded = 0;
+  size_t downloaded = 0;
+  std::string error;
   try {
     winrt::Windows::Web::Http::HttpClient client;
-    std::filesystem::create_directories(dest_folder);
-
-    for (size_t i = 0; i < urls.size(); i++) {
-      auto uri = winrt::Windows::Foundation::Uri(winrt::to_hstring(urls[i]));
-      auto response = co_await client.GetAsync(uri);
-      response.EnsureSuccessStatusCode();
-      auto buffer = co_await response.Content().ReadAsBufferAsync();
-
-      std::string url = urls[i];
-      std::string fname = url.substr(url.rfind('/') + 1);
-      std::string decoded;
-      for (size_t j = 0; j < fname.size(); j++) {
-        if (fname[j] == '%' && j + 2 < fname.size()) {
-          char hex[3] = {fname[j + 1], fname[j + 2], 0};
-          decoded += (char)strtol(hex, nullptr, 16);
-          j += 2;
-        } else {
-          decoded += fname[j];
-        }
+    client.DefaultRequestHeaders().Append(L"User-Agent", L"xenia-uwp/1.0");
+    for (size_t i = 0; i < urls.size(); ++i) {
+      const auto uri = winrt::Windows::Foundation::Uri(winrt::to_hstring(urls[i]));
+      const auto url_path = winrt::to_string(uri.Path());
+      const auto name = winrt::to_string(
+          winrt::Windows::Foundation::Uri::UnescapeComponent(
+              winrt::to_hstring(url_path.substr(url_path.rfind('/') + 1))));
+      if (name.empty() || name == "." || name == ".." ||
+          name.find_first_of("/\\:") != std::string::npos ||
+          name.find('\0') != std::string::npos) {
+        throw std::runtime_error("The server supplied an invalid download filename.");
       }
-
-      std::filesystem::path out = std::filesystem::path(dest_folder) / decoded;
-      auto reader =
-          winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
-      std::vector<uint8_t> data(buffer.Length());
-      reader.ReadBytes(winrt::array_view<uint8_t>(data));
-      std::ofstream ofs(out, std::ios::binary);
-      ofs.write(reinterpret_cast<const char*>(data.data()), data.size());
-      downloaded++;
-      s_download_progress = float(i + 1) / float(urls.size());
+      auto response = co_await client.GetAsync(
+          uri, winrt::Windows::Web::Http::HttpCompletionOption::ResponseHeadersRead);
+      const auto output = std::filesystem::u8path(dest_folder) /
+                          std::filesystem::u8path(name);
+      co_await SaveHttpResponse(
+          response, output,
+          [i, count = urls.size()](uint64_t received, std::optional<uint64_t> total) {
+            const double fraction = total && *total
+                                        ? std::min(0.99, double(received) / *total)
+                                        : 0.0;
+            s_download_progress = float((i + fraction) / count);
+          });
+      ++downloaded;
+      s_download_progress = float(downloaded) / float(urls.size());
     }
+  } catch (const winrt::hresult_error& e) {
+    error = winrt::to_string(e.message());
+  } catch (const std::exception& e) {
+    error = e.what();
   } catch (...) {
-    s_download_in_progress = false;
-    if (downloaded == 0) {
-      callback(false, "");
-      co_return;
-    }
+    error = "Unknown download error.";
   }
-
   s_download_in_progress = false;
-  s_download_progress = 1.0f;
-  if (downloaded > 0) {
-    callback(true, std::to_string(downloaded) + " file(s) downloaded.");
-  } else {
-    callback(false, "");
-  }
+  const bool success = error.empty() && downloaded != 0;
+  callback(success, success ? std::to_string(downloaded) + " file(s) downloaded."
+                            : "Download failed: " + error);
 }
-
 winrt::fire_and_forget FetchAndDownloadForTitleIdAsync(
     std::string api_url, std::string title_id, std::string dest_folder,
     std::function<void(bool, std::string)> callback) {
-  s_download_in_progress = true;
+  if (s_download_in_progress.exchange(true)) {
+    callback(false, "Another download is already in progress.");
+    co_return;
+  }
   s_download_progress = 0.0f;
   try {
     winrt::Windows::Web::Http::HttpClient client;
@@ -894,113 +896,13 @@ void UWP::DownloadPluginsForGame(
   FetchAndDownloadForTitleIdAsync(api_url, title_id, dest_folder, callback);
 }
 
-static std::string EscapeTomlString(const std::string& input) {
-  std::string escaped;
-  escaped.reserve(input.size() + 2);
-  for (char c : input) {
-    if (c == '"' || c == '\\') {
-      escaped.push_back('\\');
-    }
-    escaped.push_back(c);
-  }
-  return escaped;
-}
-
-bool UWP::ConvertOptimizedConfigJsonToToml(const std::string& json,
-                                           std::string& out_toml) {
-  try {
-    auto parsed =
-        winrt::Windows::Data::Json::JsonValue::Parse(winrt::to_hstring(json));
-    if (parsed.ValueType() !=
-        winrt::Windows::Data::Json::JsonValueType::Object) {
-      return false;
-    }
-
-    auto root = parsed.GetObject();
-    if (root.Size() == 0) {
-      return false;
-    }
-
-    std::vector<std::wstring> categories;
-    for (const auto& entry : root) {
-      categories.emplace_back(entry.Key().c_str());
-    }
-
-    std::sort(categories.begin(), categories.end());
-
-    std::ostringstream oss;
-    bool wrote_any = false;
-
-    for (const auto& category_key : categories) {
-      auto category_value = root.Lookup(category_key);
-
-      if (category_value.ValueType() !=
-          winrt::Windows::Data::Json::JsonValueType::Object) {
-        continue;
-      }
-
-      auto category_object = category_value.GetObject();
-      if (category_object.Size() == 0) {
-        continue;
-      }
-
-      oss << "[" << winrt::to_string(category_key) << "]\n";
-      bool wrote_category = false;
-      for (const auto& kvp : category_object) {
-        const auto& value = kvp.Value();
-        std::string value_string;
-        switch (value.ValueType()) {
-          case winrt::Windows::Data::Json::JsonValueType::Boolean: {
-            value_string = value.GetBoolean() ? "true" : "false";
-            break;
-          }
-          case winrt::Windows::Data::Json::JsonValueType::Number: {
-            double number = value.GetNumber();
-            double rounded = std::round(number);
-            if (std::fabs(number - rounded) < 1e-6) {
-              value_string = std::to_string(static_cast<int64_t>(rounded));
-            } else {
-              std::ostringstream num_stream;
-              num_stream << number;
-              value_string = num_stream.str();
-            }
-            break;
-          }
-          case winrt::Windows::Data::Json::JsonValueType::String: {
-            value_string =
-                "\"" + EscapeTomlString(winrt::to_string(value.GetString())) +
-                "\"";
-            break;
-          }
-          default:
-            continue;
-        }
-
-        oss << winrt::to_string(kvp.Key()) << " = " << value_string << "\n";
-        wrote_category = true;
-      }
-
-      if (wrote_category) {
-        oss << "\n";
-        wrote_any = true;
-      }
-    }
-
-    if (!wrote_any) {
-      return false;
-    }
-
-    out_toml = oss.str();
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 winrt::fire_and_forget DownloadConfigForGameAsync(
     std::string title_id, std::string dest_folder,
     std::function<void(bool, std::string)> callback) {
-  s_download_in_progress = true;
+  if (s_download_in_progress.exchange(true)) {
+    callback(false, "Another download is already in progress.");
+    co_return;
+  }
   s_download_progress = 0.0f;
   try {
     std::string normalized = title_id;
@@ -1010,7 +912,7 @@ winrt::fire_and_forget DownloadConfigForGameAsync(
 
     auto url = fmt::format(
         "https://raw.githubusercontent.com/xenia-manager/optimized-settings/"
-        "main/settings/{}.json",
+        "main/settings/{}.toml",
         normalized);
 
     winrt::Windows::Web::Http::HttpClient client;
@@ -1030,16 +932,18 @@ winrt::fire_and_forget DownloadConfigForGameAsync(
         co_await response.Content().ReadAsBufferAsync());
     std::vector<uint8_t> buf(reader.UnconsumedBufferLength());
     reader.ReadBytes(winrt::array_view<uint8_t>(buf));
-    std::string json(buf.begin(), buf.end());
+    std::string toml(buf.begin(), buf.end());
 
-    std::string toml;
-    if (!ConvertOptimizedConfigJsonToToml(json, toml)) {
+    // The repository publishes each game's settings as a game config already.
+    try {
+      toml::parse(toml);
+    } catch (const toml::parse_error& e) {
       XELOGE(
-          "[UWP] DownloadConfigForGameAsync: failed to convert optimized "
-          "settings JSON to TOML for {}",
-          normalized);
+          "[UWP] DownloadConfigForGameAsync: optimized settings for {} are "
+          "not valid TOML: {}",
+          normalized, e.description());
       s_download_in_progress = false;
-      callback(false, "invalid_json");
+      callback(false, "invalid_toml");
       co_return;
     }
 
@@ -1156,129 +1060,6 @@ static int JsonObjectInt(const winrt::Windows::Data::Json::JsonObject& object,
     }
   }
   return 0;
-}
-
-struct TitleUpdateCandidate {
-  std::string title_update_id;
-  std::string media_id;
-  int version = 0;
-};
-
-static std::string GetJsonObjectStringAny(
-    const winrt::Windows::Data::Json::JsonObject& object,
-    std::initializer_list<const wchar_t*> keys) {
-  for (const auto* key : keys) {
-    std::string value = JsonObjectString(object, key);
-    if (!value.empty()) {
-      return value;
-    }
-  }
-  return "";
-}
-
-static int GetJsonObjectIntAny(
-    const winrt::Windows::Data::Json::JsonObject& object,
-    std::initializer_list<const wchar_t*> keys) {
-  for (const auto* key : keys) {
-    int value = JsonObjectInt(object, key);
-    if (value != 0) {
-      return value;
-    }
-  }
-  return 0;
-}
-
-static void CollectTitleUpdateCandidatesFromJsonValue(
-    const winrt::Windows::Data::Json::IJsonValue& value,
-    const std::string& inherited_media_id,
-    std::vector<TitleUpdateCandidate>* out_candidates) {
-  if (!out_candidates) {
-    return;
-  }
-
-  using winrt::Windows::Data::Json::JsonValueType;
-  if (value.ValueType() == JsonValueType::Array) {
-    for (const auto& child : value.GetArray()) {
-      CollectTitleUpdateCandidatesFromJsonValue(child, inherited_media_id,
-                                                out_candidates);
-    }
-    return;
-  }
-
-  if (value.ValueType() != JsonValueType::Object) {
-    return;
-  }
-
-  auto object = value.GetObject();
-  std::string media_id = inherited_media_id;
-  std::string found_media_id =
-      GetJsonObjectStringAny(object, {L"MediaID", L"mediaid", L"media_id"});
-  if (!found_media_id.empty()) {
-    media_id = NormalizeId(found_media_id);
-  }
-
-  std::string title_update_id = GetJsonObjectStringAny(
-      object, {L"TitleUpdateID", L"titleupdateid", L"tuid", L"id"});
-  if (!title_update_id.empty()) {
-    TitleUpdateCandidate candidate;
-    candidate.title_update_id = title_update_id;
-    candidate.media_id = media_id;
-    candidate.version = GetJsonObjectIntAny(object, {L"Version", L"version"});
-    out_candidates->push_back(std::move(candidate));
-  }
-
-  for (const auto& kvp : object) {
-    CollectTitleUpdateCandidatesFromJsonValue(kvp.Value(), media_id,
-                                              out_candidates);
-  }
-}
-
-static bool IsBetterTitleUpdateCandidate(const TitleUpdateCandidate& candidate,
-                                         const TitleUpdateCandidate& best) {
-  if (candidate.version != best.version) {
-    return candidate.version > best.version;
-  }
-  return candidate.title_update_id > best.title_update_id;
-}
-
-static std::string SelectBestTitleUpdateIdFromMetadata(
-    const winrt::Windows::Data::Json::IJsonValue& value,
-    const std::string& normalized_media_id) {
-  std::vector<TitleUpdateCandidate> candidates;
-  CollectTitleUpdateCandidatesFromJsonValue(value, "", &candidates);
-  if (candidates.empty()) {
-    return "";
-  }
-
-  bool found_best = false;
-  TitleUpdateCandidate best_candidate;
-  for (const auto& candidate : candidates) {
-    if (!normalized_media_id.empty() &&
-        candidate.media_id != normalized_media_id) {
-      continue;
-    }
-    if (!found_best ||
-        IsBetterTitleUpdateCandidate(candidate, best_candidate)) {
-      best_candidate = candidate;
-      found_best = true;
-    }
-  }
-
-  if (found_best) {
-    return best_candidate.title_update_id;
-  }
-
-  if (!normalized_media_id.empty()) {
-    return "";
-  }
-
-  best_candidate = candidates.front();
-  for (size_t i = 1; i < candidates.size(); ++i) {
-    if (IsBetterTitleUpdateCandidate(candidates[i], best_candidate)) {
-      best_candidate = candidates[i];
-    }
-  }
-  return best_candidate.title_update_id;
 }
 
 static std::string PickBestCoverId(
@@ -1648,192 +1429,114 @@ bool UWP::TryGetUnityMetadata(const std::string& title_id,
   return true;
 }
 
-winrt::fire_and_forget DownloadTitleUpdatesForGameAsync(
-    std::string title_id, std::string media_id, std::string dest_folder,
-    std::function<void(bool, std::vector<std::string>, std::string)> callback) {
-  s_download_in_progress = true;
-  s_download_progress = 0.0f;
-
+winrt::fire_and_forget ListTitleUpdatesForGameAsync(
+    std::string title_id, std::string media_id, std::string base_version,
+    std::function<void(bool, std::vector<TitleUpdateCandidate>, std::string)>
+        callback) {
+  std::vector<TitleUpdateCandidate> candidates;
+  std::string error;
   try {
-    std::string normalized_title_id = NormalizeId(title_id);
-    std::string normalized_media_id = NormalizeId(media_id);
-
-    winrt::Windows::Web::Http::HttpClient client;
-    client.DefaultRequestHeaders().Append(L"User-Agent", L"xenia-uwp/1.0");
-
-    const std::string metadata_url =
-        "http://xboxunity.net/Resources/Lib/TitleUpdateInfo.php?titleid=" +
-        normalized_title_id;
-
-    auto metadata_response = co_await client.GetAsync(
-        winrt::Windows::Foundation::Uri(winrt::to_hstring(metadata_url)));
-    metadata_response.EnsureSuccessStatusCode();
-
-    auto metadata_buffer =
-        co_await metadata_response.Content().ReadAsBufferAsync();
-    auto metadata_reader =
-        winrt::Windows::Storage::Streams::DataReader::FromBuffer(
-            metadata_buffer);
-    std::vector<uint8_t> metadata_bytes(metadata_buffer.Length());
-    metadata_reader.ReadBytes(winrt::array_view<uint8_t>(metadata_bytes));
-    std::string metadata_json(metadata_bytes.begin(), metadata_bytes.end());
-
-    std::string selected_title_update_id;
-    try {
-      auto parsed = winrt::Windows::Data::Json::JsonValue::Parse(
-          winrt::to_hstring(metadata_json));
-      selected_title_update_id =
-          SelectBestTitleUpdateIdFromMetadata(parsed, normalized_media_id);
-    } catch (const winrt::hresult_error& e) {
-      XELOGE(
-          "[UWP] DownloadTitleUpdatesForGameAsync: metadata parse error "
-          "code=0x{:08X} message='{}'",
-          static_cast<uint32_t>(e.code().value), winrt::to_string(e.message()));
-      s_download_in_progress = false;
-      callback(false, {}, "Failed to parse title update metadata.");
-      co_return;
+    const auto normalized_title_id = NormalizeTitleUpdateId(title_id);
+    const auto normalized_media_id = NormalizeTitleUpdateId(media_id);
+    const auto normalized_base_version =
+        NormalizeTitleUpdateBaseVersion(base_version);
+    if (normalized_title_id.empty() || normalized_media_id.empty() ||
+        normalized_base_version.empty()) {
+      error = "The game's title ID, media ID or base version is unavailable. "
+              "A compatible update cannot be selected.";
+    } else {
+      winrt::Windows::Web::Http::HttpClient client;
+      client.DefaultRequestHeaders().Append(L"User-Agent", L"xenia-uwp/1.0");
+      const std::string url =
+          "https://xboxunity.net/api/tu/" + normalized_title_id + "/" +
+          normalized_base_version;
+      auto response = co_await client.GetAsync(
+          winrt::Windows::Foundation::Uri(winrt::to_hstring(url)));
+      response.EnsureSuccessStatusCode();
+      const auto json = winrt::to_string(co_await response.Content().ReadAsStringAsync());
+      candidates = ParseTitleUpdateCandidates(json, normalized_media_id, error,
+                                               normalized_title_id,
+                                               normalized_base_version);
+      XELOGI("Title update lookup: title {} media {} base {} returned {} updates",
+             normalized_title_id, normalized_media_id, normalized_base_version,
+             candidates.size());
     }
-
-    if (selected_title_update_id.empty()) {
-      s_download_in_progress = false;
-      callback(false, {}, "No matching title updates were found online.");
-      co_return;
-    }
-
-    std::filesystem::create_directories(dest_folder);
-    std::vector<std::string> downloaded_files;
-    const std::string tuid = selected_title_update_id;
-    const std::string download_url =
-        "http://xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=" + tuid;
-
-    auto file_response = co_await client.GetAsync(
-        winrt::Windows::Foundation::Uri(winrt::to_hstring(download_url)));
-    if (!file_response.IsSuccessStatusCode()) {
-      XELOGE(
-          "[UWP] DownloadTitleUpdatesForGameAsync: download failed for tuid={} "
-          "status={}",
-          tuid, static_cast<int>(file_response.StatusCode()));
-      s_download_in_progress = false;
-      callback(false, {}, "Failed to download the selected title update.");
-      co_return;
-    }
-
-    auto file_buffer = co_await file_response.Content().ReadAsBufferAsync();
-    if (file_buffer.Length() == 0) {
-      XELOGE(
-          "[UWP] DownloadTitleUpdatesForGameAsync: empty payload for tuid={}",
-          tuid);
-      s_download_in_progress = false;
-      callback(false, {}, "Downloaded title update payload was empty.");
-      co_return;
-    }
-
-    auto file_reader =
-        winrt::Windows::Storage::Streams::DataReader::FromBuffer(file_buffer);
-    std::vector<uint8_t> file_bytes(file_buffer.Length());
-    file_reader.ReadBytes(winrt::array_view<uint8_t>(file_bytes));
-
-    std::string output_name;
-    auto content_disposition =
-        file_response.Content().Headers().ContentDisposition();
-    if (content_disposition) {
-      if (!content_disposition.FileNameStar().empty()) {
-        output_name = winrt::to_string(content_disposition.FileNameStar());
-      } else if (!content_disposition.FileName().empty()) {
-        output_name = winrt::to_string(content_disposition.FileName());
-      }
-    }
-
-    if (!output_name.empty() && output_name.front() == '"' &&
-        output_name.back() == '"' && output_name.size() > 1) {
-      output_name = output_name.substr(1, output_name.size() - 2);
-    }
-
-    // RFC5987 filename* may still contain UTF-8'' prefix and percent escapes.
-    if (output_name.rfind("UTF-8''", 0) == 0) {
-      output_name = output_name.substr(7);
-    }
-    if (output_name.rfind("utf-8''", 0) == 0) {
-      output_name = output_name.substr(7);
-    }
-
-    if (output_name.find('%') != std::string::npos) {
-      std::string decoded;
-      decoded.reserve(output_name.size());
-      for (size_t j = 0; j < output_name.size(); ++j) {
-        if (output_name[j] == '%' && j + 2 < output_name.size()) {
-          char hex[3] = {output_name[j + 1], output_name[j + 2], 0};
-          decoded += static_cast<char>(strtol(hex, nullptr, 16));
-          j += 2;
-        } else {
-          decoded += output_name[j];
-        }
-      }
-      output_name = decoded;
-    }
-
-    if (output_name.find('/') != std::string::npos ||
-        output_name.find('\\') != std::string::npos) {
-      output_name.clear();
-    }
-
-    if (output_name.empty()) {
-      output_name = fmt::format("TU_{}.tu", tuid);
-    }
-
-    std::filesystem::path output_path =
-        std::filesystem::path(dest_folder) / output_name;
-    std::ofstream ofs(output_path, std::ios::binary);
-    if (!ofs.is_open()) {
-      XELOGE(
-          "[UWP] DownloadTitleUpdatesForGameAsync: failed opening output file "
-          "'{}'",
-          xe::path_to_utf8(output_path));
-      s_download_in_progress = false;
-      callback(false, {}, "Failed to save the selected title update.");
-      co_return;
-    }
-    ofs.write(reinterpret_cast<const char*>(file_bytes.data()),
-              file_bytes.size());
-    ofs.close();
-
-    downloaded_files.push_back(xe::path_to_utf8(output_path));
-    s_download_progress = 1.0f;
-
-    s_download_in_progress = false;
-    s_download_progress = 1.0f;
-
-    if (downloaded_files.empty()) {
-      callback(false, {}, "Failed to download any title updates.");
-      co_return;
-    }
-
-    callback(true, downloaded_files,
-             fmt::format("Downloaded {} title update package(s).",
-                         downloaded_files.size()));
   } catch (const winrt::hresult_error& e) {
-    XELOGE(
-        "[UWP] DownloadTitleUpdatesForGameAsync: hresult_error code=0x{:08X} "
-        "message='{}'",
-        static_cast<uint32_t>(e.code().value), winrt::to_string(e.message()));
-    s_download_in_progress = false;
-    callback(false, {}, "Failed to download title updates (network error).");
+    error = "Could not retrieve title updates: " + winrt::to_string(e.message());
   } catch (const std::exception& e) {
-    XELOGE("[UWP] DownloadTitleUpdatesForGameAsync: exception: {}", e.what());
-    s_download_in_progress = false;
-    callback(false, {}, "Failed to download title updates (exception).");
+    error = "Could not retrieve title updates: " + std::string(e.what());
   } catch (...) {
-    XELOGE("[UWP] DownloadTitleUpdatesForGameAsync: unknown exception");
-    s_download_in_progress = false;
-    callback(false, {}, "Failed to download title updates (unknown error).");
+    error = "Could not retrieve title updates.";
   }
+  const bool success = error.empty();
+  callback(success, std::move(candidates), std::move(error));
 }
 
-void UWP::DownloadTitleUpdatesForGame(
+void UWP::ListTitleUpdatesForGame(
     const std::string& title_id, const std::string& media_id,
-    const std::string& dest_folder,
+    const std::string& base_version,
+    std::function<void(bool, std::vector<TitleUpdateCandidate>, std::string)>
+        callback) {
+  ListTitleUpdatesForGameAsync(title_id, media_id, base_version,
+                              std::move(callback));
+}
+
+winrt::fire_and_forget DownloadTitleUpdateForGameAsync(
+    std::string title_id, std::string media_id, TitleUpdateCandidate candidate,
+    std::string dest_folder,
     std::function<void(bool, std::vector<std::string>, std::string)> callback) {
-  DownloadTitleUpdatesForGameAsync(title_id, media_id, dest_folder,
-                                   std::move(callback));
+  if (NormalizeTitleUpdateId(title_id).empty() ||
+      !IsMatchingTitleUpdate(candidate, media_id)) {
+    callback(false, {}, "The selected update does not match this game's media ID.");
+    co_return;
+  }
+  if (s_download_in_progress.exchange(true)) {
+    callback(false, {}, "Another download is already in progress.");
+    co_return;
+  }
+  s_download_progress = 0.0f;
+  std::vector<std::string> files;
+  std::string error;
+  try {
+    winrt::Windows::Web::Http::HttpClient client;
+    client.DefaultRequestHeaders().Append(L"User-Agent", L"xenia-uwp/1.0");
+    std::string url = candidate.download_url.empty()
+                          ? "https://assets.xboxunity.net/api/gettu/" + candidate.id
+                          : candidate.download_url;
+    if (url.starts_with("http://")) {
+      url.replace(0, 7, "https://");
+    }
+    auto response = co_await client.GetAsync(
+        winrt::Windows::Foundation::Uri(winrt::to_hstring(url)),
+        winrt::Windows::Web::Http::HttpCompletionOption::ResponseHeadersRead);
+    const auto output = std::filesystem::u8path(dest_folder) /
+                        ("TU_" + candidate.id + ".tu");
+    co_await SaveHttpResponse(
+        response, output,
+        [](uint64_t received, std::optional<uint64_t> total) {
+          if (total && *total) {
+            s_download_progress = std::min(0.99f, float(double(received) / *total));
+          }
+        });
+    files.push_back(xe::path_to_utf8(output));
+    s_download_progress = 1.0f;
+  } catch (const winrt::hresult_error& e) {
+    error = "Could not download the selected update: " + winrt::to_string(e.message());
+  } catch (const std::exception& e) {
+    error = "Could not download the selected update: " + std::string(e.what());
+  } catch (...) {
+    error = "Could not download the selected update.";
+  }
+  s_download_in_progress = false;
+  callback(error.empty(), std::move(files),
+           error.empty() ? "The selected title update was downloaded." : error);
+}
+
+void UWP::DownloadTitleUpdateForGame(
+    const std::string& title_id, const std::string& media_id,
+    const TitleUpdateCandidate& candidate, const std::string& dest_folder,
+    std::function<void(bool, std::vector<std::string>, std::string)> callback) {
+  DownloadTitleUpdateForGameAsync(title_id, media_id, candidate, dest_folder,
+                                 std::move(callback));
 }
 }  // namespace UWP

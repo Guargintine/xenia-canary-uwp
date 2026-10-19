@@ -28,8 +28,16 @@ DEFINE_bool(dxbc_switch, !XE_PLATFORM_WINRT,
             "some titles appear to crash when if is used for flow control "
             "(possibly the shader compiler tries to flatten them). On Intel "
             "HD Graphics, this is ignored because of a crash with the switch "
-            "instruction.",
+            "instruction. Off by default on UWP, where it crashed titles on "
+            "the Xbox driver.",
             "GPU.Debug");
+DEFINE_uint32(dxbc_control_flow_guard_max_jumps, XE_PLATFORM_WINRT ? 65536 : 0,
+              "Maximum number of backward control flow jumps (loop back-edges "
+              "and backward jmp) per shader invocation before the shader is "
+              "ended. 0 disables the limit.",
+              "GPU.Debug");
+// Configs saved with the old default of 16384 get the new default.
+UPDATE_from_uint32(dxbc_control_flow_guard_max_jumps, 2026, 9, 18, 23, 16384);
 DEFINE_bool(dxbc_source_map, false,
             "Disassemble Xenos instructions as comments in the resulting DXBC "
             "for debugging.",
@@ -986,6 +994,11 @@ void DxbcShaderTranslator::StartTranslation() {
     system_temp_loop_count_ = PushSystemTemp(0b1111);
     system_temp_grad_h_lod_ = PushSystemTemp(0b1111);
     system_temp_grad_v_vfetch_address_ = PushSystemTemp(0b1111);
+    // Backward jump counter for the control flow guard.
+    control_flow_guard_max_jumps_ = cvars::dxbc_control_flow_guard_max_jumps;
+    if (control_flow_guard_max_jumps_) {
+      system_temp_control_flow_guard_ = PushSystemTemp(0b0011);
+    }
   }
 
   // Write stage-specific prologue.
@@ -1138,6 +1151,10 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     // Close the last label and the switch.
     if (UseSwitchForControlFlow()) {
       a_.OpBreak();
+      // Any pc without a case, such as UINT32_MAX written at the end, leaves
+      // the main loop.
+      a_.OpDefault();
+      a_.OpBreak();
       a_.OpEndSwitch();
     } else {
       a_.OpEndIf();
@@ -1147,13 +1164,14 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     a_.OpEndLoop();
 
     // Release the following system temporary values so epilogue can reuse them:
+    // - system_temp_control_flow_guard_ (if allocated).
     // - system_temp_result_.
     // - system_temp_ps_pc_p0_a0_.
     // - system_temp_aL_.
     // - system_temp_loop_count_.
     // - system_temp_grad_h_lod_.
     // - system_temp_grad_v_vfetch_address_.
-    PopSystemTemp(6);
+    PopSystemTemp(control_flow_guard_max_jumps_ ? 7 : 6);
   }
 
   uint8_t memexport_eM_written = current_shader().memexport_eM_written();
@@ -1802,9 +1820,24 @@ void DxbcShaderTranslator::CloseInstructionPredication() {
   }
 }
 
-void DxbcShaderTranslator::JumpToLabel(uint32_t address) {
+void DxbcShaderTranslator::JumpToLabel(uint32_t address,
+                                       bool counts_towards_guard) {
   a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010),
            dxbc::Src::LU(address));
+  if (counts_towards_guard && control_flow_guard_max_jumps_) {
+    // Count the jump, and break out of the main loop (through the switch in
+    // switch mode) once the limit is reached.
+    a_.OpIAdd(dxbc::Dest::R(system_temp_control_flow_guard_, 0b0001),
+              dxbc::Src::R(system_temp_control_flow_guard_, dxbc::Src::kXXXX),
+              dxbc::Src::LU(1));
+    a_.OpUGE(dxbc::Dest::R(system_temp_control_flow_guard_, 0b0010),
+             dxbc::Src::R(system_temp_control_flow_guard_, dxbc::Src::kXXXX),
+             dxbc::Src::LU(control_flow_guard_max_jumps_));
+    a_.OpIf(true,
+            dxbc::Src::R(system_temp_control_flow_guard_, dxbc::Src::kYYYY));
+    a_.OpBreak();
+    a_.OpEndIf();
+  }
   a_.OpContinue();
 }
 
@@ -1997,7 +2030,7 @@ void DxbcShaderTranslator::ProcessLoopEndInstruction(
     // Release aL_add_temp.
     PopSystemTemp();
     // Jump back to the beginning of the loop body.
-    JumpToLabel(instr.loop_body_address);
+    JumpToLabel(instr.loop_body_address, true);
   }
   a_.OpEndIf();
 }
@@ -2027,7 +2060,8 @@ void DxbcShaderTranslator::ProcessJumpInstruction(
   // the predicate check is on the flow control level too.
   CloseInstructionPredication();
 
-  JumpToLabel(instr.target_address);
+  // Only backward jumps count towards the control flow guard.
+  JumpToLabel(instr.target_address, instr.target_address <= instr.dword_index);
 }
 
 void DxbcShaderTranslator::ProcessAllocInstruction(

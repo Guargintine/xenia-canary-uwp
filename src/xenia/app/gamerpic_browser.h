@@ -19,6 +19,9 @@
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/immediate_drawer.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/app/guide_dialog.h"
+#endif
 
 namespace xe {
 namespace app {
@@ -51,6 +54,13 @@ class TitleGamerpicBrowser final : public ui::ImGuiDialog {
   void OnClose() override;
 
  private:
+#if XE_PLATFORM_WINRT
+  void OnDrawGuide(ImGuiIO& io);
+  GuideDialogState guide_state_;
+  bool guide_options_ = false;
+  bool guide_activation_armed_ = false;
+  bool guide_focus_requested_ = true;
+#endif
   void CleanupTitleImagesThreads();
   void CloseTitleImagesThreads();
   void CloseGamerpicsThreads();

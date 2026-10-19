@@ -12,6 +12,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,7 @@ class Processor {
 
   bool AddModule(std::unique_ptr<Module> module);
   void RemoveModule(const std::string_view name);
+  void RemoveModule(Module* module);
   Module* GetModule(const std::string_view name);
   std::vector<Module*> GetModules();
 
@@ -208,6 +210,7 @@ class Processor {
 
   bool OnUnhandledException(Exception* ex);
   bool OnThreadBreakpointHit(Exception* ex);
+  bool OnGuestStepBreakpointHit(Exception* ex);
 
   uint8_t* AllocateFunctionTraceData(size_t size);
 
@@ -248,6 +251,8 @@ class Processor {
                                          uint32_t current_pc);
 
   bool DemandFunction(Function* function);
+  uint32_t StepToGuestAddresses(uint32_t thread_id,
+                               const std::vector<uint32_t>& addresses);
 
   Memory* memory_ = nullptr;
   std::unique_ptr<StackWalker> stack_walker_;
@@ -280,6 +285,10 @@ class Processor {
   std::vector<Breakpoint*> breakpoints_;
 
   Irql irql_;
+
+  struct GuestStep;
+  std::shared_ptr<GuestStep> guest_step_;
+  std::map<uintptr_t, std::set<uint32_t>> guest_step_retries_;
 };
 
 }  // namespace cpu

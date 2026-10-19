@@ -32,6 +32,7 @@ class VirtualFileSystem {
 
   Device* RegisterDevice(std::unique_ptr<Device> device);
   bool UnregisterDevice(const std::string_view path);
+  bool UnregisterDevice(Device* device);
 
   bool RegisterSymbolicLink(const std::string_view path,
                             const std::string_view target);

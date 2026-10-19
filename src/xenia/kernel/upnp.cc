@@ -28,6 +28,7 @@ namespace kernel {
 UPnP::UPnP() {}
 
 UPnP::~UPnP() {
+  refresh_ports_timer_.reset();
   CloseOpenPorts();
 
   std::lock_guard igd_lock(igd_mutex_);
@@ -41,7 +42,13 @@ void UPnP::Initialize() {
     return;
   }
 
-  get_valid_IGD_ = std::async(std::launch::async, &UPnP::GetValidIGD, this);
+  discovery_state_ = DiscoveryState::Searching;
+  get_valid_IGD_ = std::async(std::launch::async, [this] {
+    auto result = GetValidIGD();
+    discovery_state_ = result ? DiscoveryState::DeviceFound
+                              : DiscoveryState::Failed;
+    return result;
+  });
 };
 
 void UPnP::Start() {

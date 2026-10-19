@@ -109,6 +109,17 @@ class CodeCacheBase : public CodeCache {
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
 
+  void* GetWritableAddress(uintptr_t execute_address) const {
+    const uintptr_t execute_base =
+        reinterpret_cast<uintptr_t>(generated_code_execute_base_);
+    if (generated_code_execute_base_ &&
+        execute_address - execute_base < kGeneratedCodeSize) {
+      return generated_code_write_base_ + (execute_address - execute_base);
+    }
+    // Host breakpoints may also refer to memory outside the code cache.
+    return reinterpret_cast<void*>(execute_address);
+  }
+
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
 
   void set_indirection_default(uint32_t default_value) {

@@ -40,6 +40,42 @@ DEFINE_bool(
 namespace xe {
 namespace gpu {
 
+namespace {
+constexpr uint32_t kInterruptCallbacksStopped = UINT32_C(0x80000000);
+
+class InterruptCallbackScope {
+ public:
+  explicit InterruptCallbackScope(std::atomic<uint32_t>& state) : state_(state) {
+    auto value = state_.load(std::memory_order_relaxed);
+    while (!(value & kInterruptCallbacksStopped)) {
+      if (state_.compare_exchange_weak(value, value + 1,
+                                      std::memory_order_acquire,
+                                      std::memory_order_relaxed)) {
+        entered_ = true;
+        return;
+      }
+    }
+  }
+
+  InterruptCallbackScope(const InterruptCallbackScope&) = delete;
+  InterruptCallbackScope& operator=(const InterruptCallbackScope&) = delete;
+
+  ~InterruptCallbackScope() {
+    if (entered_ &&
+        state_.fetch_sub(1, std::memory_order_release) ==
+            (kInterruptCallbacksStopped | 1)) {
+      state_.notify_all();
+    }
+  }
+
+  explicit operator bool() const { return entered_; }
+
+ private:
+  std::atomic<uint32_t>& state_;
+  bool entered_ = false;
+};
+}  // namespace
+
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
 // systems.
@@ -72,7 +108,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   scaled_aspect_x_ = 16;
   scaled_aspect_y_ = 9;
 
-  if (with_presentation && provider_) {
+  if (with_presentation && provider_ && !presenter_) {
     // Safe if either the UI thread call or the presenter creation fails.
     if (app_context_) {
       app_context_->CallInUIThreadSynchronous([this]() {
@@ -215,17 +251,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 }
 
 void GraphicsSystem::Shutdown() {
-  if (command_processor_) {
-    EndTracing();
-    command_processor_->Shutdown();
-    command_processor_.reset();
-  }
-
-  if (frame_limiter_worker_thread_) {
-    frame_limiter_worker_running_ = false;
-    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
-    frame_limiter_worker_thread_.reset();
-  }
+  ShutdownGuestState();
 
   if (presenter_) {
     if (app_context_) {
@@ -238,6 +264,49 @@ void GraphicsSystem::Shutdown() {
   }
 
   provider_.reset();
+}
+
+void GraphicsSystem::StopGuestCallbacks() {
+  auto state = interrupt_callbacks_state_.fetch_or(
+                   kInterruptCallbacksStopped, std::memory_order_acq_rel) |
+               kInterruptCallbacksStopped;
+  while (state != kInterruptCallbacksStopped) {
+    interrupt_callbacks_state_.wait(state, std::memory_order_acquire);
+    state = interrupt_callbacks_state_.load(std::memory_order_acquire);
+  }
+  interrupt_callback_.store(0, std::memory_order_relaxed);
+}
+
+void GraphicsSystem::ShutdownGuestState() {
+  if (paused_ && command_processor_) {
+    Resume();
+  }
+  StopGuestCallbacks();
+  if (frame_limiter_worker_thread_) {
+    frame_limiter_worker_running_ = false;
+    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
+    frame_limiter_worker_thread_.reset();
+  }
+  if (command_processor_) {
+    EndTracing();
+    command_processor_->Shutdown();
+    command_processor_.reset();
+  }
+  memory_ = nullptr;
+  processor_ = nullptr;
+  kernel_state_ = nullptr;
+}
+
+X_STATUS GraphicsSystem::ReinitializeGuestState(
+    cpu::Processor* processor, kernel::KernelState* kernel_state) {
+  assert_null(command_processor_);
+  assert_null(frame_limiter_worker_thread_);
+  std::memset(register_file_, 0, sizeof(*register_file_));
+  interrupt_callback_.store(0, std::memory_order_relaxed);
+  interrupt_callbacks_state_.store(0, std::memory_order_release);
+  paused_ = false;
+  return GraphicsSystem::Setup(processor, kernel_state, app_context_,
+                               presenter_ != nullptr);
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread(
@@ -326,14 +395,23 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr,
 
 void GraphicsSystem::SetInterruptCallback(uint32_t callback,
                                           uint32_t user_data) {
-  interrupt_callback_ = callback;
-  interrupt_callback_data_ = user_data;
+  const InterruptCallbackScope registration(interrupt_callbacks_state_);
+  if (!registration) {
+    return;
+  }
+  interrupt_callback_.store(uint64_t(callback) | (uint64_t(user_data) << 32),
+                             std::memory_order_release);
   XELOGGPU("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  kernel_state()->EmulateCPInterruptDPC(interrupt_callback_,
-                                        interrupt_callback_data_, source, cpu);
+  const InterruptCallbackScope dispatch(interrupt_callbacks_state_);
+  if (!dispatch) {
+    return;
+  }
+  const auto callback = interrupt_callback_.load(std::memory_order_acquire);
+  kernel_state()->EmulateCPInterruptDPC(uint32_t(callback),
+                                       uint32_t(callback >> 32), source, cpu);
 }
 
 void GraphicsSystem::MarkVblank() {
@@ -412,15 +490,17 @@ void GraphicsSystem::Resume() {
 }
 
 bool GraphicsSystem::Save(ByteStream* stream) {
-  stream->Write<uint32_t>(interrupt_callback_);
-  stream->Write<uint32_t>(interrupt_callback_data_);
+  const auto callback = interrupt_callback_.load(std::memory_order_acquire);
+  stream->Write<uint32_t>(uint32_t(callback));
+  stream->Write<uint32_t>(uint32_t(callback >> 32));
 
   return command_processor_->Save(stream);
 }
 
 bool GraphicsSystem::Restore(ByteStream* stream) {
-  interrupt_callback_ = stream->Read<uint32_t>();
-  interrupt_callback_data_ = stream->Read<uint32_t>();
+  const auto callback = stream->Read<uint32_t>();
+  const auto user_data = stream->Read<uint32_t>();
+  SetInterruptCallback(callback, user_data);
 
   return command_processor_->Restore(stream);
 }

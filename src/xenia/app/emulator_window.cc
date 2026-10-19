@@ -8,21 +8,34 @@
  */
 
 #include "xenia/app/emulator_window.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/app/dsu_integration.h"
+#include "xenia/app/game_patch_dialog.h"
+#include "xenia/app/game_title_update_dialog.h"
+#include "xenia/patcher/patcher.h"
+#include "xenia/app/screenscraper_frontend.h"
+#endif
+#include "xenia/app/guide_dialog.h"
+#include "xenia/app/frontend_theme.h"
+#include "xenia/ui/frontend_selection.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -55,9 +68,11 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
+#include "xenia/kernel/xam/xam_title_restart.h"
 #include "xenia/kernel/xconfig.h"
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/graphics_provider.h"
@@ -68,12 +83,15 @@
 #include "xenia/ui/presenter.h"
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/virtual_key.h"
+#include "xenia/vfs/entry.h"
+#include "xenia/vfs/virtual_file_system.h"
 
 #include "version.h"
 #if XE_PLATFORM_WINRT
 #include "xenia-canary-uwp/UWPUtil.h"
 #include "xenia-canary-uwp/WinRTKeyboard.h"
 #include "xenia-canary-uwp/XeniaUWP.h"
+#include "xenia-canary-uwp/game_storage.h"
 #endif
 
 #include "xenia/app/ui_text_effect_helpers.h"
@@ -85,6 +103,10 @@
 DECLARE_bool(debug);
 
 DECLARE_string(hid);
+#if XE_PLATFORM_WINRT
+DECLARE_path(target);
+DECLARE_string(ui_dynamic_background_type);
+#endif
 
 DECLARE_bool(guide_button);
 
@@ -118,17 +140,6 @@ DEFINE_bool(auto_check_updates, true,
             "available.",
             "General");
 
-DEFINE_bool(ui_prefer_short_descriptions, true,
-            "Prefer short metadata descriptions on the Games tab (falls back "
-            "to the long description if needed).",
-            "UI");
-DEFINE_bool(ui_prefer_banner_hero_art, true,
-            "Prefer banner artwork above the description on the Games tab "
-            "(falls back to gallery artwork).",
-            "UI");
-DEFINE_bool(ui_prefer_icon_gamelist_art, true,
-            "Prefer icon art in the Games tab list (falls back to box art).",
-            "UI");
 DEFINE_bool(ui_show_genre_metadata, true,
             "Show genre metadata on the Games tab.", "UI");
 DEFINE_bool(ui_show_developer_metadata, true,
@@ -144,29 +155,18 @@ DEFINE_bool(ui_show_release_date_metadata, true,
 DEFINE_bool(ui_show_user_rating_metadata, true,
             "Show user ratings on the Games tab.", "UI");
 
-DEFINE_string(ui_interface_overlay_image, "blades.png",
-              "Interface overlay image to display in the frontend. Must be a "
-              "PNG file in Assets/interface_overlays/.",
-              "UI");
-
-DEFINE_string(ui_background_image, "xenia.png",
-              "Background image to display in the frontend when no overlay is "
-              "present. Must be a PNG file in Assets/backgrounds/.",
-              "UI");
-
-DEFINE_bool(ui_enable_dynamic_game_backgrounds, true,
-            "Enable dynamic game-specific background artwork in the frontend.",
-            "UI");
+DEFINE_string(ui_color_theme, "green", "Base frontend color theme.", "UI");
+DEFINE_string(ui_interface_overlay_color, "green",
+              "Color of the interface overlay and Xenia logo.", "UI");
+DEFINE_string(ui_background_color, "green",
+              "Color of the static frontend background.", "UI");
 
 DEFINE_bool(ui_hide_tabs_text, false,
             "Hide the text labels for tabs (games, settings, paths, about) in "
             "the frontend.",
             "UI");
 
-DEFINE_string(ui_guide_image, "blades.png",
-              "Guide panel image to display in the search overlay. Must be a "
-              "PNG file in Assets/guide_images/.",
-              "UI");
+DEFINE_string(ui_guide_color, "green", "Color of the guide panels.", "UI");
 
 DEFINE_string(ui_text_effect, "stroke_fill",
               "Text effect to apply globally to all UI text. Options: shadow, "
@@ -180,7 +180,7 @@ DEFINE_string(
 DEFINE_string(ui_border_color, "green",
               "Accent color applied to UI borders, checkboxes, combo accents, "
               "and frontend headers. Options: green, purple, red, orange, "
-              "blue, yellow, grey, black, white.",
+              "blue, yellow, silver, black, white.",
               "UI");
 
 DEFINE_double(ui_text_brightness, 1.0,
@@ -379,6 +379,9 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 
 EmulatorWindow::~EmulatorWindow() {
 #if XE_PLATFORM_WINRT
+  ShutdownDsu();
+  if (gamelist_) gamelist_->StopVideoBackground();
+  screenscraper_.reset();
   UWP::SetHostGuideAction({});
   host_guide_lifetime_.reset();
   host_guide_.reset();
@@ -392,6 +395,29 @@ void EmulatorWindow::ShutdownUpdaterDialog() {
   cancel_request = true;
   updater_dialog_.reset();
 }
+
+#if XE_PLATFORM_WINRT
+void EmulatorWindow::ShutdownDsu() {
+  UWP::SetCompanionTick({});
+  UWP::RegisterInputSystem(nullptr);
+  dsu_.reset();
+}
+
+screenscraper::Service& EmulatorWindow::screen_scraper_service() {
+  if (!screenscraper_) screenscraper_ = std::make_unique<ScreenScraperFrontend>();
+  return screenscraper_->service();
+}
+
+void EmulatorWindow::SelectRemoteGame(const std::filesystem::path& path,
+                                      const std::string& name) {
+  if (gamelist_) gamelist_->SelectRemoteGame(xe::path_to_utf8(path), name);
+}
+
+std::filesystem::path EmulatorWindow::SelectedFrontendGame() const {
+  return gamelist_ ? std::filesystem::u8path(gamelist_->selected_path())
+                   : std::filesystem::path();
+}
+#endif
 
 ui::Presenter* EmulatorWindow::GetGraphicsSystemPresenter() const {
   gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
@@ -436,17 +462,38 @@ void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
 
 void EmulatorWindow::OnEmulatorInitialized() {
 #if XE_PLATFORM_WINRT
+  screen_scraper_service();
+  UWP::RegisterInputSystem(emulator_->input_system());
+  dsu_ = std::make_unique<DsuIntegration>(*this);
+  UWP::SetCompanionTick([this]() { if (dsu_) dsu_->Tick(); });
   UWP::SetHostGuideAction([this]() { ShowHostGuide(); });
   emulator_->on_terminate.AddListener([this]() {
     app_context_.CallInUIThread([this]() {
-      if (!cvars::skip_frontend && gamelist_) {
+      if (UWP::ShouldReturnToFrontend()) {
+        UWP::RequestQuit();
+        return;
+      }
+      if (gamelist_) {
         imgui_drawer_->AddDialog(gamelist_.get());
       }
     });
   });
-  if (cvars::skip_frontend) {
+  auto xam = emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
+      "xam.xex");
+  xam->LoadLoaderData();
+  UWP::RestoreTitleRestart(!xam->loader_data().host_path.empty());
+  if (!xam->loader_data().host_path.empty()) {
+    // Consume restart data before a protocol launch or the frontend can run.
+    UWP::ConsumeGamePath();
+    XELOGI("UWP resuming saved title: {}; module: {}",
+           xam->loader_data().host_path, xam->loader_data().launch_path);
+    RunTitle(std::filesystem::u8path(xam->loader_data().host_path));
+  } else if (!cvars::target.empty()) {
+    UWP::ConsumeGamePath();
+    RunTitle(cvars::target);
+  } else if (cvars::skip_frontend) {
     if (UWP::HasGamePath()) {
-      RunTitle(UWP::ConsumeGamePath());
+      RunTitle(std::filesystem::u8path(UWP::ConsumeGamePath()));
     } else {
       FileOpen();
     }
@@ -830,6 +877,86 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
 }
 
 void EmulatorWindow::ContentInstallDialog::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  const std::string popup_name =
+      fmt::format("Installation Progress###install_{}", window_id_);
+  if (!guide_popup_opened_) {
+    guide_popup_opened_ = true;
+    ImGui::OpenPopup(popup_name.c_str());
+  }
+
+  bool dialog_open = true;
+  if (!BeginGuidePopup(popup_name.c_str(), &dialog_open, guide_state_,
+                       imgui_drawer())) {
+    Close();
+    return;
+  }
+
+  const float uy = io.DisplaySize.y / 576.0f;
+  const ImVec2 icon_size(32.0f * uy, 32.0f * uy);
+  bool is_everything_installed = true;
+  for (const auto& entry : *installation_entries_) {
+    if (entry.icon_) {
+      ImGui::Image(reinterpret_cast<ImTextureID>(entry.icon_.get()), icon_size);
+      ImGui::SameLine();
+    }
+    ImGui::TextWrapped("%s", entry.name_.c_str());
+    if (entry.content_type_ != xe::XContentType::kInvalid) {
+      ImGui::TextWrapped("Type: %s",
+                         XContentTypeMap.at(entry.content_type_).c_str());
+    }
+    ImGui::TextWrapped("Path: %s",
+                       xe::path_to_utf8(entry.data_installation_path_).c_str());
+
+    std::string result = fmt::format(
+        "Status: {}", xe::Emulator::installStateStringName[static_cast<uint8_t>(
+                          entry.installation_state_)]);
+    if (entry.installation_state_ == xe::Emulator::InstallState::failed) {
+      result += fmt::format(" - {} ({:08X})",
+                            entry.installation_error_message_.c_str(),
+                            entry.installation_result_);
+    }
+    ImGui::TextWrapped("%s", result.c_str());
+
+    float fraction = 0.0f;
+    if (entry.content_size_ > 0) {
+      fraction =
+          std::min(1.0f, static_cast<float>(entry.currently_installed_size_) /
+                             static_cast<float>(entry.content_size_));
+    }
+    if (entry.installation_state_ == Emulator::InstallState::installing ||
+        entry.installation_state_ == Emulator::InstallState::pending ||
+        entry.installation_state_ == Emulator::InstallState::preparing) {
+      is_everything_installed = false;
+    } else if (entry.installation_state_ == Emulator::InstallState::installed) {
+      fraction = 1.0f;
+    }
+    const std::string overlay =
+        fmt::format("{}%", static_cast<int>(fraction * 100.0f));
+    ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), overlay.c_str());
+
+    if (installation_entries_->size() > 1) {
+      ImGui::Separator();
+    }
+  }
+  ImGui::Spacing();
+
+  ImGui::BeginDisabled(!is_everything_installed);
+  if (GuideButton("Close")) {
+    dialog_open = false;
+    ImGui::CloseCurrentPopup();
+  }
+  ImGui::EndDisabled();
+  if (is_everything_installed && ConsumeGuideBackPress()) {
+    dialog_open = false;
+    ImGui::CloseCurrentPopup();
+  }
+  EndGuidePopup();
+
+  if (!dialog_open) {
+    Close();
+  }
+#else
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(20, 20), ImGuiCond_FirstUseEver);
 
@@ -918,6 +1045,7 @@ void EmulatorWindow::ContentInstallDialog::OnDraw(ImGuiIO& io) {
     return;
   }
   ImGui::End();
+#endif  // XE_PLATFORM_WINRT
 }
 
 void EmulatorWindow::XMPConfigDialog::OnDraw(ImGuiIO& io) {
@@ -1165,7 +1293,7 @@ bool EmulatorWindow::Initialize() {
 
     Netplay_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Manager", "",
-        std::bind(&EmulatorWindow::ToggleFriendsDialog, this)));
+        std::bind(&EmulatorWindow::ToggleFriendsDialog, this, false)));
 
     Netplay_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
 
@@ -1561,7 +1689,13 @@ void EmulatorWindow::FileOpen() {
 #endif
 }
 
-void EmulatorWindow::FileClose() { emulator_->TerminateTitle(); }
+void EmulatorWindow::FileClose() {
+#if XE_PLATFORM_WINRT
+  BeginTitleClose();
+#else
+  emulator_->TerminateTitle();
+#endif
+}
 
 void EmulatorWindow::InstallContent() {
   auto install_paths = [this](std::vector<std::filesystem::path> paths) {
@@ -1652,7 +1786,13 @@ void EmulatorWindow::ExtractContent(const std::filesystem::path file) {
     extract_dir = save_file_picker->selected_files().front();
   }
 
-  if (extract_dir.empty()) {
+  ExtractContentTo(package_files, extract_dir);
+}
+
+void EmulatorWindow::ExtractContentTo(
+    const std::vector<std::filesystem::path>& package_files,
+    const std::filesystem::path& extract_dir) {
+  if (package_files.empty() || extract_dir.empty()) {
     return;
   }
 
@@ -2076,11 +2216,30 @@ void EmulatorWindow::ToggleConsoleSettingsDialog() {
 }
 
 void EmulatorWindow::ToggleContentListDialog() {
+  ToggleContentListDialogForTitle(0);
+}
+
+void EmulatorWindow::ToggleContentListDialogForTitle(uint32_t title_id) {
   if (!content_list_dialog_) {
-    content_list_dialog_ = std::unique_ptr<ContentListDialog>(
-        new ContentListDialog(imgui_drawer_.get(), *this,
-                              emulator_->kernel_state()->content_manager()));
+#if XE_PLATFORM_WINRT
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+    disable_hotkeys_ = true;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+#endif
+    content_list_dialog_ = std::make_unique<ContentListDialog>(
+        imgui_drawer_.get(), *this,
+        emulator_->kernel_state()->content_manager(), title_id);
   } else {
+#if XE_PLATFORM_WINRT
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+#endif
     if (content_list_dialog_->IsClosing()) {
       content_list_dialog_.release();
     } else {
@@ -2089,7 +2248,7 @@ void EmulatorWindow::ToggleContentListDialog() {
   }
 }
 
-void EmulatorWindow::ToggleFriendsDialog() {
+void EmulatorWindow::ToggleFriendsDialog(bool guide_style) {
   if (!friends_manager_dialog_) {
     disable_hotkeys_ = true;
 
@@ -2102,7 +2261,7 @@ void EmulatorWindow::ToggleFriendsDialog() {
     emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
 
     friends_manager_dialog_ =
-        std::make_unique<ManagerDialog>(imgui_drawer_.get(), this);
+        std::make_unique<ManagerDialog>(imgui_drawer_.get(), this, guide_style);
   } else {
     disable_hotkeys_ = false;
     emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
@@ -2774,6 +2933,9 @@ std::string EmulatorWindow::CanonicalizeFileExtension(
 
 xe::X_STATUS EmulatorWindow::RunTitle(
     const std::filesystem::path& path_to_file) {
+#if XE_PLATFORM_WINRT
+  if (title_close_result_.valid()) return X_STATUS_UNSUCCESSFUL;
+#endif
   std::error_code ec = {};
   bool titleExists = std::filesystem::exists(path_to_file, ec);
 
@@ -2832,7 +2994,14 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     return X_STATUS_UNSUCCESSFUL;
   }
 
+#if XE_PLATFORM_WINRT
+  if (gamelist_) gamelist_->StopVideoBackground();
+  if (dsu_) dsu_->OnLaunching();
+#endif
   auto result = emulator_->LaunchPath(abs_path);
+#if XE_PLATFORM_WINRT
+  if (dsu_) dsu_->OnLaunch(abs_path, result == X_STATUS_SUCCESS);
+#endif
 
   disable_hotkeys_ = false;
 
@@ -2848,9 +3017,12 @@ xe::X_STATUS EmulatorWindow::RunTitle(
 #endif
     xe::ui::ImGuiDialog::ShowMessageBox(
         imgui_drawer_.get(), "Title Launch Failed!",
-        "Failed to launch title.\n\nCheck xenia.log for technical details.");
+        fmt::format("Failed to launch title.\n\nPath: {}\nStatus: {:08X}\n\n"
+                    "Check xenia.log for technical details.",
+                    xe::path_to_utf8(abs_path), result));
 
-    emulator_->file_system()->Clear();
+    // Keep persistent storage and profile mounts available for the frontend
+    // and subsequent launches. MountPath rolls back failed package devices.
   } else {
     AddRecentlyLaunchedTitle(path_to_file,
                              std::string(emulator_->title_name()));
@@ -3027,6 +3199,76 @@ void EmulatorWindow::ClearDialogs() {
 }
 
 #if XE_PLATFORM_WINRT
+void EmulatorWindow::BeginTitleClose(
+    std::optional<kernel::xam::LoaderData> restart) {
+  if (!emulator_->is_title_open() || title_close_result_.valid()) return;
+  XELOGI("UWP {} requested; frontend return: {}",
+         restart ? "Restart Game" : "Quit Game",
+         UWP::ShouldReturnToFrontend());
+  xe::FlushLog();
+  title_restart_data_ = std::move(restart);
+  ClearDialogs();
+  ShutdownDsu();
+  emulator_initialized_ = false;
+  disable_hotkeys_ = true;
+  imgui_drawer_->SetIgnoreInput(true);
+  UWP::SetCompanionTick([this]() { CompleteTitleClose(); });
+  title_close_result_ = std::async(std::launch::async,
+                                  [this]() { return emulator_->ResetTitle(); });
+}
+
+void EmulatorWindow::WaitForTitleClose() {
+  if (title_close_result_.valid()) title_close_result_.wait();
+}
+
+void EmulatorWindow::CompleteTitleClose() {
+  if (!title_close_result_.valid() ||
+      title_close_result_.wait_for(std::chrono::seconds(0)) !=
+          std::future_status::ready || !UWP::ArePickerControlsReleased()) {
+    return;
+  }
+  X_STATUS result = X_STATUS_UNSUCCESSFUL;
+  try {
+    result = title_close_result_.get();
+  } catch (const std::exception& error) {
+    XELOGE("Could not close title: {}", error.what());
+  }
+  auto restart = std::exchange(title_restart_data_, std::nullopt);
+  imgui_drawer_->GetIO().ClearEventsQueue();
+  imgui_drawer_->SetIgnoreInput(false);
+  if (XFAILED(result)) {
+    xe::FlushLog();
+    ui::ImGuiDialog::ShowMessageBox(
+        imgui_drawer_.get(), "Unable to close game",
+        "The game runtime could not be reset. Close and reopen Xenia.");
+    return;
+  }
+  emulator_initialized_ = true;
+  disable_hotkeys_ = false;
+  UWP::RegisterInputSystem(emulator_->input_system());
+  dsu_ = std::make_unique<DsuIntegration>(*this);
+  UWP::SetCompanionTick([this]() { if (dsu_) dsu_->Tick(); });
+  if (restart) {
+    auto xam = emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
+        "xam.xex");
+    const auto host_path = std::filesystem::u8path(restart->host_path);
+    xam->loader_data() = std::move(*restart);
+    const auto launch_result = RunTitle(host_path);
+    XELOGI("Restart Game completed in process: {:08X}", launch_result);
+    xe::FlushLog();
+    return;
+  }
+  if (!gamelist_) {
+    gamelist_ = std::make_unique<WinRTFrontendDialog>(imgui_drawer_.get(), *this);
+  } else {
+    imgui_drawer_->AddDialog(gamelist_.get());
+  }
+  UpdateTitle();
+  XELOGI("Quit Game completed in process; library ready");
+  xe::FlushLog();
+  UWP::ReturnToFrontend(imgui_drawer_.get());
+}
+
 void EmulatorWindow::ShowHostGuide() {
   if (!emulator_initialized_ || host_guide_ ||
       imgui_drawer_->GetIgnoreInput()) {
@@ -3048,13 +3290,11 @@ void EmulatorWindow::ShowHostGuide() {
   emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
                                                    true);
   emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
-  UWP::SetUIOpen(true);
   host_guide_ =
       std::make_unique<WinRTHostGuideDialog>(imgui_drawer_.get(), *this);
 }
 
-void EmulatorWindow::HostGuideClosed(WinRTHostGuideDialog* dialog,
-                                     HostGuideAction action) {
+void EmulatorWindow::HostGuideClosed(WinRTHostGuideDialog* dialog) {
   if (host_guide_.get() != dialog) {
     return;
   }
@@ -3063,10 +3303,11 @@ void EmulatorWindow::HostGuideClosed(WinRTHostGuideDialog* dialog,
   const std::weak_ptr<int> lifetime = host_guide_lifetime_;
   // The current ImGui draw data still references these textures after the
   // dialog self-deletes. Keep them alive until this frame has been submitted.
-  app_context_.CallInUIThreadDeferred([this, lifetime, action,
+  app_context_.CallInUIThreadDeferred([this, lifetime,
                                        background = dialog->background_,
                                        button_a = dialog->button_a_,
-                                       button_b = dialog->button_b_]() {
+                                       button_b = dialog->button_b_,
+                                       action = dialog->close_action_]() {
     if (lifetime.expired()) {
       return;
     }
@@ -3074,9 +3315,71 @@ void EmulatorWindow::HostGuideClosed(WinRTHostGuideDialog* dialog,
     emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
                                                      false);
     emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+    window_->Focus();
+    if (action) {
+      ExecuteHostGuideAction(*action);
+    }
+  });
+}
+
+void EmulatorWindow::ExecuteHostGuideAction(HostGuideAction action) {
+  if (action == HostGuideAction::kExitXenia) {
+    UWP::RequestQuit();
+    return;
+  }
+  if (!emulator_->is_title_open()) {
+    return;
+  }
+  if (action == HostGuideAction::kQuitGame) {
+    FileClose();
+    return;
+  }
+  if (action != HostGuideAction::kRestartGame) {
+    return;
+  }
+  auto* kernel_state = emulator_->kernel_state();
+  const auto module = kernel_state->GetExecutableModule();
+  auto xam = kernel_state->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  auto* entry =
+      module ? emulator_->file_system()->ResolvePath(module->path()) : nullptr;
+  if (!entry || !xam || xam->loader_data().host_path.empty()) {
+    ui::ImGuiDialog::ShowMessageBox(
+        imgui_drawer_.get(), "Unable to restart game",
+        "The running game's launch path is unavailable.");
+    return;
+  }
+  auto loader_data = xam->loader_data();
+  loader_data.launch_path = entry->path();
+  auto restart = kernel::xam::PrepareTitleRestartData(loader_data);
+  if (!restart) {
+    ui::ImGuiDialog::ShowMessageBox(
+        imgui_drawer_.get(), "Unable to restart game",
+        "The running game's launch path is invalid.");
+    return;
+  }
+  BeginTitleClose(std::move(restart));
+}
+
+void EmulatorWindow::HostGuideOpenPage(WinRTHostGuideDialog* dialog,
+                                       HostGuideAction action) {
+  if (host_guide_.get() != dialog) {
+    return;
+  }
+  dialog->navigation_.OpenChild(static_cast<int>(action));
+  const std::weak_ptr<int> lifetime = host_guide_lifetime_;
+  // Start after the guide frame ends. Keep the parent registered so guest input
+  // remains captured across the transition, including self-owned child pages.
+  app_context_.CallInUIThreadDeferred([this, lifetime, dialog, action]() {
+    if (lifetime.expired() || host_guide_.get() != dialog ||
+        !dialog->navigation_.launch_pending()) {
+      return;
+    }
+    // The child entry points reserve the XAM UI flag themselves. This is an
+    // ownership handoff, so no UI-closed notification is needed here.
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
     switch (action) {
       case HostGuideAction::kFriends:
-        ToggleFriendsDialog();
+        ToggleFriendsDialog(true);
         break;
       case HostGuideAction::kProfiles:
         ToggleProfilesConfigDialog();
@@ -3090,18 +3393,42 @@ void EmulatorWindow::HostGuideClosed(WinRTHostGuideDialog* dialog,
       case HostGuideAction::kGamerpics:
         ToggleGamerpicBrowserDialog();
         break;
-      case HostGuideAction::kClose:
-        window_->Focus();
+      default:
         break;
     }
+    dialog->navigation_.ChildLaunched();
   });
 }
 
 void EmulatorWindow::WinRTHostGuideDialog::OnClose() {
-  emulator_window_.HostGuideClosed(this, selected_action_);
+  navigation_.Close();
+  emulator_window_.HostGuideClosed(this);
 }
 
 void EmulatorWindow::WinRTHostGuideDialog::OnDraw(ImGuiIO& io) {
+  if (!navigation_.visible()) {
+    const bool descendant_dialogs_open =
+        imgui_drawer()->GetDialogCount() > background_dialog_count_ + 1;
+    const bool popup_open = ImGui::IsPopupOpen(
+        nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    if (!navigation_.Resume(descendant_dialogs_open, popup_open)) {
+      return;
+    }
+    // The previous child may have cleared the shared UI flag on close. Restore
+    // it only for this still-live guide, never for unrelated root dialogs.
+    emulator_window_.disable_hotkeys_ = true;
+    auto* kernel_state = emulator_window_.emulator_->kernel_state();
+    kernel_state->BroadcastNotification(kXNotificationSystemUI, true);
+    kernel_state->xam_state()->is_xam_dialog_present_.store(true);
+    focus_requested_ = true;
+  }
+  navigation_.ObserveInputRelease(
+      !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) &&
+      !ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) &&
+      !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+      !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) &&
+      !ImGui::IsKeyDown(ImGuiKey_Space) && !ImGui::IsKeyDown(ImGuiKey_Escape) &&
+      !ImGui::IsAnyMouseDown());
   const auto* viewport = ImGui::GetMainViewport();
   ImGui::SetNextWindowPos(viewport->Pos);
   ImGui::SetNextWindowSize(viewport->Size);
@@ -3116,8 +3443,11 @@ void EmulatorWindow::WinRTHostGuideDialog::OnDraw(ImGuiIO& io) {
     ImGui::End();
     return;
   }
-  if (!background_) {
-    background_ = LoadConfiguredGuideBackgroundTexture(imgui_drawer());
+  const auto guide_path = ResolveConfiguredGuideBackgroundAssetPath();
+  if (!background_ || guide_path != background_texture_path_) {
+    imgui_drawer()->RetainTextureForFrame(background_);
+    background_ = LoadOverlayTexture(imgui_drawer(), guide_path.c_str(), true);
+    background_texture_path_ = guide_path;
   }
   if (!button_a_) {
     button_a_ = LoadButtonTexture(imgui_drawer(), 'A');
@@ -3138,35 +3468,67 @@ void EmulatorWindow::WinRTHostGuideDialog::OnDraw(ImGuiIO& io) {
   const float ux = io.DisplaySize.x / 1024.0f;
   const float uy = io.DisplaySize.y / 576.0f;
   const ImVec2 padding = GetGuidePanelPadding();
+  const auto content_bounds =
+      ui::GetGuideContentBounds(panel_size.x, viewport->Size.x);
   const auto header = DrawOverlayHeader(draw_list, panel_min, panel_size,
                                         padding, ux, uy, "Xenia Guide");
+  const auto body = ui::GetGuideBodyBounds(panel_size.y);
+  const float content_y =
+      std::max(panel_min.y + body.top,
+               header.position.y + header.font_size + 45.0f * uy);
   ImGui::SetCursorScreenPos(
-      ImVec2(panel_min.x + padding.x,
-             header.position.y + header.font_size + 45.0f * uy));
-  const ImVec2 button_size(std::max(1.0f, panel_size.x - padding.x * 2.0f),
-                           34.0f * uy);
-  if (focus_requested_) {
-    ImGui::SetKeyboardFocusHere();
-    focus_requested_ = false;
-  }
-  const auto action_button = [&](const char* label, HostGuideAction action) {
-    ImGui::SetCursorScreenPos(
-        ImVec2(panel_min.x + padding.x, ImGui::GetCursorScreenPos().y));
-    if (DrawTextEffectButton(label, button_size)) {
-      selected_action_ = action;
-      Close();
+      ImVec2(panel_min.x + content_bounds.left - 2.0f * ux, content_y));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+  ImGui::BeginChild(
+      "##host_guide_actions",
+      ImVec2(content_bounds.width() + 4.0f * ux,
+             std::max(1.0f, panel_min.y + body.bottom - content_y)),
+      ImGuiChildFlags_None,
+      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+  ImGui::PopStyleVar();
+  ImGui::Dummy(ImVec2(0, 2.0f * uy));
+  const ImVec2 button_size(content_bounds.width(), 34.0f * uy);
+  ImGui::BeginDisabled(!navigation_.input_armed());
+  const auto action_button = [&](const char* label, HostGuideAction action,
+                                 bool requires_game = false) {
+    ImGui::SetCursorScreenPos(ImVec2(panel_min.x + content_bounds.left,
+                                     ImGui::GetCursorScreenPos().y));
+    if (focus_requested_ && navigation_.input_armed() &&
+        navigation_.selected_option() == static_cast<int>(action)) {
+      ImGui::SetKeyboardFocusHere();
+      ImGui::SetNavCursorVisible(true);
+      focus_requested_ = false;
     }
+    ImGui::BeginDisabled(requires_game &&
+                         !emulator_window_.emulator_->is_title_open());
+    if (DrawTextEffectButton(label, button_size)) {
+      if (action == HostGuideAction::kContinue) {
+        Close();
+      } else if (action == HostGuideAction::kRestartGame ||
+                 action == HostGuideAction::kQuitGame ||
+                 action == HostGuideAction::kExitXenia) {
+        close_action_ = action;
+        Close();
+      } else {
+        emulator_window_.HostGuideOpenPage(this, action);
+      }
+    }
+    ImGui::EndDisabled();
     ImGui::Spacing();
   };
-  action_button("Friends and Sessions", HostGuideAction::kFriends);
+  action_button("Continue", HostGuideAction::kContinue);
+  action_button("Restart Game", HostGuideAction::kRestartGame, true);
+  action_button("Quit Game", HostGuideAction::kQuitGame, true);
+  action_button("Friends", HostGuideAction::kFriends);
   action_button("Profiles", HostGuideAction::kProfiles);
   action_button("Network Settings", HostGuideAction::kNetworkSettings);
   action_button("Network Status", HostGuideAction::kNetworkStatus);
   action_button("Gamerpic Browser", HostGuideAction::kGamerpics);
-  action_button("Close", HostGuideAction::kClose);
-  if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-      (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
-       ImGui::IsKeyPressed(ImGuiKey_Escape, false))) {
+  action_button("Exit Xenia", HostGuideAction::kExitXenia);
+  ImGui::EndDisabled();
+  ImGui::EndChild();
+  if (navigation_.visible() && navigation_.input_armed() &&
+      ConsumeGuideBackPress()) {
     Close();
   }
   DrawFooterPrompt(draw_list, button_b_, 13.5f * uy, 15.6f * uy, "Back",
@@ -3178,67 +3540,133 @@ void EmulatorWindow::WinRTHostGuideDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 }
 
-bool EmulatorWindow::WinRTFrontendDialog::EnablePatchesForTitle(
-    const std::filesystem::path& patches_dir, const std::string& title_id) {
+void EmulatorWindow::WinRTFrontendDialog::OpenPatchEditor(
+    const std::filesystem::path& directory, const std::string& title_id) {
+  if (!patch_editor_) patch_editor_ = std::make_unique<GamePatchDialog>();
+  patch_editor_->Open(directory, title_id);
+  show_game_context_menu_ = false;
+  action_popup_should_close_ = true;
+  show_action_status_ = false;
+}
+
+EmulatorWindow::WinRTFrontendDialog::~WinRTFrontendDialog() {
+  async_lifetime_.reset();
+  StopVideoBackground();
+  if (storage_folder_result_) {
+    imgui_drawer()->SetIgnoreInput(false);
+  }
+}
+
+void EmulatorWindow::WinRTFrontendDialog::StopVideoBackground() {
+  if (background_video_) background_video_->Stop();
+  if (background_video_texture_) imgui_drawer()->RetainTextureForFrame(background_video_texture_);
+  background_video_texture_.reset();
+  background_video_path_.clear();
+  background_video_error_.clear();
+}
+
+void EmulatorWindow::WinRTFrontendDialog::ApplyStorageFolder(
+    StorageFolderTarget target, const std::string& path) {
+  if (path.empty()) {
+    return;
+  }
+  storage_path_status_.clear();
+  if (target == StorageFolderTarget::kMedia) {
+    const auto root = std::filesystem::u8path(path);
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    if (ec || !UWP::TestPathPermissions(path)) {
+      storage_path_status_ = "The selected media folder is not writable.";
+    } else if (!emulator_window_.screenscraper_->SetMediaRoot(root)) {
+      storage_path_status_ = "Cancel the current ScreenScraper job before changing folders.";
+    } else {
+      storage_path_status_ = "Media location saved. Existing downloads stay in their current folders.";
+    }
+    return;
+  }
+  if (target != StorageFolderTarget::kConfig) {
+    UWP::SetGamePaths(UWP::SelectGameStoragePath(
+        UWP::GetPaths(), path, target == StorageFolderTarget::kPrimaryGames));
+    cached_game_title_ids_.clear();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(std::filesystem::u8path(path), ec)) {
+      storage_path_status_ =
+          "Games directory saved. Connect the drive or create the folder, then "
+          "select Refresh List.";
+    }
+    return;
+  }
+  if (emulator_window_.emulator()->is_title_open()) {
+    storage_path_status_ = "Close the game before changing config folders.";
+    return;
+  }
+  const auto root = std::filesystem::u8path(path);
   std::error_code ec;
-  if (!std::filesystem::exists(patches_dir, ec)) {
-    return false;
+  std::filesystem::create_directories(root, ec);
+  if (ec || !UWP::TestPathPermissions(path)) {
+    storage_path_status_ = "The selected config folder is not writable.";
+    return;
   }
-
-  bool any_enabled = false;
-  std::string normalized_title = title_id;
-  for (char& c : normalized_title) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  for (const auto* name : {"cache_root", "content_root", "storage_root"}) {
+    auto* variable = dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
+        cvar::ConfigVars->find(name)->second);
+    const std::string folder(name, std::strlen(name) - std::strlen("_root"));
+    variable->SetConfigValue(root / folder);
   }
+  config::SaveConfig();
+  storage_path_status_ =
+      "Config folder locations saved. Restart Xenia to use them. Existing "
+      "profiles and saves stay in their current folders.";
+}
 
-  for (const auto& entry :
-       std::filesystem::directory_iterator(patches_dir, ec)) {
-    if (ec || !entry.is_regular_file()) {
-      continue;
-    }
-
-    const auto filename = entry.path().filename().string();
-    if (filename.size() < 8) {
-      continue;
-    }
-    std::string file_title = filename.substr(0, 8);
-    for (char& c : file_title) {
-      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    if (_strnicmp(file_title.c_str(), normalized_title.c_str(), 8) != 0) {
-      continue;
-    }
-
-    try {
-      auto table = ParseFile(entry.path());
-      auto patch_array = table.get_as<toml::array>("patch");
-      if (!patch_array) {
-        continue;
-      }
-
-      bool modified = false;
-      for (auto& patch_node : *patch_array) {
-        auto* patch_table = patch_node.as_table();
-        if (!patch_table) {
-          continue;
-        }
-        patch_table->erase("is_enabled");
-        patch_table->insert("is_enabled", true);
-        modified = true;
-      }
-
-      if (modified) {
-        std::ofstream ofs(entry.path(), std::ios::trunc | std::ios::binary);
-        ofs << table;
-        ofs.close();
-        any_enabled = true;
-      }
-    } catch (...) {
-      continue;
-    }
+void EmulatorWindow::WinRTFrontendDialog::PickStorageFolder(
+    StorageFolderTarget target) {
+  if (storage_folder_result_) {
+    return;
   }
+  auto result = std::make_shared<StorageFolderResult>();
+  result->target = target;
+  storage_folder_result_ = result;
+  storage_path_status_.clear();
+  imgui_drawer()->SetIgnoreInput(true);
+  const wchar_t* token = target == StorageFolderTarget::kPrimaryGames
+                             ? L"xenia-primary-game-folder"
+                         : target == StorageFolderTarget::kAdditionalGames
+                             ? L"xenia-additional-game-folder"
+                         : target == StorageFolderTarget::kMedia
+                             ? L"xenia-media-folder"
+                             : L"xenia-config-folder";
+  // The picker may outlive this frontend. Completion owns only the mailbox;
+  // configuration, scanning and ImGui input are updated by the next draw.
+  UWP::SelectStorageFolder(
+      token, [result](std::string path, std::string error) {
+        std::lock_guard lock(result->mutex);
+        result->path = std::move(path);
+        result->error = std::move(error);
+        result->ready = true;
+      });
+}
 
-  return any_enabled;
+void EmulatorWindow::WinRTFrontendDialog::CompleteStorageFolderPicker() {
+  const auto result = storage_folder_result_;
+  if (!result) {
+    return;
+  }
+  std::lock_guard lock(result->mutex);
+  // Ignoring input clears ImGui's key history. Read physical controls so the
+  // button used to finish/cancel the native picker cannot become a fresh press
+  // in the restored frontend.
+  if (!result->ready || !UWP::ArePickerControlsReleased()) {
+    return;
+  }
+  storage_folder_result_.reset();
+  imgui_drawer()->SetIgnoreInput(false);
+  storage_focus_requested_ = true;
+  if (!result->error.empty()) {
+    storage_path_status_ = "Could not select the folder: " + result->error;
+  } else {
+    ApplyStorageFolder(result->target, result->path);
+  }
 }
 
 void EmulatorWindow::WinRTFrontendDialog::DrawNoProfilePrompt(ImGuiIO& io) {
@@ -3270,15 +3698,31 @@ void EmulatorWindow::WinRTFrontendDialog::DrawNoProfilePrompt(ImGuiIO& io) {
 }
 
 void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
+  CompleteStorageFolderPicker();
   if (!emulator_window_.emulator_initialized_) {
     return;
   }
+  if (title_update_dialog_) {
+    title_update_dialog_->ProcessPending(emulator_window_.emulator());
+  }
+  auto& scraper = *emulator_window_.screenscraper_;
+  scraper.BeginFrame();
+  if (artwork_revision_ != scraper.revision()) {
+    for (const auto& [path, texture] : game_image_textures_) {
+      imgui_drawer()->RetainTextureForFrame(texture);
+    }
+    game_image_textures_.clear();
+    artwork_revision_ = scraper.revision();
+  }
   if (UWP::HasGamePath()) {
-    emulator_window_.RunTitle(UWP::ConsumeGamePath());
+    emulator_window_.RunTitle(std::filesystem::u8path(UWP::ConsumeGamePath()));
     return;
   }
 
-  const bool frontend_accepts_input = !imgui_drawer()->GetIgnoreInput() &&
+  const bool game_editor_open = scraper.MetadataEditorOpen() ||
+      (patch_editor_ && patch_editor_->is_open()) ||
+      (title_update_dialog_ && title_update_dialog_->is_open());
+  const bool frontend_accepts_input = !game_editor_open && !imgui_drawer()->GetIgnoreInput() &&
                                       imgui_drawer()->GetDialogCount() == 1;
   const auto key_pressed = [&](ImGuiKey key, bool repeat = true) {
     return frontend_accepts_input && ImGui::IsKeyPressed(key, repeat);
@@ -3306,8 +3750,9 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                         ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
   bool launch_after_draw = false;
-  std::string launch_path_after_draw;
+  std::filesystem::path launch_path_after_draw;
 
+  ImGui::BeginDisabled(game_editor_open);
   if (ImGui::Begin("Frontend", nullptr, flags)) {
     ImDrawList* frontend_draw_list = ImGui::GetWindowDrawList();
     ImDrawListSplitter frontend_splitter;
@@ -3464,11 +3909,25 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         static bool gamelist_focus_requested = false;
         static bool gamelist_focus_selected_request = false;
         static bool gamelist_window_focus_requested = false;
+        const bool remote_selection_this_frame = remote_focus_requested_;
+        if (remote_selection_this_frame) {
+          gamelist_focus_requested = true;
+          gamelist_window_focus_requested = true;
+          remote_focus_requested_ = false;
+        }
         static int settings_selected_section = 0;
         static bool settings_focus_requested = false;
         static bool settings_focus_right_requested = false;
         static bool settings_focus_on_right = false;
         static bool paths_focus_requested = false;
+        if (storage_focus_requested_) {
+          if (active_frontend_page_ == FrontendPage::kSettings) {
+            settings_focus_right_requested = true;
+          } else {
+            paths_focus_requested = true;
+          }
+          storage_focus_requested_ = false;
+        }
         static bool about_focus_requested = false;
         static bool gamelist_x_was_down = false;
         static bool gamelist_b_was_down = false;
@@ -3623,9 +4082,10 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
           for (const auto& item : *cvar::ConfigVars) {
             auto* config_var = item.second;
+            // Tiled resource options are not offered per game (they crash the
+            // Xbox driver).
             if (config_var->name() == "d3d12_enable_tiled_shared_memory" ||
-                config_var->name() == "draw_resolution_scale_x" ||
-                config_var->name() == "draw_resolution_scale_y") {
+                config_var->name() == "d3d12_tiled_scaled_resolve") {
               continue;
             }
             PerGameConfigOption option;
@@ -3885,35 +4345,27 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             [this, open_manual_prompt](
                 const std::string& title_id,
                 const std::filesystem::path& patches_root) {
-              const std::string patches_dir = patches_root.string();
+              std::weak_ptr<int> lifetime = async_lifetime_;
+              auto* context = &emulator_window_.app_context();
               UWP::DownloadPatchesForGame(
-                  title_id, patches_dir,
-                  [this, open_manual_prompt, title_id, patches_root](
+                  title_id, xe::path_to_utf8(patches_root),
+                  [this, lifetime, context, open_manual_prompt, title_id, patches_root](
                       bool ok, std::string msg) {
-                    if (ok) {
-                      bool enabled =
-                          EnablePatchesForTitle(patches_root, title_id);
-                      action_status_ =
-                          enabled
-                              ? fmt::format(
-                                    "Downloaded and applied patches for {}.",
-                                    title_id)
-                              : fmt::format(
-                                    "Downloaded patches for {}, but enabling "
-                                    "failed.",
-                                    title_id);
-                      action_popup_mode_ = ActionPopupMode::kInfo;
-                      pending_manual_kind_ = ManualInstallKind::kPatch;
-                      pending_manual_destination_ = patches_root;
-                      pending_manual_title_id_ = title_id;
-                      action_popup_should_close_ = true;
-                      show_action_status_ = true;
-                    } else {
-                      open_manual_prompt(
-                          patches_root, ManualInstallKind::kPatch, title_id,
-                          "No matching patches were found online.\n"
-                          "Do you want to select a patch file manually?");
-                    }
+                    context->CallInUIThreadDeferred(
+                        [this, lifetime, open_manual_prompt, title_id, patches_root,
+                         ok, msg = std::move(msg)]() {
+                          if (lifetime.expired()) return;
+                          if (ok) {
+                            OpenPatchEditor(patches_root, title_id);
+                            action_popup_should_close_ = true;
+                            show_action_status_ = false;
+                          } else {
+                            open_manual_prompt(
+                                patches_root, ManualInstallKind::kPatch, title_id,
+                                (msg.empty() ? "No matching patches were found online." : msg) +
+                                    "\nSelect a patch file manually?");
+                          }
+                        });
                   });
             };
 
@@ -3923,55 +4375,67 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                                                          title_id,
                                                      const std::filesystem::
                                                          path& config_root) {
+          std::weak_ptr<int> lifetime = async_lifetime_;
+          auto* context = &emulator_window_.app_context();
+          // The download completes on a background thread; apply the config
+          // and update the frontend on the UI thread.
           UWP::DownloadConfigForGame(
               title_id, config_root.string(),
-              [this, open_manual_prompt, apply_per_game_config, title_id,
+              [this, lifetime, context, open_manual_prompt,
+               apply_per_game_config, title_id,
                config_root](bool ok, std::string msg) {
-                const auto config_path =
-                    config_root / fmt::format("{}.config.toml", title_id);
-                if (ok) {
-                  bool applied = apply_per_game_config(title_id, config_path);
-                  if (msg == "already_installed") {
-                    action_status_ =
-                        applied ? fmt::format(
-                                      "Optimized settings already installed "
-                                      "and re-applied for {}.",
-                                      title_id)
-                                : fmt::format(
-                                      "Optimized settings already installed "
-                                      "for {}, but apply failed.",
-                                      title_id);
-                  } else {
-                    action_status_ = applied
-                                         ? fmt::format(
-                                               "Downloaded optimized settings "
-                                               "and applied config for {}.",
-                                               title_id)
-                                         : fmt::format(
-                                               "Downloaded optimized settings "
-                                               "for {}, but apply failed.",
-                                               title_id);
-                  }
-                  action_popup_mode_ = ActionPopupMode::kInfo;
-                  pending_manual_kind_ = ManualInstallKind::kConfig;
-                  pending_manual_destination_ = config_root;
-                  pending_manual_title_id_ = title_id;
-                  action_popup_should_close_ = true;
-                  show_action_status_ = true;
-                } else {
-                  if (msg == "not_found") {
-                    action_status_ =
-                        "No optimized settings were found online for this "
-                        "title.";
+                context->CallInUIThreadDeferred([this, lifetime,
+                                                 open_manual_prompt,
+                                                 apply_per_game_config,
+                                                 title_id, config_root, ok,
+                                                 msg = std::move(msg)]() {
+                  if (lifetime.expired()) return;
+                  const auto config_path =
+                      config_root / fmt::format("{}.config.toml", title_id);
+                  if (ok) {
+                    bool applied = apply_per_game_config(title_id, config_path);
+                    if (msg == "already_installed") {
+                      action_status_ =
+                          applied ? fmt::format(
+                                        "Optimized settings already installed "
+                                        "and re-applied for {}.",
+                                        title_id)
+                                  : fmt::format(
+                                        "Optimized settings already installed "
+                                        "for {}, but apply failed.",
+                                        title_id);
+                    } else {
+                      action_status_ = applied
+                                           ? fmt::format(
+                                                 "Downloaded optimized settings "
+                                                 "and applied config for {}.",
+                                                 title_id)
+                                           : fmt::format(
+                                                 "Downloaded optimized settings "
+                                                 "for {}, but apply failed.",
+                                                 title_id);
+                    }
                     action_popup_mode_ = ActionPopupMode::kInfo;
+                    pending_manual_kind_ = ManualInstallKind::kConfig;
+                    pending_manual_destination_ = config_root;
+                    pending_manual_title_id_ = title_id;
+                    action_popup_should_close_ = true;
                     show_action_status_ = true;
                   } else {
-                    open_manual_prompt(
-                        config_root, ManualInstallKind::kConfig, title_id,
-                        "Failed to download optimized settings automatically.\n"
-                        "Do you want to select a config manually?");
+                    if (msg == "not_found") {
+                      action_status_ =
+                          "No optimized settings were found online for this "
+                          "title.";
+                      action_popup_mode_ = ActionPopupMode::kInfo;
+                      show_action_status_ = true;
+                    } else {
+                      open_manual_prompt(
+                          config_root, ManualInstallKind::kConfig, title_id,
+                          "Failed to download optimized settings automatically.\n"
+                          "Do you want to select a config manually?");
+                    }
                   }
-                }
+                });
               });
         };
 
@@ -4120,8 +4584,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                       const std::string option_name(option_node.first);
                       const auto& value_node = option_node.second;
                       if (option_name == "d3d12_enable_tiled_shared_memory" ||
-                          option_name == "draw_resolution_scale_x" ||
-                          option_name == "draw_resolution_scale_y") {
+                          option_name == "d3d12_tiled_scaled_resolve") {
                         continue;
                       }
                       std::string value_string;
@@ -4223,7 +4686,8 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           }
 
           const bool is_any_popup_open =
-              ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+              ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                             ImGuiPopupFlags_AnyPopupLevel);
           const bool is_any_game_context_open = is_any_popup_open ||
                                                 show_game_context_menu_ ||
                                                 show_per_game_config_editor_;
@@ -4255,8 +4719,15 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             std::string path;
             std::string filename;
             std::string title_id;
+            std::string disambiguation;
             UWP::UnityGameMetadata metadata;
             bool has_metadata = false;
+            bool cache_checked = false;
+            std::string list_art_path;
+            std::string detail_art_path;
+            std::string dynamic_art_path;
+            std::string video_path;
+            screenscraper::Metadata editable_metadata;
           };
 
           std::vector<GameListRow> game_rows;
@@ -4274,10 +4745,89 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
               row.title_id = cached_title_id->second;
             }
 
+            const auto* cached = scraper.Cached(
+                MakeScreenScraperTarget(std::filesystem::u8path(row.path),
+                                        row.filename),
+                row.path == selected_game_path_, &row.cache_checked);
+            bool needs_metadata_fallback = !cached;
+            if (cached && !cached->local_override) {
+              const auto& source = cached->metadata;
+              needs_metadata_fallback =
+                  source.title.empty() || source.description.empty() ||
+                  source.publisher.empty() ||
+                  (cvars::ui_show_genre_metadata && source.genre.empty()) ||
+                  (cvars::ui_show_developer_metadata &&
+                   source.developer.empty()) ||
+                  (cvars::ui_show_release_date_metadata &&
+                   source.release_date.empty()) ||
+                  (cvars::ui_show_user_rating_metadata && source.rating <= 0);
+            }
             if (!row.title_id.empty()) {
-              UWP::EnsureUnityMetadataFetch(row.title_id);
+              if (row.cache_checked && needs_metadata_fallback) {
+                UWP::EnsureUnityMetadataFetch(row.title_id);
+              }
               row.has_metadata =
                   UWP::TryGetUnityMetadata(row.title_id, &row.metadata);
+            }
+
+            if (cached) {
+              const auto& source = cached->metadata;
+              row.editable_metadata = source;
+              auto& metadata = row.metadata;
+              if (cached->local_override || !source.title.empty()) {
+                metadata.display_name = source.title;
+              }
+              if (cached->local_override || !source.description.empty()) {
+                metadata.description_full = source.description;
+                metadata.description_short = source.description;
+              }
+              if (cached->local_override || !source.publisher.empty()) {
+                metadata.publisher = source.publisher;
+              }
+              if (cached->local_override || !source.developer.empty()) {
+                metadata.developer = source.developer;
+              }
+              if (cached->local_override || !source.genre.empty()) {
+                metadata.genre.clear();
+                if (!source.genre.empty()) {
+                  metadata.genre.push_back(source.genre);
+                }
+              }
+              if (cached->local_override || !source.release_date.empty()) {
+                metadata.release_date = source.release_date;
+              }
+              if (cached->local_override || source.rating > 0) {
+                metadata.user_rating =
+                    source.rating > 0
+                        ? fmt::format("{:.1f}/5", source.rating * 5.0)
+                        : std::string();
+              }
+              row.list_art_path = scraper.ArtPath(*cached, false);
+              row.detail_art_path = scraper.ArtPath(*cached, true);
+              row.dynamic_art_path = scraper.BackgroundPath(*cached);
+              row.video_path = scraper.VideoPath(*cached);
+              row.has_metadata = true;
+            }
+
+            auto& editable = row.editable_metadata;
+            editable.title = row.metadata.display_name.empty()
+                                 ? row.filename : row.metadata.display_name;
+            editable.description = row.metadata.description_full.empty()
+                                       ? row.metadata.description_short
+                                       : row.metadata.description_full;
+            editable.developer = row.metadata.developer;
+            editable.publisher = row.metadata.publisher;
+            editable.release_date = row.metadata.release_date;
+            editable.genre.clear();
+            for (const auto& genre : row.metadata.genre) {
+              if (!editable.genre.empty()) editable.genre += ", ";
+              editable.genre += genre;
+            }
+            if (!cached || (!cached->local_override && editable.rating <= 0)) {
+              try {
+                editable.rating = std::clamp(
+                    std::stod(row.metadata.user_rating) / 5.0, 0.0, 1.0);
+              } catch (...) {}
             }
 
             game_rows.push_back(std::move(row));
@@ -4290,8 +4840,49 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             return row.filename;
           };
 
+          std::map<std::string, std::vector<GameListRow*>> title_groups;
+          for (auto& row : game_rows) {
+            title_groups[xe::utf8::lower_ascii(get_game_display_title(row))]
+                .push_back(&row);
+          }
+          for (auto& group : title_groups) {
+            auto& rows = group.second;
+            if (rows.size() < 2) {
+              continue;
+            }
+            std::map<std::string, size_t> scan_label_counts;
+            for (const auto* row : rows) {
+              ++scan_label_counts[xe::utf8::lower_ascii(row->filename)];
+            }
+            std::map<std::string, size_t> subtitle_counts;
+            for (auto* row : rows) {
+              if (!row->filename.empty() &&
+                  scan_label_counts[xe::utf8::lower_ascii(row->filename)] == 1) {
+                row->disambiguation = row->filename;
+              } else {
+                const auto target = MakeScreenScraperTarget(
+                    std::filesystem::u8path(row->path), row->filename);
+                row->disambiguation = target.relative_game_path.empty()
+                                          ? row->path
+                                          : xe::path_to_utf8(
+                                                target.relative_game_path);
+              }
+              ++subtitle_counts[xe::utf8::lower_ascii(row->disambiguation)];
+            }
+            for (auto* row : rows) {
+              // Different game roots can contain the same relative filename.
+              if (subtitle_counts[xe::utf8::lower_ascii(row->disambiguation)] >
+                  1) {
+                row->disambiguation = row->path;
+              }
+            }
+          }
+
           auto get_game_subtitle = [](const GameListRow& row,
                                       const std::string& display_title) {
+            if (!row.disambiguation.empty()) {
+              return row.disambiguation;
+            }
             if (row.has_metadata && !row.metadata.publisher.empty()) {
               return row.metadata.publisher;
             }
@@ -4303,28 +4894,26 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             return fallback;
           };
 
-          auto get_gamelist_art_path =
-              [](const GameListRow& row) -> const std::string* {
-            if (!row.has_metadata) {
-              return nullptr;
-            }
-            const std::string* icon_path = row.metadata.icon_path.empty()
-                                               ? nullptr
-                                               : &row.metadata.icon_path;
-            const std::string* boxart_path = row.metadata.cover_path.empty()
-                                                 ? nullptr
-                                                 : &row.metadata.cover_path;
-            if (cvars::ui_prefer_icon_gamelist_art) {
-              if (icon_path) {
-                return icon_path;
-              }
-              return boxart_path;
-            }
-            if (boxart_path) {
-              return boxart_path;
-            }
-            return icon_path;
-          };
+          auto load_game_art =
+              [&](const GameListRow& row, const std::string& preferred_path,
+                  std::initializer_list<std::string_view> fallback_paths) {
+                auto texture = GetOrCreateImageTexture(preferred_path);
+                if (!texture) {
+                  if (row.cache_checked && !row.title_id.empty()) {
+                    UWP::EnsureUnityMetadataFetch(row.title_id);
+                  }
+                  for (const auto path : fallback_paths) {
+                    if (path.empty()) {
+                      continue;
+                    }
+                    texture = GetOrCreateImageTexture(std::string(path));
+                    if (texture) {
+                      break;
+                    }
+                  }
+                }
+                return texture;
+              };
 
           auto normalize_search_text = [](const std::string& value) {
             return xe::utf8::lower_ascii(value);
@@ -4379,29 +4968,59 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           ImVec2 main_page_max =
               ImVec2(main_page_min.x + ImGui::GetWindowSize().x,
                      main_page_min.y + ImGui::GetWindowSize().y);
-          if (selected_row && selected_row->has_metadata &&
-              !selected_row->metadata.background_path.empty()) {
-            // Check if dynamic game backgrounds are enabled
-            auto c_dynamic_bg = dynamic_cast<cvar::ConfigVar<bool>*>(
-                cvar::ConfigVars->find("ui_enable_dynamic_game_backgrounds")
-                    ->second);
-            bool enable_dynamic_bg =
-                c_dynamic_bg ? c_dynamic_bg->GetTypedConfigValue() : true;
-
-            if (enable_dynamic_bg) {
-              auto bg_tex = GetOrCreateImageTexture(
-                  selected_row->metadata.background_path);
-              if (bg_tex) {
-                frontend_splitter.SetCurrentChannel(frontend_draw_list, 1);
-                frontend_draw_list->PushClipRect(main_page_min, main_page_max,
-                                                 true);
-                frontend_draw_list->AddImage(
-                    reinterpret_cast<ImTextureID>(bg_tex.get()), main_page_min,
-                    main_page_max);
-                frontend_draw_list->PopClipRect();
-                frontend_splitter.SetCurrentChannel(frontend_draw_list, 3);
+          if (selected_row && scraper.BackgroundEnabled()) {
+            auto bg_tex =
+                cvars::ui_dynamic_background_type == "fanart"
+                    ? load_game_art(*selected_row, selected_row->dynamic_art_path,
+                                    {selected_row->metadata.background_path})
+                    : GetOrCreateImageTexture(selected_row->dynamic_art_path);
+            if (!selected_row->video_path.empty()) {
+              if (!background_video_) {
+                background_video_ = std::make_unique<FrontendVideoPlayer>();
               }
+              if (background_video_path_ != selected_row->video_path) {
+                imgui_drawer()->RetainTextureForFrame(
+                    background_video_texture_);
+                background_video_texture_.reset();
+                background_video_path_ = selected_row->video_path;
+              }
+              background_video_->SetPath(
+                  std::filesystem::u8path(selected_row->video_path),
+                  scraper.revision());
+              background_video_error_ = background_video_->GetError();
+              if (auto frame = background_video_->TakeFrame()) {
+                if (emulator_window_.immediate_drawer_ && frame->width &&
+                    frame->height &&
+                    frame->rgba.size() ==
+                        size_t(frame->width) * frame->height * 4) {
+                  imgui_drawer()->RetainTextureForFrame(
+                      background_video_texture_);
+                  background_video_texture_ =
+                      emulator_window_.immediate_drawer_->CreateTexture(
+                          frame->width, frame->height,
+                          ui::ImmediateTextureFilter::kLinear, false,
+                          frame->rgba.data());
+                }
+              }
+              if (background_video_texture_) {
+                bg_tex = background_video_texture_;
+              }
+            } else {
+              StopVideoBackground();
             }
+            if (bg_tex) {
+              imgui_drawer()->RetainTextureForFrame(bg_tex);
+              frontend_splitter.SetCurrentChannel(frontend_draw_list, 1);
+              frontend_draw_list->PushClipRect(main_page_min, main_page_max,
+                                               true);
+              frontend_draw_list->AddImage(
+                  reinterpret_cast<ImTextureID>(bg_tex.get()), main_page_min,
+                  main_page_max);
+              frontend_draw_list->PopClipRect();
+              frontend_splitter.SetCurrentChannel(frontend_draw_list, 3);
+            }
+          } else {
+            StopVideoBackground();
           }
 
           ImGui::Dummy(ImVec2(0.0f, 42.0f * display_scale));
@@ -4435,6 +5054,10 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             const float carousel_horizontal_offset = 30.0f * display_scale;
             const std::vector<size_t> ordered_game_row_indices =
                 build_top_loop_order(game_rows.size(), selected_game_row_index);
+            // Apply navigation queued during this draw on the next frame.
+            const bool focus_selected_row_now =
+                gamelist_focus_requested || gamelist_focus_selected_request;
+            const std::string focus_selected_row_path = selected_game_path_;
             ImGui::Dummy(ImVec2(0.0f, 10.0f * display_scale));
 
             for (size_t ordered_index = 0;
@@ -4452,20 +5075,14 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                                side_inset * 2.0f - carousel_horizontal_offset);
               const float row_start_x = ImGui::GetCursorPosX() + side_inset +
                                         carousel_horizontal_offset;
-              if (!is_any_game_context_open && is_selected) {
-                if (gamelist_focus_requested ||
-                    (!ImGui::IsAnyItemFocused() &&
-                     ImGui::IsWindowFocused(
-                         ImGuiFocusedFlags_RootAndChildWindows))) {
-                  ImGui::SetKeyboardFocusHere();
-                  gamelist_focus_requested = false;
-                }
-              }
-              if (!is_any_game_context_open &&
-                  gamelist_focus_selected_request && is_selected) {
-                ImGui::SetKeyboardFocusHere();
-                gamelist_focus_selected_request = false;
-              }
+              const bool focus_this_row = frontend_accepts_input &&
+                  !is_any_game_context_open &&
+                  is_selected &&
+                  ((focus_selected_row_now &&
+                    row.path == focus_selected_row_path) ||
+                   (!ImGui::IsAnyItemFocused() &&
+                    ImGui::IsWindowFocused(
+                        ImGuiFocusedFlags_RootAndChildWindows)));
               const ImGuiSelectableFlags row_selectable_flags =
                   is_any_game_context_open ? ImGuiSelectableFlags_Disabled : 0;
               ImGui::SetCursorPosX(row_start_x);
@@ -4481,12 +5098,17 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 gamelist_focus_selected_request = true;
               }
               ImGui::PopStyleColor(4);
+              if (focus_this_row && xe::ui::FocusFrontendSelection()) {
+                gamelist_focus_requested = false;
+                gamelist_focus_selected_request = false;
+              }
               const bool row_focused = ImGui::IsItemFocused();
               if (!is_any_game_context_open && row_focused && !is_selected) {
                 selected_game_path_ = row.path;
                 selected_game_name_ = row.filename;
               }
-              if (!is_any_game_context_open && row_focused) {
+              if (!is_any_game_context_open && row_focused &&
+                  !remote_selection_this_frame) {
                 const bool nav_up =
                     key_pressed(ImGuiKey_GamepadDpadUp, false) ||
                     key_pressed(ImGuiKey_UpArrow, false);
@@ -4509,27 +5131,27 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
               const ImVec2 item_min = ImGui::GetItemRectMin();
               const ImVec2 item_max = ImGui::GetItemRectMax();
               const float pad = 10.0f * display_scale;
-              const float art_size = carousel_card_height - pad * 2.0f;
+              const float art_height = carousel_card_height - pad * 2.0f;
+              auto gamelist_tex = load_game_art(
+                  row, row.list_art_path,
+                  {row.metadata.cover_path, row.metadata.icon_path});
+              const float art_width =
+                  gamelist_tex && gamelist_tex->height
+                      ? art_height * float(gamelist_tex->width) /
+                            float(gamelist_tex->height)
+                      : art_height;
               const float image_x = item_min.x + pad;
               const float image_y =
-                  item_min.y + std::max(0.0f, (row_height - art_size) * 0.5f);
-              const float text_area_min_x = image_x + art_size + pad * 2.2f;
+                  item_min.y + std::max(0.0f, (row_height - art_height) * 0.5f);
+              const float text_area_min_x = image_x + art_width + pad * 2.2f;
               const float text_area_max_x = item_max.x - pad;
               const float text_area_width =
                   std::max(0.0f, text_area_max_x - text_area_min_x);
 
-              const std::string* gamelist_image_path =
-                  get_gamelist_art_path(row);
-
-              if (gamelist_image_path) {
-                auto gamelist_tex =
-                    GetOrCreateImageTexture(*gamelist_image_path);
-                if (gamelist_tex) {
-                  ImGui::SetCursorScreenPos(ImVec2(image_x, image_y));
-                  ImGui::Image(
-                      reinterpret_cast<ImTextureID>(gamelist_tex.get()),
-                      ImVec2(art_size, art_size));
-                }
+              if (gamelist_tex) {
+                ImGui::SetCursorScreenPos(ImVec2(image_x, image_y));
+                ImGui::Image(reinterpret_cast<ImTextureID>(gamelist_tex.get()),
+                             ImVec2(art_width, art_height));
               }
 
               const std::string display_title = get_game_display_title(row);
@@ -4567,6 +5189,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
               if (!is_any_game_context_open && row_focused &&
                   selected_game_path_ == row.path &&
+                  !remote_selection_this_frame &&
                   key_pressed(ImGuiKey_GamepadFaceDown, false)) {
                 request_launch_selected_game = true;
                 launch_game_path = row.path;
@@ -4595,7 +5218,10 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           ImGui::SameLine();
 
           if (ImGui::BeginChild("##main_page", ImVec2(0, content_height), false,
-                                ImGuiWindowFlags_NoScrollbar)) {
+                                ImGuiWindowFlags_NoScrollbar |
+                                    ImGuiWindowFlags_NoScrollWithMouse |
+                                    ImGuiWindowFlags_NoInputs)) {
+            ImGui::SetScrollY(0);
             if (selected_row) {
               ImGui::Dummy(ImVec2(0.0f, 21.0f * display_scale));
               std::string detail_title = selected_row->filename;
@@ -4604,102 +5230,71 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 detail_title = selected_row->metadata.display_name;
               }
 
-              const std::string* hero_image_path = nullptr;
-              if (selected_row->has_metadata) {
-                const auto& metadata = selected_row->metadata;
-                const std::string* banner_path = metadata.banner_path.empty()
-                                                     ? nullptr
-                                                     : &metadata.banner_path;
-                const std::string* gallery_path =
-                    metadata.gallery_paths.empty()
-                        ? nullptr
-                        : &metadata.gallery_paths.front();
-                auto select_hero_image =
-                    [&](bool prefer_banner) -> const std::string* {
-                  if (prefer_banner) {
-                    if (banner_path) {
-                      return banner_path;
-                    }
-                    if (gallery_path) {
-                      return gallery_path;
-                    }
-                  } else {
-                    if (gallery_path) {
-                      return gallery_path;
-                    }
-                    if (banner_path) {
-                      return banner_path;
-                    }
-                  }
-                  return nullptr;
-                };
-                hero_image_path =
-                    select_hero_image(cvars::ui_prefer_banner_hero_art);
+              auto hero_tex = load_game_art(
+                  *selected_row, selected_row->detail_art_path,
+                  {selected_row->metadata.banner_path,
+                   selected_row->metadata.gallery_paths.empty()
+                       ? std::string_view()
+                       : selected_row->metadata.gallery_paths.front()});
+              if (hero_tex) {
+                const float avail_w =
+                    ImGui::GetContentRegionAvail().x - 42.0f * display_scale;
+                const float aspect_ratio = static_cast<float>(hero_tex->width) /
+                                           static_cast<float>(hero_tex->height);
+                const float uniform_h =
+                    std::min(avail_w / aspect_ratio,
+                             std::max(1.0f, content_height * 0.48f));
+                ImGui::Image(reinterpret_cast<ImTextureID>(hero_tex.get()),
+                             ImVec2(uniform_h * aspect_ratio, uniform_h),
+                             ImVec2(0, 0), ImVec2(1, 1));
               }
 
-              if (hero_image_path) {
-                auto hero_tex = GetOrCreateImageTexture(*hero_image_path);
-                if (hero_tex) {
-                  const float avail_w =
-                      ImGui::GetContentRegionAvail().x - 42.0f * display_scale;
-                  const float aspect_ratio =
-                      static_cast<float>(hero_tex->width) /
-                      static_cast<float>(hero_tex->height);
-                  const float uniform_h = avail_w / aspect_ratio;
-                  ImGui::Image(reinterpret_cast<ImTextureID>(hero_tex.get()),
-                               ImVec2(avail_w, uniform_h), ImVec2(0, 0),
-                               ImVec2(1, 1));
-                }
+              ImGui::BeginChild(
+                  "##metadata_text",
+                  ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x -
+                                           42.0f * display_scale),
+                         std::max(1.0f, ImGui::GetContentRegionAvail().y)),
+                  ImGuiChildFlags_None,
+                  ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoInputs);
+              const float scroll_range = ImGui::GetScrollMaxY();
+              const int frame = ImGui::GetFrameCount();
+              if (metadata_scroll_path_ != selected_row->path ||
+                  metadata_scroll_frame_ != frame - 1 ||
+                  std::abs(metadata_scroll_range_ - scroll_range) > 0.5f ||
+                  is_any_game_context_open || show_search_panel_) {
+                metadata_scroll_elapsed_ = 0;
+              } else {
+                metadata_scroll_elapsed_ += io.DeltaTime;
               }
-
+              metadata_scroll_path_ = selected_row->path;
+              metadata_scroll_frame_ = frame;
+              metadata_scroll_range_ = scroll_range;
+              const double speed = ImGui::GetTextLineHeight() * 0.5;
+              const double phase = std::fmod(
+                  metadata_scroll_elapsed_, scroll_range / speed + 6.0);
+              ImGui::SetScrollY(float(std::clamp(
+                  (phase - 3.0) * speed, 0.0, double(scroll_range))));
+              ImGui::PushTextWrapPos(0.0f);
               if (cvars::ui_show_title_metadata) {
                 ImGui::TextWrapped("%s", detail_title.c_str());
               }
-
-              const std::string* detail_description = nullptr;
-              if (selected_row->has_metadata) {
-                const auto& metadata = selected_row->metadata;
-                const std::string* short_desc =
-                    metadata.description_short.empty()
-                        ? nullptr
-                        : &metadata.description_short;
-                const std::string* full_desc = metadata.description_full.empty()
-                                                   ? nullptr
-                                                   : &metadata.description_full;
-                auto select_description =
-                    [&](bool prefer_short) -> const std::string* {
-                  if (prefer_short) {
-                    if (short_desc) {
-                      return short_desc;
-                    }
-                    if (full_desc) {
-                      return full_desc;
-                    }
-                  } else {
-                    if (full_desc) {
-                      return full_desc;
-                    }
-                    if (short_desc) {
-                      return short_desc;
-                    }
-                  }
-                  return nullptr;
-                };
-                detail_description =
-                    select_description(cvars::ui_prefer_short_descriptions);
+              if (!background_video_error_.empty()) {
+                ImGui::TextWrapped("Video background: %s", background_video_error_.c_str());
               }
+
+              const auto& metadata = selected_row->metadata;
+              const std::string* detail_description =
+                  !metadata.description_full.empty()
+                      ? &metadata.description_full
+                  : !metadata.description_short.empty()
+                      ? &metadata.description_short
+                      : nullptr;
 
               if (detail_description) {
                 ImGui::Spacing();
-                const float description_right_margin =
-                    (6.0f + 42.0f) * display_scale;
-                const float wrap_limit =
-                    ImGui::GetCursorPos().x +
-                    std::max(0.0f, ImGui::GetContentRegionAvail().x -
-                                       description_right_margin);
-                ImGui::PushTextWrapPos(wrap_limit);
                 ImGui::TextWrapped("%s", detail_description->c_str());
-                ImGui::PopTextWrapPos();
               }
 
               if (selected_row->has_metadata) {
@@ -4750,9 +5345,12 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                   ImGui::TextDisabled(
                       "Type: %s", selected_row->metadata.title_type.c_str());
                 }
-              } else {
-                ImGui::TextDisabled("Metadata: Fetching from x360db...");
+              } else if (selected_row->metadata.request_started &&
+                         !selected_row->metadata.request_finished) {
+                ImGui::TextDisabled("Loading fallback metadata...");
               }
+              ImGui::PopTextWrapPos();
+              ImGui::EndChild();
             }
           }
           ImGui::EndChild();
@@ -4906,6 +5504,10 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                     matches = normalize_search_text(row.filename)
                                   .find(lowered_query) != std::string::npos;
                   }
+                  if (!matches) {
+                    matches = normalize_search_text(row.path)
+                                  .find(lowered_query) != std::string::npos;
+                  }
                   if (!matches && !row.title_id.empty()) {
                     matches = normalize_search_text(row.title_id)
                                   .find(lowered_query) != std::string::npos;
@@ -5031,24 +5633,27 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                   const ImVec2 item_min = ImGui::GetItemRectMin();
                   const ImVec2 item_max = ImGui::GetItemRectMax();
                   const float pad = 10.0f * display_scale;
-                  const float art_size = carousel_card_height - pad * 2.0f;
+                  const float art_height = carousel_card_height - pad * 2.0f;
+                  auto art_tex = load_game_art(
+                      *row, row->list_art_path,
+                      {row->metadata.cover_path, row->metadata.icon_path});
+                  const float art_width =
+                      art_tex && art_tex->height
+                          ? art_height * float(art_tex->width) /
+                                float(art_tex->height)
+                          : art_height;
                   const float image_x = item_min.x + pad;
                   const float image_y =
                       item_min.y +
-                      std::max(0.0f, (row_height - art_size) * 0.5f);
-                  const float text_area_min_x = image_x + art_size + pad * 2.2f;
+                      std::max(0.0f, (row_height - art_height) * 0.5f);
+                  const float text_area_min_x = image_x + art_width + pad * 2.2f;
                   const float text_area_max_x = item_max.x - pad;
                   const float text_area_width =
                       std::max(0.0f, text_area_max_x - text_area_min_x);
-                  const std::string* art_path = get_gamelist_art_path(*row);
-
-                  if (art_path) {
-                    auto art_tex = GetOrCreateImageTexture(*art_path);
-                    if (art_tex) {
-                      ImGui::SetCursorScreenPos(ImVec2(image_x, image_y));
-                      ImGui::Image(reinterpret_cast<ImTextureID>(art_tex.get()),
-                                   ImVec2(art_size, art_size));
-                    }
+                  if (art_tex) {
+                    ImGui::SetCursorScreenPos(ImVec2(image_x, image_y));
+                    ImGui::Image(reinterpret_cast<ImTextureID>(art_tex.get()),
+                                 ImVec2(art_width, art_height));
                   }
 
                   const std::string display = get_game_display_title(*row);
@@ -5325,7 +5930,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                     item_min.y +
                         (item_max.y - item_min.y - line_height) * 0.5f);
                 DrawTextWithConfiguredEffect(
-                    overlay_draw_list, ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize(),
                     text_pos, IM_COL32(228, 228, 228, 255), visible_label);
                 if (clicked) {
                   close_context_menu = true;
@@ -5335,7 +5940,30 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
               };
 
               if (!close_context_menu) {
-                if (draw_game_context_option("Apply Patch")) {
+                const auto body = ui::GetGuideBodyBounds(panel_size.y);
+                ImGui::BeginChild("##game_menu_options",
+                    ImVec2(button_width + 4.0f * display_scale,
+                           std::max(1.0f, overlay_min.y + body.bottom - content_start_y)),
+                    ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+                if (draw_game_context_option("Edit Metadata")) {
+                  scraper.OpenMetadataEditor(
+                      MakeScreenScraperTarget(std::filesystem::u8path(selected_game_path_),
+                                             selected_game_name_),
+                      selected_row ? selected_row->editable_metadata : screenscraper::Metadata{},
+                      selected_row ? load_game_art(*selected_row, selected_row->list_art_path,
+                          {selected_row->metadata.cover_path, selected_row->metadata.icon_path}) : nullptr,
+                      selected_row ? load_game_art(*selected_row, selected_row->detail_art_path,
+                          {selected_row->metadata.banner_path,
+                           selected_row->metadata.gallery_paths.empty() ? std::string_view() :
+                               selected_row->metadata.gallery_paths.front()}) : nullptr);
+                }
+                if (draw_game_context_option("Edit Patches")) {
+                  OpenPatchEditor(storage_root / "patches",
+                                  UWP::GetTitleIdFromPath(selected_game_path_));
+                }
+
+                if (draw_game_context_option("Download Patches")) {
                   std::filesystem::path patches_root = storage_root / "patches";
                   std::string patches_dir = patches_root.string();
                   std::string title_id =
@@ -5479,9 +6107,8 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                         action_status_ =
                             "Failed to copy file. Please try again.";
                       } else {
-                        bool enabled = true;
                         if (pending_manual_kind_ == ManualInstallKind::kPatch) {
-                          enabled = EnablePatchesForTitle(dest, title_id);
+                          OpenPatchEditor(dest, title_id);
                         }
                         bool config_applied = true;
                         bool plugin_layout_ok = true;
@@ -5501,8 +6128,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                         switch (pending_manual_kind_) {
                           case ManualInstallKind::kPatch:
                             action_status_ =
-                                enabled ? "Patch installed manually."
-                                        : "Patch copied, but enabling failed.";
+                                "Patch installed. Choose its options in Edit Patches.";
                             break;
                           case ManualInstallKind::kPlugin:
                             action_status_ =
@@ -5595,147 +6221,28 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 }
 
                 if (draw_game_context_option("Manage Title Updates")) {
-                  std::string title_id =
-                      UWP::GetTitleIdFromPath(selected_game_path_);
-                  std::string media_id =
-                      UWP::GetMediaIdFromPath(selected_game_path_);
-                  const auto title_updates_root =
-                      storage_root / "title_updates";
-
-                  if (title_id.empty()) {
-                    action_status_ =
-                        "Could not resolve title ID for title update "
-                        "management.";
-                    action_popup_mode_ = ActionPopupMode::kInfo;
-                    show_action_status_ = true;
-                  } else {
-                    UWP::DownloadTitleUpdatesForGame(
-                        title_id, media_id,
-                        xe::path_to_utf8(title_updates_root),
-                        [this, title_id, title_updates_root](
-                            bool ok, std::vector<std::string> files,
-                            std::string message) {
-                          if (!ok) {
-                            action_status_ =
-                                message.empty()
-                                    ? "Failed to download title updates."
-                                    : message;
-                            action_popup_mode_ = ActionPopupMode::kInfo;
-                            show_action_status_ = true;
-                            return;
-                          }
-
-                          int installed = 0;
-                          int failed = 0;
-                          std::vector<std::string> installed_tu_names;
-                          for (const auto& file : files) {
-                            try {
-                              auto abs_path = std::filesystem::absolute(file);
-                              Emulator::ContentInstallEntry install_entry(
-                                  abs_path);
-                              auto result = emulator_window_.emulator_
-                                                ->InstallContentPackage(
-                                                    abs_path, install_entry);
-                              if (result == X_STATUS_SUCCESS) {
-                                ++installed;
-                                installed_tu_names.push_back(
-                                    std::filesystem::path(
-                                        install_entry.data_installation_path_)
-                                        .filename()
-                                        .string());
-                                std::error_code remove_ec;
-                                std::filesystem::remove(abs_path, remove_ec);
-                              } else {
-                                ++failed;
-                              }
-                            } catch (...) {
-                              ++failed;
-                            }
-                          }
-
-                          if (!installed_tu_names.empty()) {
-                            const auto content_root =
-                                emulator_window_.emulator_->content_root();
-                            const auto installed_tu_root =
-                                content_root / "0000000000000000" / title_id /
-                                "000B0000";
-                            const auto installed_tu_headers_root =
-                                content_root / "0000000000000000" / title_id /
-                                "Headers" / "000B0000";
-
-                            auto keep_installed_tu =
-                                [&](const std::filesystem::path& path) {
-                                  const auto name = path.filename().string();
-                                  return std::find(installed_tu_names.begin(),
-                                                   installed_tu_names.end(),
-                                                   name) !=
-                                         installed_tu_names.end();
-                                };
-                            auto keep_installed_tu_header =
-                                [&](const std::filesystem::path& path) {
-                                  const auto name = path.filename().string();
-                                  return std::find_if(
-                                             installed_tu_names.begin(),
-                                             installed_tu_names.end(),
-                                             [&](const std::string&
-                                                     installed_name) {
-                                               return name == installed_name +
-                                                                  ".header";
-                                             }) != installed_tu_names.end();
-                                };
-
-                            std::error_code cleanup_ec;
-                            if (std::filesystem::exists(installed_tu_root)) {
-                              for (const auto& entry :
-                                   std::filesystem::directory_iterator(
-                                       installed_tu_root)) {
-                                if (keep_installed_tu(entry.path())) {
-                                  continue;
-                                }
-                                std::filesystem::remove_all(entry.path(),
-                                                            cleanup_ec);
-                              }
-                            }
-                            if (!cleanup_ec && std::filesystem::exists(
-                                                   installed_tu_headers_root)) {
-                              for (const auto& entry :
-                                   std::filesystem::directory_iterator(
-                                       installed_tu_headers_root)) {
-                                if (keep_installed_tu_header(entry.path())) {
-                                  continue;
-                                }
-                                std::filesystem::remove(entry.path(),
-                                                        cleanup_ec);
-                              }
-                            }
-                            if (cleanup_ec) {
-                              action_status_ = fmt::format(
-                                  "Installed new title update for {}, but "
-                                  "failed to clean up older title updates.",
-                                  title_id);
-                              action_popup_mode_ = ActionPopupMode::kInfo;
-                              show_action_status_ = true;
-                              return;
-                            }
-                          }
-
-                          if (failed > 0) {
-                            action_status_ = fmt::format(
-                                "{} Installed {} title update package(s); {} "
-                                "failed."
-                                "\nFailed downloads remain in: {}",
-                                message, installed, failed,
-                                xe::path_to_utf8(title_updates_root));
-                          } else {
-                            action_status_ = fmt::format(
-                                "{} Installed {} title update package(s).",
-                                message, installed);
-                          }
-                          action_popup_mode_ = ActionPopupMode::kInfo;
-                          show_action_status_ = true;
-                        });
+                  if (!title_update_dialog_) {
+                    title_update_dialog_ = std::make_unique<GameTitleUpdateDialog>();
                   }
+                  const auto game =
+                      UWP::GetTitleUpdateGameInfo(selected_game_path_);
+                  title_update_dialog_->Open(game.title_id, game.media_id,
+                                            game.base_version, storage_root);
                 }
+
+                if (draw_game_context_option("Installed Content")) {
+                  const std::string title_id =
+                      UWP::GetTitleIdFromPath(selected_game_path_);
+                  uint32_t title_filter = 0;
+                  if (!title_id.empty()) {
+                    title_filter = static_cast<uint32_t>(
+                        std::strtoul(title_id.c_str(), nullptr, 16));
+                  }
+                  emulator_window_.ToggleContentListDialogForTitle(
+                      title_filter);
+                }
+
+                ImGui::EndChild();
 
                 const float footer_text_size = 13.5f * uy;
                 const float footer_icon_size = 15.6f * uy;
@@ -5770,15 +6277,14 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             }
           }
 
+          if (patch_editor_ && patch_editor_->is_open()) show_action_status_ = false;
+          const bool close_action_popup =
+              std::exchange(action_popup_should_close_, false) &&
+              !show_action_status_;
           if (show_action_status_) {
             ImGui::OpenPopup("Action Result");
             show_action_status_ = false;
             action_popup_focus_requested_ = true;
-          }
-
-          if (action_popup_should_close_) {
-            ImGui::CloseCurrentPopup();
-            action_popup_should_close_ = false;
           }
 
           const ImGuiViewport* action_viewport = ImGui::GetMainViewport();
@@ -5793,6 +6299,9 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           }
           if (ImGui::BeginPopupModal("Action Result", nullptr,
                                      action_popup_flags)) {
+            if (close_action_popup) {
+              ImGui::CloseCurrentPopup();
+            }
             ImDrawList* action_draw_list = ImGui::GetWindowDrawList();
             const ImVec2 screen_min = action_viewport->Pos;
             const ImVec2 screen_max =
@@ -5910,10 +6419,9 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                     if (copy_ec) {
                       action_status_ = "Failed to copy file. Please try again.";
                     } else {
-                      bool enabled = true;
                       if (pending_manual_kind_ == ManualInstallKind::kPatch) {
-                        enabled = EnablePatchesForTitle(dest, title_id);
-                      }
+                          OpenPatchEditor(dest, title_id);
+                        }
                       bool config_applied = true;
                       bool plugin_layout_ok = true;
                       std::string plugin_layout_error;
@@ -5931,8 +6439,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                       switch (pending_manual_kind_) {
                         case ManualInstallKind::kPatch:
                           action_status_ =
-                              enabled ? "Patch installed manually."
-                                      : "Patch copied, but enabling failed.";
+                              "Patch installed. Choose its options in Edit Patches.";
                           break;
                         case ManualInstallKind::kPlugin:
                           action_status_ = plugin_layout_ok
@@ -6701,18 +7208,18 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                           fmt::format("Category: {}", option->category);
                       draw_wrapped_pergame_right_text(pergame_category_text);
                       if (!option->description.empty()) {
-                        ImGui::Separator();
+                        ImGui::Spacing();
                         draw_wrapped_pergame_right_text(option->description);
                       }
                     }
 
-                    ImGui::Separator();
+                    ImGui::Spacing();
                     const std::string pergame_value_text =
                         fmt::format("Current value: {}", active_pergame_value);
                     draw_wrapped_pergame_right_text(pergame_value_text);
 
                     if (option && !option->enum_values.empty()) {
-                      ImGui::Separator();
+                      ImGui::Spacing();
                       const std::string pergame_choose_text = "Choose value:";
                       draw_wrapped_pergame_right_text(pergame_choose_text);
                       for (const auto& enum_value_raw : option->enum_values) {
@@ -6929,7 +7436,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                     }
 
                     if (option) {
-                      ImGui::Separator();
+                      ImGui::Spacing();
                       if (ImGui::Button("Reset To Default")) {
                         apply_per_game_value_change(option->default_value);
                       }
@@ -7183,7 +7690,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
           if (request_launch_selected_game && !launch_game_path.empty()) {
             launch_after_draw = true;
-            launch_path_after_draw = launch_game_path;
+            launch_path_after_draw = std::filesystem::u8path(launch_game_path);
           }
 
           gamelist_x_was_down = controller_x_down;
@@ -7203,6 +7710,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         about_tab_was_open = about_tab_open;
 
         if (active_frontend_page_ == FrontendPage::kSettings) {
+          StopVideoBackground();
           std::string tooltip =
               "Note: Xenia-Canary is a WIP emulator.\nMost settings should be "
               "considered hacks, and may cause (or fix) crashes and other "
@@ -7211,7 +7719,8 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
           static const char* k_settings_sections[] = {
               "General", "D3D12",        "Display", "GPU", "Audio",
               "Memory",  "Storage",      "UI",      "x64", "Video",
-              "HID",     "Command Line", "Netplay",
+              "HID",     "Command Line", "Netplay", "DSU / Streaming",
+              "ScreenScraper",
           };
 
           if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
@@ -8147,8 +8656,8 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 }
 
                 ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
-                                   "(Changing this from x1 will cause all "
-                                   "games to crash on Xbox)");
+                                   "(Scaled rendering commits extra memory per "
+                                   "resolved region; 3x needs the most)");
               }
 
               if (settings_selected_section == 4) {
@@ -8310,6 +8819,7 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
               }
 
               if (settings_selected_section == 7) {
+                scraper.DrawUISettings();
                 auto bool_toggle =
                     [&](const char* label, const char* true_label,
                         const char* false_label, cvar::ConfigVar<bool>* cvar,
@@ -8357,31 +8867,6 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                     "Enable or disable the storage selection dialog.");
 
                 bool_toggle(
-                    "Description Preference", "Short Descriptions",
-                    "Long Descriptions",
-                    dynamic_cast<cvar::ConfigVar<bool>*>(
-                        cvar::ConfigVars->find("ui_prefer_short_descriptions")
-                            ->second),
-                    "Choose whether the Games tab uses short or long metadata "
-                    "descriptions (falls back as needed).");
-
-                bool_toggle(
-                    "Boxart Image Preference", "Banner First", "Gallery First",
-                    dynamic_cast<cvar::ConfigVar<bool>*>(
-                        cvar::ConfigVars->find("ui_prefer_banner_hero_art")
-                            ->second),
-                    "Choose whether to prioritize banner box art or gallery "
-                    "artwork above the description.");
-
-                bool_toggle(
-                    "Game List Art", "Icon First", "Box Art First",
-                    dynamic_cast<cvar::ConfigVar<bool>*>(
-                        cvar::ConfigVars->find("ui_prefer_icon_gamelist_art")
-                            ->second),
-                    "Choose whether the Games tab list prefers icon art or box "
-                    "art.");
-
-                bool_toggle(
                     "Genre Metadata", "Show Genre", "Hide Genre",
                     dynamic_cast<cvar::ConfigVar<bool>*>(
                         cvar::ConfigVars->find("ui_show_genre_metadata")
@@ -8425,359 +8910,48 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                             ->second),
                     "Toggle user ratings in the Games tab detail pane.");
 
-                // Interface overlay selection
-                auto c_overlay = dynamic_cast<cvar::ConfigVar<std::string>*>(
-                    cvar::ConfigVars->find("ui_interface_overlay_image")
-                        ->second);
-                std::string current_overlay =
-                    c_overlay ? c_overlay->GetTypedConfigValue() : "blades.png";
-
-                // Scan for available interface overlay files
-                static std::vector<std::string> available_overlays;
-                static int current_overlay_index = 0;
-                static bool overlays_scanned = false;
-
-                if (!overlays_scanned) {
-                  available_overlays.clear();
-
-                  // Scan Assets/interface_overlays/ folder
-                  std::string overlays_dir = "Assets/interface_overlays/";
-                  if (std::filesystem::exists(overlays_dir) &&
-                      std::filesystem::is_directory(overlays_dir)) {
-                    for (const auto& entry :
-                         std::filesystem::directory_iterator(overlays_dir)) {
-                      if (entry.is_regular_file() &&
-                          entry.path().extension() == ".png") {
-                        available_overlays.push_back(
-                            entry.path().filename().string());
-                      }
-                    }
-                  }
-
-                  // Also scan content path if available
-                  auto ccontent_root =
-                      dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-                          cvar::ConfigVars->find("content_root")->second);
-                  std::string content_path =
-                      ccontent_root->GetTypedConfigValue().string();
-                  if (!content_path.empty()) {
-                    std::string content_overlays_dir =
-                        content_path + "/interface_overlays/";
-                    if (std::filesystem::exists(content_overlays_dir) &&
-                        std::filesystem::is_directory(content_overlays_dir)) {
-                      for (const auto& entry :
-                           std::filesystem::directory_iterator(
-                               content_overlays_dir)) {
-                        if (entry.is_regular_file() &&
-                            entry.path().extension() == ".png") {
-                          std::string filename =
-                              entry.path().filename().string();
-                          // Avoid duplicates
-                          if (std::find(available_overlays.begin(),
-                                        available_overlays.end(),
-                                        filename) == available_overlays.end()) {
-                            available_overlays.push_back(filename);
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  // Sort alphabetically
-                  std::sort(available_overlays.begin(),
-                            available_overlays.end());
-
-                  // Find current overlay index
-                  auto it =
-                      std::find(available_overlays.begin(),
-                                available_overlays.end(), current_overlay);
-                  current_overlay_index =
-                      (it != available_overlays.end())
-                          ? std::distance(available_overlays.begin(), it)
-                          : 0;
-
-                  overlays_scanned = true;
-                }
-
-                if (!available_overlays.empty()) {
-                  const char* preview =
-                      current_overlay_index < available_overlays.size()
-                          ? available_overlays[current_overlay_index].c_str()
-                          : "blades.png";
-
-                  {
-                    ScopedAccentComboStyle accent_combo_style;
-                    if (ImGui::BeginCombo("Interface Overlay", preview)) {
-                      for (int i = 0;
-                           i < static_cast<int>(available_overlays.size());
-                           ++i) {
-                        bool is_selected = (current_overlay_index == i);
-                        if (ImGui::Selectable(available_overlays[i].c_str(),
-                                              is_selected)) {
-                          current_overlay_index = i;
-                          c_overlay->SetConfigValue(available_overlays[i]);
-                          config::SaveConfig();
-                          background_tex_.reset();
-                        }
-                        if (is_selected) {
-                          ImGui::SetItemDefaultFocus();
-                        }
-                      }
-                      ImGui::EndCombo();
-                    }
-                  }
-                  if (ImGui::IsItemFocused()) {
-                    tooltip =
-                        "Select an interface overlay from the "
-                        "Assets/interface_overlays/ folder. PNG files only.";
-                  }
-                } else {
-                  ImGui::Text(
-                      "No interface overlays found in "
-                      "Assets/interface_overlays/");
-                }
-
-                // Guide image selection
-                auto c_guide = dynamic_cast<cvar::ConfigVar<std::string>*>(
-                    cvar::ConfigVars->find("ui_guide_image")->second);
-                std::string current_guide =
-                    c_guide ? c_guide->GetTypedConfigValue() : "blades.png";
-                const auto has_suffix = [](const std::string& value,
-                                           const std::string& suffix) {
-                  return value.size() >= suffix.size() &&
-                         value.compare(value.size() - suffix.size(),
-                                       suffix.size(), suffix) == 0;
+                auto set_color = [](const char* name,
+                                    const std::string& value) {
+                  dynamic_cast<cvar::ConfigVar<std::string>*>(
+                      cvar::ConfigVars->at(name))
+                      ->SetConfigValue(value);
                 };
-                if (current_guide.empty() ||
-                    current_guide.find('.') == std::string::npos) {
-                  current_guide = "blades.png";
-                }
-                {
-                  std::filesystem::path current_guide_path(current_guide);
-                  std::string current_guide_stem =
-                      current_guide_path.stem().string();
-                  std::string current_guide_ext =
-                      current_guide_path.extension().string();
-                  if (current_guide_ext.empty()) {
-                    current_guide_ext = ".png";
-                  }
-                  if (has_suffix(current_guide_stem, "_wide")) {
-                    current_guide = current_guide_stem.substr(
-                                        0, current_guide_stem.size() - 5) +
-                                    current_guide_ext;
-                  } else if (has_suffix(current_guide_stem, "-wide")) {
-                    current_guide = current_guide_stem.substr(
-                                        0, current_guide_stem.size() - 5) +
-                                    current_guide_ext;
-                  }
-                }
-
-                // Scan for available guide image files
-                static std::vector<std::string> available_guides;
-                static int current_guide_index = 0;
-                static bool guides_scanned = false;
-
-                if (!guides_scanned) {
-                  available_guides.clear();
-
-                  // Scan Assets/guide_images/ folder
-                  std::string guides_dir = "Assets/guide_images/";
-                  if (std::filesystem::exists(guides_dir) &&
-                      std::filesystem::is_directory(guides_dir)) {
-                    for (const auto& entry :
-                         std::filesystem::directory_iterator(guides_dir)) {
-                      if (entry.is_regular_file() &&
-                          entry.path().extension() == ".png") {
-                        std::string filename = entry.path().filename().string();
-                        std::string stem = entry.path().stem().string();
-                        if (has_suffix(stem, "_wide") ||
-                            has_suffix(stem, "-wide")) {
-                          continue;
-                        }
-                        available_guides.push_back(filename);
-                      }
+                auto color_combo = [&](const char* label, const char* name,
+                                       bool theme = false) {
+                  auto* setting = dynamic_cast<cvar::ConfigVar<std::string>*>(
+                      cvar::ConfigVars->at(name));
+                  const auto current =
+                      NormalizeThemeColor(setting->GetTypedConfigValue());
+                  const char* preview = "Green";
+                  for (const auto& color : kThemeColors) {
+                    if (current == color.value) {
+                      preview = color.label;
                     }
                   }
-
-                  // Sort alphabetically
-                  std::sort(available_guides.begin(), available_guides.end());
-
-                  // Find current guide index
-                  auto it = std::find(available_guides.begin(),
-                                      available_guides.end(), current_guide);
-                  current_guide_index =
-                      (it != available_guides.end())
-                          ? std::distance(available_guides.begin(), it)
-                          : 0;
-
-                  guides_scanned = true;
-                }
-
-                if (!available_guides.empty()) {
-                  const char* preview =
-                      current_guide_index < available_guides.size()
-                          ? available_guides[current_guide_index].c_str()
-                          : "blades.png";
-
-                  {
-                    ScopedAccentComboStyle accent_combo_style;
-                    if (ImGui::BeginCombo("Guide Panel Image", preview)) {
-                      for (int i = 0;
-                           i < static_cast<int>(available_guides.size()); ++i) {
-                        bool is_selected = (current_guide_index == i);
-                        if (ImGui::Selectable(available_guides[i].c_str(),
-                                              is_selected)) {
-                          current_guide_index = i;
-                          c_guide->SetConfigValue(available_guides[i]);
-                          config::SaveConfig();
+                  ScopedAccentComboStyle accent_combo_style;
+                  if (ImGui::BeginCombo(label, preview)) {
+                    for (const auto& color : kThemeColors) {
+                      const bool selected = current == color.value;
+                      if (ImGui::Selectable(color.label, selected)) {
+                        if (theme) {
+                          ApplyColorTheme(color.value, set_color);
+                        } else {
+                          set_color(name, color.value);
                         }
-                        if (is_selected) {
-                          ImGui::SetItemDefaultFocus();
-                        }
+                        config::SaveConfig();
                       }
-                      ImGui::EndCombo();
-                    }
-                  }
-                  if (ImGui::IsItemFocused()) {
-                    tooltip =
-                        "Select a guide panel image from the "
-                        "Assets/guide_images/ folder. PNG files only.";
-                  }
-                } else {
-                  ImGui::Text("No guide images found in Assets/guide_images/");
-                }
-
-                // Background image selection
-                auto c_background = dynamic_cast<cvar::ConfigVar<std::string>*>(
-                    cvar::ConfigVars->find("ui_background_image")->second);
-                std::string current_background =
-                    c_background ? c_background->GetTypedConfigValue()
-                                 : "default.png";
-
-                // Scan for available background image files
-                static std::vector<std::string> available_backgrounds;
-                static int current_background_index = 0;
-                static bool backgrounds_scanned = false;
-
-                if (!backgrounds_scanned) {
-                  available_backgrounds.clear();
-
-                  // Scan Assets/backgrounds/ folder
-                  std::string backgrounds_dir = "Assets/backgrounds/";
-                  if (std::filesystem::exists(backgrounds_dir) &&
-                      std::filesystem::is_directory(backgrounds_dir)) {
-                    for (const auto& entry :
-                         std::filesystem::directory_iterator(backgrounds_dir)) {
-                      if (entry.is_regular_file() &&
-                          entry.path().extension() == ".png") {
-                        available_backgrounds.push_back(
-                            entry.path().filename().string());
+                      if (selected) {
+                        ImGui::SetItemDefaultFocus();
                       }
                     }
+                    ImGui::EndCombo();
                   }
-
-                  // Also scan content path if available
-                  auto ccontent_root =
-                      dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-                          cvar::ConfigVars->find("content_root")->second);
-                  std::string content_path =
-                      ccontent_root->GetTypedConfigValue().string();
-                  if (!content_path.empty()) {
-                    std::string content_backgrounds_dir =
-                        content_path + "/backgrounds/";
-                    if (std::filesystem::exists(content_backgrounds_dir) &&
-                        std::filesystem::is_directory(
-                            content_backgrounds_dir)) {
-                      for (const auto& entry :
-                           std::filesystem::directory_iterator(
-                               content_backgrounds_dir)) {
-                        if (entry.is_regular_file() &&
-                            entry.path().extension() == ".png") {
-                          std::string filename =
-                              entry.path().filename().string();
-                          // Avoid duplicates
-                          if (std::find(available_backgrounds.begin(),
-                                        available_backgrounds.end(),
-                                        filename) ==
-                              available_backgrounds.end()) {
-                            available_backgrounds.push_back(filename);
-                          }
-                        }
-                      }
-                    }
-                  }
-
-                  // Sort alphabetically
-                  std::sort(available_backgrounds.begin(),
-                            available_backgrounds.end());
-
-                  // Find current background index
-                  auto it = std::find(available_backgrounds.begin(),
-                                      available_backgrounds.end(),
-                                      current_background);
-                  current_background_index =
-                      (it != available_backgrounds.end())
-                          ? std::distance(available_backgrounds.begin(), it)
-                          : 0;
-
-                  backgrounds_scanned = true;
-                }
-
-                if (!available_backgrounds.empty()) {
-                  const char* preview =
-                      current_background_index < available_backgrounds.size()
-                          ? available_backgrounds[current_background_index]
-                                .c_str()
-                          : "default.png";
-
-                  {
-                    ScopedAccentComboStyle accent_combo_style;
-                    if (ImGui::BeginCombo("Background Image", preview)) {
-                      for (int i = 0;
-                           i < static_cast<int>(available_backgrounds.size());
-                           ++i) {
-                        bool is_selected = (current_background_index == i);
-                        if (ImGui::Selectable(available_backgrounds[i].c_str(),
-                                              is_selected)) {
-                          current_background_index = i;
-                          c_background->SetConfigValue(
-                              available_backgrounds[i]);
-                          config::SaveConfig();
-                          background_fallback_tex_.reset();
-                        }
-                        if (is_selected) {
-                          ImGui::SetItemDefaultFocus();
-                        }
-                      }
-                      ImGui::EndCombo();
-                    }
-                  }
-                  if (ImGui::IsItemFocused()) {
-                    tooltip =
-                        "Select a background image from the "
-                        "Assets/backgrounds/ folder. PNG files only.";
-                  }
-                } else {
-                  ImGui::Text(
-                      "No background images found in Assets/backgrounds/");
-                }
-
-                // Dynamic game backgrounds toggle
-                auto c_dynamic_bg = dynamic_cast<cvar::ConfigVar<bool>*>(
-                    cvar::ConfigVars->find("ui_enable_dynamic_game_backgrounds")
-                        ->second);
-                if (ImGui::Checkbox("Enable Dynamic Game Backgrounds",
-                                    c_dynamic_bg->current_value())) {
-                  c_dynamic_bg->SetConfigValue(
-                      !c_dynamic_bg->GetTypedConfigValue());
-                  config::SaveConfig();
-                }
-                if (ImGui::IsItemFocused()) {
-                  tooltip =
-                      "Enable or disable game-specific background artwork in "
-                      "the frontend. When disabled, only the selected "
-                      "background image will be shown.";
-                }
+                };
+                color_combo("Color Theme", "ui_color_theme", true);
+                color_combo("Interface Overlay Color",
+                            "ui_interface_overlay_color");
+                color_combo("Guide Panel Color", "ui_guide_color");
+                color_combo("Background Color", "ui_background_color");
 
                 // Hide tabs text toggle
                 auto c_hide_tabs = dynamic_cast<cvar::ConfigVar<bool>*>(
@@ -8800,12 +8974,13 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 std::string current_border_color =
                     c_border_color ? c_border_color->GetTypedConfigValue()
                                    : "green";
+                if (current_border_color == "grey") current_border_color = "silver";
                 const char* border_color_values[] = {
                     "green",  "purple", "red",   "orange", "blue",
-                    "yellow", "grey",   "black", "white"};
+                    "yellow", "silver", "black", "white"};
                 const char* border_color_labels[] = {
                     "Green (#61C032)", "Purple", "Red",   "Orange", "Blue",
-                    "Yellow",          "Grey",   "Black", "White"};
+                    "Yellow",          "Silver", "Black", "White"};
                 int current_border_color_index = 0;
                 for (int i = 0;
                      i < static_cast<int>(sizeof(border_color_values) /
@@ -8979,6 +9154,24 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 
                 if (ImGui::IsItemFocused()) {
                   tooltip = c_host_guest_stacksync->description();
+                }
+
+                auto c_disable_context_promotion =
+                    dynamic_cast<cvar::ConfigVar<bool>*>(
+                        cvar::ConfigVars->find("disable_context_promotion")
+                            ->second);
+                if (ImGui::Checkbox(
+                        "Disable Context Promotion",
+                        c_disable_context_promotion->current_value())) {
+                  c_disable_context_promotion->SetConfigValue(
+                      !c_disable_context_promotion->GetTypedConfigValue());
+                  config::SaveConfig();
+                }
+
+                if (ImGui::IsItemFocused()) {
+                  // Guest code is translated when a game loads.
+                  tooltip = c_disable_context_promotion->description() +
+                            " Applies the next time a game starts.";
                 }
               }
 
@@ -9171,6 +9364,20 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
                 }
               }
 
+              if (settings_selected_section == 13 && emulator_window_.dsu_) {
+                emulator_window_.dsu_->DrawSettings();
+                tooltip.clear();
+              }
+
+              if (settings_selected_section == 14 && emulator_window_.screenscraper_) {
+                emulator_window_.screenscraper_->DrawSettings(
+                    MakeScreenScraperTarget(std::filesystem::u8path(selected_game_path_), selected_game_name_),
+                    [this]() { PickStorageFolder(StorageFolderTarget::kMedia); },
+                    bool(storage_folder_result_));
+                if (!storage_path_status_.empty()) ImGui::TextWrapped("%s", storage_path_status_.c_str());
+                tooltip.clear();
+              }
+
               if (settings_selected_section == 12) {
                 if (DrawTextEffectButton("Network Settings")) {
                   emulator_window_.ToggleNetplaySettingsDialog();
@@ -9206,200 +9413,119 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
         }
 
         if (active_frontend_page_ == FrontendPage::kPaths) {
-          if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
-            if (key_pressed(ImGuiKey_GamepadFaceRight, false)) {
-              // B button pressed - clear selection and exit list focus
-              if (selected_path_ != "") {
-                selected_path_ = "";
-                // Request focus to move away from the list
-                paths_focus_requested = true;
-              }
-            }
-            if (key_pressed(ImGuiKey_GamepadFaceLeft, false)) {
-              // X button pressed - request focus to paths list
-              paths_focus_requested = true;
-            }
-          }
-
-          const float paths_plane_margin = 40.0f;
-          ImVec2 paths_plane_origin = ImGui::GetCursorPos();
-          ImVec2 paths_plane_avail = ImGui::GetContentRegionAvail();
-          ImVec2 paths_plane_size(
-              std::max(0.0f, paths_plane_avail.x - (paths_plane_margin * 2.0f)),
-              std::max(0.0f,
-                       paths_plane_avail.y - (paths_plane_margin * 2.0f)));
-          ImGui::SetCursorPos(
-              ImVec2(paths_plane_origin.x + paths_plane_margin,
-                     paths_plane_origin.y + paths_plane_margin));
-          ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-          if (ImGui::BeginChild("##paths_editor_plane", paths_plane_size,
-                                false)) {
+          StopVideoBackground();
+          const float margin = 40.0f;
+          const ImVec2 origin = ImGui::GetCursorPos();
+          const ImVec2 available = ImGui::GetContentRegionAvail();
+          ImGui::SetCursorPos(ImVec2(origin.x + margin, origin.y + margin));
+          ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+          if (ImGui::BeginChild(
+                  "##paths_editor_plane",
+                  ImVec2(std::max(1.0f, available.x - margin * 2.0f),
+                         std::max(1.0f, available.y - margin * 2.0f)),
+                  false, ImGuiWindowFlags_NoScrollbar)) {
             if (paths_focus_requested) {
-              ImGui::SetWindowFocus();
-            }
-            const float paths_content_offset_x = 15.0f * display_scale;
-            const float paths_content_offset_y = 15.0f * display_scale;
-            ImGui::Indent(paths_content_offset_x);
-            ImGui::Dummy(ImVec2(0.0f, paths_content_offset_y));
-
-            auto paths_list = UWP::GetPaths();
-            if (ImGui::BeginListBox("##folders")) {
-              for (size_t i = 0; i < paths_list.size(); ++i) {
-                if (paths_focus_requested && i == 0) {
-                  ImGui::SetKeyboardFocusHere();
-                }
-                bool is_selected = (selected_path_ == paths_list[i]);
-                if (ImGui::Selectable(paths_list[i].c_str(), is_selected)) {
-                  selected_path_ = paths_list[i];
-                }
-                if (ImGui::IsItemFocused()) {
-                  paths_focus_requested = false;
-                }
-              }
-              ImGui::EndListBox();
-            }
-
-            // Allow navigation out of list when Down is pressed (regardless of
-            // selection)
-            static bool navigating_to_buttons = false;
-            if (key_pressed(ImGuiKey_GamepadDpadDown, false) &&
-                !key_pressed(ImGuiKey_GamepadFaceRight, false)) {
-              // Move focus to buttons below
+              InitializeGuideNavigation();
               paths_focus_requested = false;
-              navigating_to_buttons = true;
             }
-
-            if (selected_path_ == "") {
-              ImGui::BeginDisabled();
-            }
-
-            ImU32 path_button_color = selected_path_ == ""
-                                          ? IM_COL32(160, 160, 160, 255)
-                                          : IM_COL32(255, 255, 255, 255);
-            if (draw_text_button("##remove_path_button", "Remove Path",
-                                 ImVec2(0.0f, 0.0f), path_button_color)) {
-              if (selected_path_ != "") {
-                auto paths = UWP::GetPaths();
-                paths.erase(
-                    std::remove(paths.begin(), paths.end(), selected_path_),
-                    paths.end());
-                UWP::SetGamePaths(paths);
-                selected_path_ = "";
-                // Reset focus to allow navigation after removal
-                paths_focus_requested = true;
-              }
-            }
-            // Set focus to Remove Path button when navigating from list
-            if (navigating_to_buttons && selected_path_ != "") {
-              ImGui::SetKeyboardFocusHere();
-              navigating_to_buttons = false;
-            }
-            if (ImGui::IsItemFocused()) {
-              paths_focus_requested = false;
-              navigating_to_buttons = false;
-            }
-
-            if (selected_path_ == "") {
-              ImGui::EndDisabled();
-            }
-
-            ImGui::SameLine();
-            if (paths_focus_requested && paths_list.empty()) {
-              ImGui::SetKeyboardFocusHere();
-            }
-            if (draw_text_button("##add_path_button", "Add Path")) {
-              imgui_drawer()->SetIgnoreInput(true);
-              UWP::SelectFolder([this](std::string path) {
-                if (path != "") {
-                  if (!UWP::TestPathPermissions(path)) {
-                    show_path_warning_ = true;
-                  } else {
-                    auto paths = UWP::GetPaths();
-                    paths.push_back(path);
-                    UWP::SetGamePaths(paths);
+            ImGui::PushTextWrapPos(0.0f);
+            const auto draw_storage_selector =
+                [&](const char* label, const char* id,
+                    const std::string& current_path, const char* development,
+                    const char* usb, StorageFolderTarget target,
+                    bool additional = false) {
+                  const char* preview =
+                      additional ? "Choose location"
+                      : UWP::SameStoragePath(current_path, development)
+                          ? "Development files"
+                      : UWP::SameStoragePath(current_path, usb) ? "USB path"
+                                                             : "Custom";
+                  ImGui::TextUnformatted(label);
+                  ImGui::SetNextItemWidth(std::min(
+                      ImGui::GetContentRegionAvail().x, 580.0f * display_scale));
+                  if (ImGui::BeginCombo(id, preview)) {
+                    const char* choices[] = {"Development files", "USB path",
+                                             "Custom"};
+                    for (int index = 0; index < 3; ++index) {
+                      const bool selected = !additional &&
+                                            std::strcmp(preview, choices[index]) == 0;
+                      if (ImGui::Selectable(choices[index], selected)) {
+                        if (index == 2) {
+                          PickStorageFolder(target);
+                        } else {
+                          ApplyStorageFolder(target,
+                                             index == 0 ? development : usb);
+                        }
+                      }
+                      if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                      }
+                    }
+                    ImGui::EndCombo();
                   }
-                }
+                  if (!additional && !current_path.empty()) {
+                    ImGui::TextWrapped("%s", current_path.c_str());
+                  }
+                  ImGui::Spacing();
+                };
 
-                imgui_drawer()->SetIgnoreInput(false);
-                // Reset focus to allow navigation after folder selection
-                paths_focus_requested = true;
-              });
+            auto paths = UWP::GetPaths();
+            draw_storage_selector(
+                "Games directory", "##primary_games_location",
+                paths.empty() ? UWP::kDefaultGameDirectory : paths.front(),
+                UWP::kDevelopmentGameDirectory, UWP::kDefaultGameDirectory,
+                StorageFolderTarget::kPrimaryGames);
+            draw_storage_selector(
+                "Add another game folder", "##additional_games_location", {},
+                UWP::kDevelopmentGameDirectory, UWP::kDefaultGameDirectory,
+                StorageFolderTarget::kAdditionalGames, true);
+            if (draw_text_button("##refresh_paths", "Refresh List")) {
+              UWP::RefreshPaths();
+              cached_game_title_ids_.clear();
+              storage_path_status_ = "Game list refreshed.";
             }
-            if (ImGui::IsItemFocused()) {
-              paths_focus_requested = false;
+            paths = UWP::GetPaths();
+            for (size_t index = 1; index < paths.size(); ++index) {
+              ImGui::PushID(static_cast<int>(index));
+              ImGui::TextWrapped("%s", paths[index].c_str());
+              if (draw_text_button("##remove_game_folder", "Remove Folder")) {
+                paths.erase(paths.begin() + index);
+                UWP::SetGamePaths(paths);
+                cached_game_title_ids_.clear();
+                ImGui::PopID();
+                break;
+              }
+              ImGui::PopID();
             }
 
-            auto ccache_root =
-                dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-                    cvar::ConfigVars->find("cache_root")->second);
-            auto ccontent_root =
-                dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-                    cvar::ConfigVars->find("content_root")->second);
-            auto cstorage_root =
+            ImGui::Spacing();
+            auto* storage_variable =
                 dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
                     cvar::ConfigVars->find("storage_root")->second);
-
-            if (draw_text_button("##set_config_folders_path_button",
-                                 "Set Config Folders Path")) {
-              imgui_drawer()->SetIgnoreInput(true);
-              UWP::SelectFolder([this, ccache_root, ccontent_root,
-                                 cstorage_root](std::string path) {
-                if (path != "") {
-                  if (!UWP::TestPathPermissions(path)) {
-                    ImGui::OpenPopup("Warning");
-                  } else {
-                    ccache_root->SetConfigValue(
-                        std::filesystem::path(path + "\\cache"));
-                    ccontent_root->SetConfigValue(
-                        std::filesystem::path(path + "\\content"));
-                    cstorage_root->SetConfigValue(
-                        std::filesystem::path(path + "\\storage"));
-                    config::SaveConfig();
-                  }
-                }
-
-                imgui_drawer()->SetIgnoreInput(false);
-                // Reset focus to allow navigation after folder selection
-                paths_focus_requested = true;
-              });
+            auto config_folder = storage_variable->GetTypedConfigValue();
+            if (config_folder.empty()) {
+              config_folder = emulator_window_.emulator()->storage_root();
+            } else if (config_folder.filename() == "storage") {
+              config_folder = config_folder.parent_path();
             }
-            if (ImGui::IsItemFocused()) {
-              paths_focus_requested = false;
+            ImGui::BeginDisabled(emulator_window_.emulator()->is_title_open());
+            draw_storage_selector(
+                "Config folders", "##config_folders_location",
+                xe::path_to_utf8(config_folder), "D:/DevelopmentFiles/Xenia",
+                "E:/Xenia", StorageFolderTarget::kConfig);
+            ImGui::EndDisabled();
+            if (!storage_path_status_.empty()) {
+              ImGui::Spacing();
+              ImGui::TextWrapped("%s", storage_path_status_.c_str());
             }
-
-            ImGui::SameLine();
-
-            ImGui::TextWrapped(
-                "Remember to configure your USB filesystem so its paths work ");
-
-            if (show_path_warning_) {
-              ImGui::OpenPopup("Warning");
-              show_path_warning_ = false;
-              ImGui::SetNextWindowSize(
-                  ImVec2(1600 * display_scale, 150 * display_scale));
-            }
-
-            if (ImGui::BeginPopupModal("Warning")) {
-              ImGui::TextWrapped(
-                  "The folder path you have selected is not writable! Please "
-                  "check "
-                  "that you have the correct permissions for the folder you "
-                  "have "
-                  "selected.");
-              ImGui::Separator();
-              if (draw_text_button("##path_warning_ok_button", "OK")) {
-                ImGui::CloseCurrentPopup();
-              }
-
-              ImGui::EndPopup();
-            }
-
-            ImGui::EndChild();
+            ImGui::PopTextWrapPos();
           }
+          ImGui::EndChild();
           ImGui::PopStyleVar();
         }
 
         if (active_frontend_page_ == FrontendPage::kAbout) {
+          StopVideoBackground();
           if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
               key_pressed(ImGuiKey_GamepadFaceRight, false)) {
             about_focus_requested = true;
@@ -9424,28 +9550,24 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
             const float about_content_offset_x = 15.0f * display_scale;
             ImGui::Indent(about_content_offset_x);
 
-            ImGui::TextWrapped(
-                "Xenia Canary UWP 1.1.7.1\n"
+            const std::string about_text = fmt::format(
+                "Xenia Canary Netplay UWP {}\n"
                 "A Unofficial fork of Xenia focusing on Xbox support and a "
-                "blades "
-                "style frontend.\n");
+                "blades style frontend.\n",
+                UWP::GetPackageVersion());
+            ImGui::TextWrapped("%s", about_text.c_str());
 
             ImGui::Spacing();
 
             if (about_focus_requested) {
               ImGui::SetKeyboardFocusHere();
             }
-            if (draw_text_button("##xbox_port_donations_button",
-                                 "Xbox Port Donations")) {
-              LaunchWebBrowser("https://ko-fi.com/danp142");
-            }
-            if (ImGui::IsItemFocused()) {
-              about_focus_requested = false;
-            }
-            ImGui::Spacing();
             if (draw_text_button("##upstream_donations_button",
                                  "Upstream Donations")) {
               LaunchWebBrowser("https://www.patreon.com/xenia_project");
+            }
+            if (ImGui::IsItemFocused()) {
+              about_focus_requested = false;
             }
             ImGui::Spacing();
             if (draw_text_button("##xbox_emulation_hub_button",
@@ -9650,8 +9772,25 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
   ImGui::PopStyleVar();
   ImGui::PopStyleColor(3);
+  ImGui::EndDisabled();
 
-  if (launch_after_draw && !launch_path_after_draw.empty()) {
+  bool editor_closed = false;
+  if (scraper.MetadataEditorOpen()) {
+    editor_closed = !scraper.DrawMetadataEditor(imgui_drawer());
+  } else if (patch_editor_ && patch_editor_->is_open()) {
+    if (patch_editor_->Draw(imgui_drawer())) {
+      emulator_window_.emulator()->patcher()->ReloadPatches();
+    }
+    editor_closed = !patch_editor_->is_open();
+  } else if (title_update_dialog_ && title_update_dialog_->is_open()) {
+    editor_closed = !title_update_dialog_->Draw(emulator_window_.emulator(), imgui_drawer());
+  }
+  if (editor_closed) {
+    show_game_context_menu_ = true;
+    game_context_menu_focus_requested_ = true;
+  }
+
+  if (launch_after_draw && !game_editor_open && !launch_path_after_draw.empty()) {
     emulator_window_.RunTitle(launch_path_after_draw);
     if (!emulator_window_.emulator()->is_title_open()) {
       imgui_drawer()->AddDialog(this);
@@ -9661,152 +9800,53 @@ void EmulatorWindow::WinRTFrontendDialog::OnDraw(ImGuiIO& io) {
 }
 
 std::shared_ptr<ui::ImmediateTexture>
+EmulatorWindow::WinRTFrontendDialog::GetOrCreateThemeTexture(
+    const std::string& path, std::string& loaded_path,
+    std::shared_ptr<ui::ImmediateTexture>& texture) {
+  if (!texture || loaded_path != path) {
+    imgui_drawer()->RetainTextureForFrame(texture);
+    texture = LoadOverlayTexture(imgui_drawer(), path.c_str(), false);
+    loaded_path = path;
+  }
+  imgui_drawer()->RetainTextureForFrame(texture);
+  return texture;
+}
+
+std::shared_ptr<ui::ImmediateTexture>
 EmulatorWindow::WinRTFrontendDialog::GetOrCreateBackground() {
-  if (background_tex_ != nullptr) {
-    return background_tex_;
-  }
-
-  std::string path;
-
-  // Get the selected interface overlay from config
-  auto c_overlay = dynamic_cast<cvar::ConfigVar<std::string>*>(
-      cvar::ConfigVars->find("ui_interface_overlay_image")->second);
-  std::string overlay_name =
-      c_overlay ? c_overlay->GetTypedConfigValue() : "blades.png";
-
-  // Ensure the overlay name has .png extension
-  if (overlay_name.empty() || overlay_name.find('.') == std::string::npos) {
-    overlay_name = "blades.png";
-  }
-
-  auto ccontent_root = dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-      cvar::ConfigVars->find("content_root")->second);
-
-  std::string content_path = ccontent_root->GetTypedConfigValue().string();
-  if (!content_path.empty()) {
-    path = content_path + "/interface_overlays/" + overlay_name;
-  } else {
-    path = UWP::GetLocalState() + "/content/interface_overlays/" + overlay_name;
-  }
-
-  if (!std::filesystem::exists(path)) {
-    path = "Assets/interface_overlays/" + overlay_name;
-  }
-
-  // Fallback to blades.png if selected overlay doesn't exist
-  if (!std::filesystem::exists(path) && overlay_name != "blades.png") {
-    if (!content_path.empty()) {
-      path = content_path + "/interface_overlays/blades.png";
-    } else {
-      path = UWP::GetLocalState() + "/content/interface_overlays/blades.png";
-    }
-
-    if (!std::filesystem::exists(path)) {
-      path = "Assets/interface_overlays/blades.png";
-    }
-  }
-
-  if (emulator_window_.immediate_drawer_ == nullptr) {
-    return nullptr;
-  }
-
-  int width = 0, height = 0, comp = 0;
-  auto data = stbi_load(path.c_str(), &width, &height, &comp, 4);
-  if (!data || width <= 0 || height <= 0) {
-    return nullptr;
-  }
-
-  auto tex = emulator_window_.immediate_drawer_->CreateTexture(
-      static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-      xe::ui::ImmediateTextureFilter::kLinear, false, data);
-  stbi_image_free(data);
-
-  background_tex_ = std::move(tex);
-  return background_tex_;
+  return GetOrCreateThemeTexture(
+      ResolveConfiguredThemeAssetPath(ThemeAsset::kOverlay,
+                                      "ui_interface_overlay_color"),
+      background_texture_path_, background_tex_);
 }
 
 std::shared_ptr<ui::ImmediateTexture>
 EmulatorWindow::WinRTFrontendDialog::GetOrCreateBackgroundFallback() {
-  if (background_fallback_tex_ != nullptr) {
-    return background_fallback_tex_;
-  }
-
-  std::string path;
-
-  // Get the selected background from config
-  auto c_background = dynamic_cast<cvar::ConfigVar<std::string>*>(
-      cvar::ConfigVars->find("ui_background_image")->second);
-  std::string background_name =
-      c_background ? c_background->GetTypedConfigValue() : "default.png";
-
-  // Ensure the background name has .png extension
-  if (background_name.empty() ||
-      background_name.find('.') == std::string::npos) {
-    background_name = "default.png";
-  }
-
-  auto ccontent_root = dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(
-      cvar::ConfigVars->find("content_root")->second);
-
-  std::string content_path = ccontent_root->GetTypedConfigValue().string();
-  if (!content_path.empty()) {
-    path = content_path + "/backgrounds/" + background_name;
-  } else {
-    path = UWP::GetLocalState() + "/content/backgrounds/" + background_name;
-  }
-
-  if (!std::filesystem::exists(path)) {
-    path = "Assets/backgrounds/" + background_name;
-  }
-
-  // Fallback to default.png if selected background doesn't exist
-  if (!std::filesystem::exists(path) && background_name != "default.png") {
-    if (!content_path.empty()) {
-      path = content_path + "/backgrounds/default.png";
-    } else {
-      path = UWP::GetLocalState() + "/content/backgrounds/default.png";
-    }
-
-    if (!std::filesystem::exists(path)) {
-      path = "Assets/backgrounds/default.png";
-    }
-  }
-
-  if (emulator_window_.immediate_drawer_ == nullptr) {
-    return nullptr;
-  }
-
-  int width = 0, height = 0, comp = 0;
-  auto data = stbi_load(path.c_str(), &width, &height, &comp, 4);
-  if (!data || width <= 0 || height <= 0) {
-    return nullptr;
-  }
-
-  auto tex = emulator_window_.immediate_drawer_->CreateTexture(
-      static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-      xe::ui::ImmediateTextureFilter::kLinear, false, data);
-  stbi_image_free(data);
-
-  background_fallback_tex_ = std::move(tex);
-  return background_fallback_tex_;
+  return GetOrCreateThemeTexture(
+      ResolveConfiguredThemeAssetPath(ThemeAsset::kBackground,
+                                      "ui_background_color"),
+      background_fallback_texture_path_, background_fallback_tex_);
 }
 
 std::shared_ptr<ui::ImmediateTexture>
 EmulatorWindow::WinRTFrontendDialog::GetOrCreateImageTexture(
     const std::string& image_path) {
+  std::error_code file_error;
   if (image_path.empty() || emulator_window_.immediate_drawer_ == nullptr ||
-      !std::filesystem::exists(image_path)) {
+      !std::filesystem::exists(std::filesystem::u8path(image_path), file_error)) {
     return nullptr;
   }
 
   auto cache_it = game_image_textures_.find(image_path);
   if (cache_it != game_image_textures_.end() && cache_it->second != nullptr) {
+    imgui_drawer()->RetainTextureForFrame(cache_it->second);
     return cache_it->second;
   }
 
   int width = 0, height = 0, comp = 0;
   auto data = stbi_load(image_path.c_str(), &width, &height, &comp, 4);
   if (!data || width <= 0 || height <= 0) {
+    stbi_image_free(data);
     return nullptr;
   }
 
@@ -9819,37 +9859,16 @@ EmulatorWindow::WinRTFrontendDialog::GetOrCreateImageTexture(
   }
 
   game_image_textures_[image_path] = std::move(tex);
+  imgui_drawer()->RetainTextureForFrame(game_image_textures_[image_path]);
   return game_image_textures_[image_path];
 }
 
 std::shared_ptr<ui::ImmediateTexture>
 EmulatorWindow::WinRTFrontendDialog::GetOrCreateXeniaLogo() {
-  if (xenia_logo_tex_ != nullptr) {
-    return xenia_logo_tex_;
-  }
-
-  std::string path = "Assets/xenia-logo.png";
-  if (!std::filesystem::exists(path)) {
-    return nullptr;
-  }
-
-  if (emulator_window_.immediate_drawer_ == nullptr) {
-    return nullptr;
-  }
-
-  int width = 0, height = 0, comp = 0;
-  auto data = stbi_load(path.c_str(), &width, &height, &comp, 4);
-  if (!data || width <= 0 || height <= 0) {
-    return nullptr;
-  }
-
-  auto tex = emulator_window_.immediate_drawer_->CreateTexture(
-      static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-      xe::ui::ImmediateTextureFilter::kLinear, false, data);
-  stbi_image_free(data);
-
-  xenia_logo_tex_ = std::move(tex);
-  return xenia_logo_tex_;
+  return GetOrCreateThemeTexture(
+      ResolveConfiguredThemeAssetPath(ThemeAsset::kLogo,
+                                      "ui_interface_overlay_color"),
+      xenia_logo_texture_path_, xenia_logo_tex_);
 }
 
 std::shared_ptr<ui::ImmediateTexture>

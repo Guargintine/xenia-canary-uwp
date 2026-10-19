@@ -31,6 +31,81 @@ using xe::hid::X_INPUT_KEYSTROKE;
 using xe::hid::X_INPUT_STATE;
 using xe::hid::X_INPUT_VIBRATION;
 
+#if XE_PLATFORM_WINRT
+namespace {
+using xe::hid::X_INPUT_FLAG_GAMEPAD;
+using xe::hid::X_INPUT_FLAG_KEYBOARD;
+
+uint32_t GuestInputFlags(uint32_t flags) {
+  flags &= ~X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER;
+  if (!(flags & X_INPUT_FLAG::X_INPUT_FLAG_ANYDEVICE)) {
+    flags |= X_INPUT_FLAG_GAMEPAD;
+  }
+  return flags;
+}
+// All callers hold InputSystem::lock(). Keep filtering at the guest boundary so
+// the UWP guide continues to see the unmodified physical controller state.
+X_RESULT ReadGuestInputState(hid::InputSystem* input_system,
+                             uint32_t user_index, uint32_t flags,
+                             X_INPUT_STATE* state, bool* captured,
+                             uint64_t* ui_snapshot) {
+  const uint64_t ui_before = UWP::GetUIInputCaptureState();
+  const bool guest_ui_before = kernel_state()->xam_state()->IsUIActive();
+  const X_RESULT result =
+      input_system->GetState(user_index, GuestInputFlags(flags), state);
+  if (result != X_ERROR_SUCCESS) {
+    *state = {};
+  }
+  *ui_snapshot = UWP::GetUIInputCaptureState();
+  *captured = input_system->guest_input_capture().Capture(
+      user_index, ui_before, *ui_snapshot,
+      guest_ui_before || kernel_state()->xam_state()->IsUIActive(),
+      state->gamepad, result == X_ERROR_SUCCESS);
+  return result;
+}
+
+X_RESULT FilterGuestKeystroke(hid::InputSystem* input_system,
+                              uint32_t user_index, uint32_t flags,
+                              bool captured, uint64_t ui_snapshot,
+                              const X_INPUT_STATE& state,
+                              X_INPUT_KEYSTROKE* keystroke) {
+  auto& capture = input_system->guest_input_capture();
+  X_RESULT result = capture.GetKeystroke(
+      user_index, captured,
+      [&](X_INPUT_KEYSTROKE* event) {
+        return input_system->GetKeystroke(user_index, GuestInputFlags(flags),
+                                          event);
+      },
+      keystroke);
+  const uint64_t ui_after = UWP::GetUIInputCaptureState();
+  if (ui_after != ui_snapshot || kernel_state()->xam_state()->IsUIActive()) {
+    // Also cover a dialog opening while a queued event was being retrieved.
+    capture.Capture(user_index, ui_snapshot, ui_after,
+                    kernel_state()->xam_state()->IsUIActive(), state.gamepad);
+    *keystroke = {};
+    if (result == X_ERROR_SUCCESS) {
+      result = X_ERROR_EMPTY;
+    }
+  }
+  return result;
+}
+
+X_RESULT GetGuestKeystroke(hid::InputSystem* input_system, uint32_t user_index,
+                           uint32_t flags, X_INPUT_KEYSTROKE* keystroke) {
+  if (user_index >= XUserMaxUserCount) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  X_INPUT_STATE state{};
+  bool captured;
+  uint64_t ui_snapshot;
+  ReadGuestInputState(input_system, user_index, X_INPUT_FLAG_GAMEPAD, &state,
+                      &captured, &ui_snapshot);
+  return FilterGuestKeystroke(input_system, user_index, flags, captured,
+                              ui_snapshot, state, keystroke);
+}
+}  // namespace
+#endif
+
 dword_result_t XAutomationpUnbindController_entry(dword_t user_index) {
   if (user_index >= XUserMaxUserCount) {
     return 0;
@@ -108,13 +183,14 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
   if (input_state) {
     memset((void*)input_state.host_address(), 0, sizeof(X_INPUT_STATE));
   }
+#if !XE_PLATFORM_WINRT
   if (user_index >= XUserMaxUserCount) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-
   if (kernel_state()->xam_state()->IsUIActive()) {
     return X_ERROR_SUCCESS;
   }
+#endif
 
   // Games call this with a NULL state ptr, probably as a query.
 
@@ -130,9 +206,41 @@ dword_result_t XamInputGetState_entry(dword_t user_index, dword_t flags,
   auto input_system = kernel_state()->emulator()->input_system();
   {
     auto lock = input_system->lock();
+#if XE_PLATFORM_WINRT
+    if (actual_user_index >= XUserMaxUserCount) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    X_INPUT_STATE state{};
+    bool captured;
+    uint64_t ui_snapshot;
+    result =
+        ReadGuestInputState(input_system, actual_user_index,
+                            !flags ? X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD : flags,
+                            &state, &captured, &ui_snapshot);
+    auto& capture = input_system->guest_input_capture();
+    if (captured || capture.NeedsKeystrokeDrain(actual_user_index)) {
+      X_INPUT_KEYSTROKE discarded{};
+      FilterGuestKeystroke(input_system, actual_user_index,
+                           X_INPUT_FLAG_GAMEPAD | X_INPUT_FLAG_KEYBOARD,
+                           captured, ui_snapshot, state, &discarded);
+    }
+    const uint64_t ui_after = UWP::GetUIInputCaptureState();
+    if (ui_after != ui_snapshot || kernel_state()->xam_state()->IsUIActive()) {
+      captured = capture.Capture(actual_user_index, ui_snapshot, ui_after,
+                                 kernel_state()->xam_state()->IsUIActive(),
+                                 state.gamepad);
+    }
+    if (captured) {
+      state.gamepad = {};
+    }
+    if (input_state) {
+      *input_state = state;
+    }
+#else
     result = input_system->GetState(
         user_index, !flags ? X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD : flags,
         input_state);
+#endif
   }
 
   if (input_state && result == X_ERROR_SUCCESS) {
@@ -183,7 +291,30 @@ dword_result_t XamInputGetKeystroke_entry(
 
   auto input_system = kernel_state()->emulator()->input_system();
   auto lock = input_system->lock();
+#if XE_PLATFORM_WINRT
+  keystroke.Zero();
+  const uint32_t actual_flags =
+      flags ? uint32_t(flags) : X_INPUT_FLAG::X_INPUT_FLAG_GAMEPAD;
+  if ((user_index & XUserIndexAny) == XUserIndexAny ||
+      (flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER)) {
+    X_RESULT result = X_ERROR_DEVICE_NOT_CONNECTED;
+    for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
+      const X_RESULT user_result =
+          GetGuestKeystroke(input_system, i, actual_flags, keystroke);
+      if (user_result == X_ERROR_SUCCESS) {
+        return user_result;
+      }
+      if (user_result == X_ERROR_EMPTY) {
+        result = X_ERROR_EMPTY;
+      }
+    }
+    return result;
+  }
+  return GetGuestKeystroke(input_system, actual_user_index, actual_flags,
+                           keystroke);
+#else
   return input_system->GetKeystroke(user_index, flags, keystroke);
+#endif
 }
 DECLARE_XAM_EXPORT1(XamInputGetKeystroke, kInput, kImplemented);
 
@@ -191,6 +322,17 @@ DECLARE_XAM_EXPORT1(XamInputGetKeystroke, kInput, kImplemented);
 dword_result_t XamInputGetKeystrokeEx_entry(
     lpdword_t user_index_ptr, dword_t flags,
     pointer_t<X_INPUT_KEYSTROKE> keystroke) {
+#if XE_PLATFORM_WINRT
+  if (!user_index_ptr || !keystroke) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  const X_RESULT result =
+      XamInputGetKeystroke_entry(uint32_t(*user_index_ptr), flags, keystroke);
+  if (result == X_ERROR_SUCCESS) {
+    *user_index_ptr = keystroke->user_index;
+  }
+  return result;
+#else
   if (!keystroke) {
     return X_ERROR_BAD_ARGUMENTS;
   }
@@ -231,6 +373,7 @@ dword_result_t XamInputGetKeystrokeEx_entry(
     *user_index_ptr = keystroke->user_index;
   }
   return result;
+#endif
 }
 DECLARE_XAM_EXPORT1(XamInputGetKeystrokeEx, kInput, kImplemented);
 

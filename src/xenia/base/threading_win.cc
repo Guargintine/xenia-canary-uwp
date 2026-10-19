@@ -7,11 +7,13 @@
  ******************************************************************************
  */
 
-#include <winternl.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/chrono_steady_cast.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
+
+#include <winternl.h>
+
 #include "xenia/base/threading.h"
 #include "xenia/base/threading_timer_queue.h"
 #if defined(__clang__)

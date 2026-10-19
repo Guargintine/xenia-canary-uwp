@@ -34,6 +34,7 @@ class XmaDecoder {
   cpu::Processor* processor() const { return processor_; }
 
   X_STATUS Setup(kernel::KernelState* kernel_state);
+  void StopWorkers();
   void Shutdown();
 
   uint32_t context_array_ptr() const {
@@ -71,6 +72,7 @@ class XmaDecoder {
   cpu::Processor* processor_ = nullptr;
 
   std::atomic<bool> worker_running_ = {false};
+  std::atomic<bool> stopping_ = {false};
   kernel::object_ref<kernel::XHostThread> worker_thread_;
   std::unique_ptr<xe::threading::Event> work_event_ = nullptr;
 
@@ -81,7 +83,7 @@ class XmaDecoder {
   XmaRegisterFile register_file_;
 
   static const uint32_t kContextCount = 320;
-  XmaContext* contexts_[kContextCount];
+  XmaContext* contexts_[kContextCount] = {};
   BitMap context_bitmap_;
 
   uint32_t context_data_first_ptr_ = 0;

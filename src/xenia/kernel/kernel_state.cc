@@ -82,13 +82,11 @@ KernelState::KernelState(Emulator* emulator)
 }
 
 KernelState::~KernelState() {
+  timestamp_timer_.reset();
+  async_work_.Stop();
   SetExecutableModule(nullptr);
 
-  if (dispatch_thread_running_) {
-    dispatch_thread_running_ = false;
-    dispatch_cond_.notify_all();
-    dispatch_thread_->Wait(0, 0, 0, nullptr);
-  }
+  StopDispatch();
 
   executable_module_.reset();
   user_modules_.clear();
@@ -570,14 +568,14 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
           dispatch_thread_->set_can_debugger_suspend(true);
 
           auto global_lock = global_critical_region_.AcquireDeferred();
-          while (dispatch_thread_running_) {
+          for (;;) {
             global_lock.lock();
-            if (dispatch_queue_.empty()) {
-              dispatch_cond_.wait(global_lock);
-              if (!dispatch_thread_running_) {
-                global_lock.unlock();
-                break;
-              }
+            dispatch_cond_.wait(global_lock, [this]() {
+              return !dispatch_thread_running_ || !dispatch_queue_.empty();
+            });
+            if (!dispatch_thread_running_) {
+              global_lock.unlock();
+              break;
             }
             auto fn = std::move(dispatch_queue_.front());
             dispatch_queue_.pop_front();
@@ -885,7 +883,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
   }
 
   auto iter = std::ranges::find_if(user_modules_, [&module](const auto& e) {
-    return e->path() == module->path();
+    return e.get() == module.get();
   });
   assert_true(iter != user_modules_.end());  // Unloading an unregistered module
                                              // is probably really bad
@@ -894,17 +892,45 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
   // Ensure this module was not somehow registered twice
   assert_true(std::find_if(user_modules_.begin(), user_modules_.end(),
                            [&module](const auto& e) {
-                             return e->path() == module->path();
+                             return e.get() == module.get();
                            }) == user_modules_.end());
 
   object_table()->ReleaseHandleInLock(module->handle());
+}
+
+std::vector<object_ref<UserModule>> KernelState::GetLoadedUserModules() {
+  auto global_lock = global_critical_region_.Acquire();
+  return user_modules_;
+}
+
+void KernelState::RollbackUserModuleLoads(
+    const std::vector<object_ref<UserModule>>& retained_modules) {
+  auto global_lock = global_critical_region_.Acquire();
+  const auto is_retained = [&retained_modules](const auto& module) {
+    return std::ranges::any_of(retained_modules, [&module](const auto& retained) {
+      return retained.get() == module.get();
+    });
+  };
+  if (executable_module_ && !is_retained(executable_module_)) {
+    xmp_volume_patch_.reset();
+    SetExecutableModule(nullptr);
+  }
+  // Imports may have loaded recursively before the main module failed. Release
+  // only this attempt's modules, in reverse order, without running guest code.
+  auto modules = user_modules_;
+  for (auto it = modules.rbegin(); it != modules.rend(); ++it) {
+    if (!is_retained(*it)) {
+      UnloadUserModule(*it, false);
+      it->reset();
+    }
+  }
 }
 
 void KernelState::InitXmpVolumePatch() {
   xmp_volume_patch_ = XmpVolumePatch::CreateForTitle(title_id(), this);
 }
 
-void KernelState::TerminateTitle() {
+bool KernelState::TerminateTitle() {
   XELOGD("KernelState::TerminateTitle");
   xmp_volume_patch_.reset();
   auto global_lock = global_critical_region_.Acquire();
@@ -923,31 +949,9 @@ void KernelState::TerminateTitle() {
   terminate_notifications_.clear();
   */
 
-  // Kill all guest threads.
-  for (auto it = threads_by_id_.begin(); it != threads_by_id_.end();) {
-    if (!XThread::IsInThread(it->second) && it->second->is_guest_thread()) {
-      auto thread = it->second;
-
-      if (thread->is_running()) {
-        // Need to step the thread to a safe point (returns it to guest code
-        // so it's guaranteed to not be holding any locks / in host kernel
-        // code / etc). Can't do that properly if we have the lock.
-        if (!emulator_->is_paused()) {
-          thread->thread()->Suspend();
-        }
-
-        global_lock.unlock();
-        processor_->StepToGuestSafePoint(thread->thread_id());
-        thread->Terminate(0);
-        global_lock.lock();
-      }
-
-      // Erase it from the thread list.
-      it = threads_by_id_.erase(it);
-    } else {
-      ++it;
-    }
-  }
+  global_lock.unlock();
+  if (!TerminateTitleThreads()) return false;
+  global_lock.lock();
 
   // Third: Unload all user modules (including the executable).
   for (size_t i = 0; i < user_modules_.size(); i++) {
@@ -971,6 +975,43 @@ void KernelState::TerminateTitle() {
     // code anymore).
     global_lock.unlock();
     XThread::GetCurrentThread()->Terminate(0);
+  }
+  return true;
+}
+
+bool KernelState::TerminateTitleThreads() {
+  for (;;) {
+    std::vector<object_ref<XThread>> threads;
+    {
+      auto lock = global_critical_region_.Acquire();
+      for (const auto& [id, thread] : threads_by_id_) {
+        if (thread->is_guest_thread() && !XThread::IsInThread(thread)) {
+          threads.push_back(retain_object(thread));
+        }
+      }
+    }
+    if (threads.empty()) return true;
+    for (const auto& thread : threads) {
+      XELOGI("Stopping guest thread {:08X}", thread->thread_id());
+      xe::FlushLog();
+      if (!thread->TerminateForTitleShutdown()) return false;
+      auto lock = global_critical_region_.Acquire();
+      threads_by_id_.erase(thread->thread_id());
+    }
+  }
+}
+
+void KernelState::StopDispatch() {
+  {
+    auto lock = global_critical_region_.Acquire();
+    dispatch_accepting_work_ = false;
+    dispatch_thread_running_ = false;
+    dispatch_queue_.clear();
+  }
+  dispatch_cond_.notify_all();
+  if (dispatch_thread_) {
+    dispatch_thread_->Wait(0, 0, 0, nullptr);
+    dispatch_thread_.reset();
   }
 }
 
@@ -1252,6 +1293,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     }
   }
   auto global_lock = global_critical_region_.Acquire();
+  if (!dispatch_accepting_work_) return;
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
                              pre_callback, post_callback]() {
     if (pre_callback) {

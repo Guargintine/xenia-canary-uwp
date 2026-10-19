@@ -224,6 +224,10 @@ void XAudio2AudioDriver::SubmitFrame(float* frame) {
     memcpy(output_frame, frame, frame_size_);
   }
 
+  CaptureSamples(std::span<const float>(output_frame,
+                                        channel_samples_ * frame_channels_),
+                 frame_channels_, frame_frequency_);
+
   api::XAUDIO2_BUFFER buffer;
   buffer.Flags = 0;
   buffer.pAudioData = reinterpret_cast<BYTE*>(output_frame);

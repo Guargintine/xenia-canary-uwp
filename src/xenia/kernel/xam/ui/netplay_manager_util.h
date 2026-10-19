@@ -10,10 +10,16 @@
 #ifndef XENIA_KERNEL_XAM_UI_NETPLAY_MANAGER_UI_H_
 #define XENIA_KERNEL_XAM_UI_NETPLAY_MANAGER_UI_H_
 
+#include <cstdint>
+#include <future>
+#include <memory>
+#include <vector>
+
 #include "third_party/imgui/imgui.h"
 
 namespace xe {
 namespace kernel {
+class SessionObjectJSON;
 namespace xam {
 namespace ui {
 
@@ -29,12 +35,15 @@ struct AddFriendArgs {
 };
 
 struct FriendsContentArgs {
+  bool guide_style = false;
   bool first_draw;
   bool friends_open;
   bool filter_joinable;
   bool filter_title;
   bool filter_offline;
   bool refresh_presence;
+  uint64_t selected_friend_xuid = 0;
+  bool friend_details_open = false;
   AddFriendArgs add_friend_args = {};
   ImGuiTextFilter filter = {};
 };
@@ -45,6 +54,7 @@ struct SessionsContentArgs {
   bool filter_own;
   bool refresh_sessions;
   bool refresh_sessions_sync;
+  std::future<std::vector<std::unique_ptr<SessionObjectJSON>>> pending_sessions;
 };
 
 struct MyDeletedProfilesArgs {

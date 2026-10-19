@@ -14,6 +14,10 @@
 
 #include <future>
 
+#if XE_PLATFORM_WINRT
+#include "xenia/app/guide_dialog.h"
+#endif
+
 namespace xe {
 namespace kernel {
 namespace xam {
@@ -29,7 +33,13 @@ struct CreateProfileUIArgs {
       downloaded_gamerpics;
   std::unique_ptr<xe::ui::ImmediateTexture> big_gamerpic_texture;
   std::optional<GamerPictureKey> gamerpic_key;
+#if XE_PLATFORM_WINRT
+  xe::app::GuideDialogState guide_state;
+  bool guide_activation_armed = false;
+  bool guide_focus_requested = true;
+#else
   std::shared_ptr<xe::ui::ImmediateTexture> guide_background;
+#endif
 };
 
 class CreateProfileUI final : public XamDialog {

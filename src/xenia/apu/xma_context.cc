@@ -39,7 +39,7 @@ XmaContext::XmaContext()
     : work_completion_event_(
           xe::threading::Event::CreateAutoResetEvent(false)) {}
 
-XmaContext::~XmaContext() {}
+XmaContext::~XmaContext() { av_packet_free(&av_packet_); }
 
 void XmaContext::DumpRaw(AVFrame* frame, int id) {
   FILE* outfile =

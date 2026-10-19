@@ -188,20 +188,22 @@ class PeriodicCallback {
   PeriodicCallback(std::chrono::milliseconds interval,
                    std::function<void()> callback, std::string thread_name) {
     assert_not_null(callback);
-    std::jthread worker =
+    worker_ =
         std::jthread([interval, callback = std::move(callback),
                       thread_name](std::stop_token stoken) {
           xe::threading::set_name(thread_name);
+          std::mutex interval_mutex;
+          std::condition_variable_any interval_condition;
+          std::unique_lock interval_lock(interval_mutex);
 
           while (!stoken.stop_requested()) {
             callback();
-            std::this_thread::sleep_for(interval);
+            interval_condition.wait_for(interval_lock, stoken, interval,
+                                        [] { return false; });
           }
         });
 
-    periodic_stop_source_ = worker.get_stop_source();
-
-    worker.detach();
+    periodic_stop_source_ = worker_.get_stop_source();
   }
 
  public:
@@ -218,6 +220,7 @@ class PeriodicCallback {
 
  private:
   std::stop_source periodic_stop_source_;
+  std::jthread worker_;
 };
 
 // Results for a WaitHandle operation.

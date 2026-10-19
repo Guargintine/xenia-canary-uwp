@@ -128,6 +128,7 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
 }
 
 X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
+  stopping_ = false;
   // Setup ffmpeg logging callback
   av_log_set_callback(av_log_callback);
 
@@ -216,21 +217,31 @@ void XmaDecoder::WorkerThreadMain() {
   }
 }
 
-void XmaDecoder::Shutdown() {
+void XmaDecoder::StopWorkers() {
+  stopping_ = true;
   worker_running_ = false;
 
   if (work_event_) {
     work_event_->Set();
   }
 
-  if (paused_) {
-    Resume();
-  }
+  paused_ = false;
+  resume_fence_.Signal();
+  pause_fence_.Signal();
 
   if (worker_thread_) {
     // Wait for work thread.
     xe::threading::Wait(worker_thread_->thread(), false);
     worker_thread_.reset();
+  }
+}
+
+void XmaDecoder::Shutdown() {
+  StopWorkers();
+
+  for (auto& context : contexts_) {
+    delete context;
+    context = nullptr;
   }
 
   if (context_data_first_ptr_) {
@@ -252,6 +263,9 @@ int XmaDecoder::GetContextId(uint32_t guest_ptr) {
 }
 
 uint32_t XmaDecoder::AllocateContext() {
+  if (stopping_) {
+    return 0;
+  }
   size_t index = context_bitmap_.Acquire();
   if (index == -1) {
     // Out of contexts.
@@ -322,6 +336,10 @@ uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
 void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
   SCOPE_profile_cpu_f("apu");
 
+  if (stopping_) {
+    return;
+  }
+
   uint32_t r = (addr & 0xFFFF) / 4;
   value = xe::byte_swap(value);
 
@@ -354,7 +372,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       while (remaining) {
         const uint32_t context_id =
             base_context_id + std::countr_zero(remaining);
-        contexts_[context_id]->WaitForWorkDone();
+        contexts_[context_id]->WaitForWorkDone(&stopping_);
         remaining &= remaining - 1;
       }
     }
@@ -404,11 +422,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 }
 
 void XmaDecoder::Pause() {
-  if (paused_) {
+  if (stopping_ || paused_ || !cvars::use_dedicated_xma_thread) {
     return;
   }
   paused_ = true;
-
+  work_event_->Set();
   pause_fence_.Wait();
 }
 

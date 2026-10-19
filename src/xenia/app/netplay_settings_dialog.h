@@ -17,6 +17,10 @@
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 
+#if XE_PLATFORM_WINRT
+#include "xenia/app/guide_dialog.h"
+#endif
+
 namespace xe {
 namespace app {
 
@@ -45,6 +49,27 @@ class NetplaySettingsDialog final : public ui::ImGuiDialog {
   void OnDraw(ImGuiIO& io) override;
 
  private:
+#if XE_PLATFORM_WINRT
+  enum class GuidePage {
+    kSettings,
+    kAPIAddresses,
+    kAddAPIAddress,
+    kAddressActions,
+    kRemoveAPIAddress,
+    kNetworkModes,
+    kNetworkInterfaces,
+  };
+
+  void OnDrawGuide();
+  void OpenGuidePage(GuidePage page);
+  void GoBackGuidePage();
+
+  GuideDialogState guide_dialog_state_;
+  GuidePage guide_page_ = GuidePage::kSettings;
+  bool guide_focus_requested_ = true;
+  bool guide_activation_armed_ = false;
+#endif
+
   void UpdateInterfaceGUIDs();
   void UpdateSelectedInterfaceItemAndIndex();
   void RefreshInterfaces();
@@ -97,6 +122,12 @@ class NetplayStatusDialog final : public ui::ImGuiDialog {
   void OnDraw(ImGuiIO& io) override;
 
  private:
+#if XE_PLATFORM_WINRT
+  void OnDrawGuide();
+  GuideDialogState guide_dialog_state_;
+  bool guide_activation_armed_ = false;
+#endif
+
   bool dialog_opened_ = false;
   EmulatorWindow* emulator_window_ = nullptr;
   kernel::NetworkAdapterManager* network_adapter_manager_ = nullptr;

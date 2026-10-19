@@ -859,8 +859,10 @@ if(XENIA_BUILD_UWP)
   set(WOLFSSL_BUILD_OUT_OF_TREE ON CACHE BOOL "" FORCE)
   set(WARNING_C_FLAGS "")
   add_subdirectory(wolfssl)
-  target_compile_definitions(wolfssl PUBLIC
-    NO_WOLFSSL_DIR WOLFSSL_SP_NO_DYN_STACK)
+  include("${PROJECT_SOURCE_DIR}/cmake/WolfSSLUwp.cmake")
+  xenia_configure_uwp_wolfssl(wolfssl
+    "${CMAKE_CURRENT_SOURCE_DIR}/wolfssl"
+    "${CMAKE_CURRENT_BINARY_DIR}/wolfssl-xenia")
   target_sources(wolfssl PRIVATE ${PROJECT_SOURCE_DIR}/xenia-canary-uwp/wolfssl_rng_uwp.c)
   target_compile_definitions(wolfssl PRIVATE CUSTOM_RAND_GENERATE_SEED=xe_uwp_random_seed)
   target_compile_options(wolfssl PRIVATE

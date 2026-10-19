@@ -75,16 +75,22 @@ class ProfileConfigDialog final : public ui::ImGuiDialog {
 
 class ManagerDialog final : public ui::ImGuiDialog {
  public:
-  ManagerDialog(ui::ImGuiDrawer* imgui_drawer, EmulatorWindow* emulator_window)
-      : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {
+  ManagerDialog(ui::ImGuiDrawer* imgui_drawer, EmulatorWindow* emulator_window,
+                bool guide_style = false)
+      : ui::ImGuiDialog(imgui_drawer),
+        direct_friends_(guide_style),
+        emulator_window_(emulator_window) {
+    friends_ui_args_.content_args.guide_style = guide_style;
     Initialize(imgui_drawer, 0);
   }
 
  protected:
   void OnDraw(ImGuiIO& io) override;
   void Initialize(ui::ImGuiDrawer* imgui_drawer, uint32_t user_index);
+  void OnDrawGuide(ImGuiIO& io);
 
  private:
+  bool direct_friends_ = false;
   bool manager_opened_ = false;
   uint64_t selected_xuid_ = 0;
   uint64_t removed_xuid_ = 0;
@@ -121,6 +127,9 @@ class TitleListUI final : public ui::ImGuiDialog {
   const ImVec2 drawing_position_ = {};
   bool has_opened_ = false;
   bool focus_requested_ = false;
+#if XE_PLATFORM_WINRT
+  bool guide_close_pending_ = false;
+#endif
 
   const kernel::xam::UserProfile* profile_;
   const kernel::xam::ProfileManager* profile_manager_;

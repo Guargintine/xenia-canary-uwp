@@ -12,6 +12,9 @@
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
 #include "xenia/ui/imgui_drawer.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/app/guide_dialog.h"
+#endif
 
 namespace xe {
 namespace ui {
@@ -29,10 +32,17 @@ ImGuiDialog::~ImGuiDialog() {
   for (auto fence : waiting_fences_) {
     fence->Signal();
   }
+  for (auto& callback : close_callbacks_) {
+    callback();
+  }
 }
 
 void ImGuiDialog::Then(xe::threading::Fence* fence) {
   waiting_fences_.push_back(fence);
+}
+
+void ImGuiDialog::Then(std::function<void()> callback) {
+  close_callbacks_.push_back(std::move(callback));
 }
 
 void ImGuiDialog::Close() { has_close_pending_ = true; }
@@ -65,6 +75,20 @@ class MessageBoxDialog final : public ImGuiDialog {
       ImGui::OpenPopup(title_.c_str());
       has_opened_ = true;
     }
+#if XE_PLATFORM_WINRT
+    if (xe::app::BeginGuidePopup(title_.c_str(), nullptr, guide_state_,
+                                  imgui_drawer())) {
+      ImGui::TextWrapped("%s", body_.c_str());
+      if (xe::app::GuideButton("OK") || xe::app::ConsumeGuideBackPress()) {
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
+      ImGui::SetItemDefaultFocus();
+      xe::app::EndGuidePopup();
+    } else {
+      Close();
+    }
+#else
     if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
       char* text = const_cast<char*>(body_.c_str());
@@ -79,12 +103,16 @@ class MessageBoxDialog final : public ImGuiDialog {
     } else {
       Close();
     }
+#endif
   }
 
  private:
   bool has_opened_ = false;
   std::string title_;
   std::string body_;
+#if XE_PLATFORM_WINRT
+  xe::app::GuideDialogState guide_state_;
+#endif
 };
 
 ImGuiDialog* ImGuiDialog::ShowMessageBox(ImGuiDrawer* imgui_drawer,

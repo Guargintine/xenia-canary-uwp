@@ -19,6 +19,7 @@
 #include "xenia/ui/window.h"
 #if XE_PLATFORM_WINRT
 #include "xenia-canary-uwp/WinRTKeyboard.h"
+#include "xenia/ui/guide_input.h"
 #endif
 
 namespace xe {
@@ -36,7 +37,7 @@ SigninUI::SigninUI(xe::ui::ImGuiDrawer* imgui_drawer,
       flags_(flags),
       title_("Sign In") {
   if (flags_ & X_UI_FLAGS_ONLINEENABLED) {
-    title_ = "Sign In - Xbox Live Enabled Profiles";
+    title_ = "Sign In - Xbox Live Profiles";
   }
 
   const auto gamerpic_key = CreateProfileUI::GetDefaultGamerPictureKey();
@@ -76,6 +77,15 @@ void SigninUI::OnDraw(ImGuiIO& io) {
     return;
   }
 
+  // Cancel only when this modal owned B before NewFrame. A combo or the
+  // Create Profile child consumes its own back press without closing sign-in.
+  if (xe::app::ConsumeGuideBackPress()) {
+    ImGui::CloseCurrentPopup();
+    Close();
+    ImGui::EndPopup();
+    return;
+  }
+
   ImDrawList* root_draw_list = ImGui::GetWindowDrawList();
   const ImVec2 screen_min = viewport->Pos;
   const ImVec2 screen_max =
@@ -84,12 +94,8 @@ void SigninUI::OnDraw(ImGuiIO& io) {
       screen_min, screen_max,
       ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.55f)));
 
-  // Load guide background texture
-  static std::shared_ptr<xe::ui::ImmediateTexture> guide_bg_tex = nullptr;
-  if (!guide_bg_tex) {
-    guide_bg_tex =
-        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer());
-  }
+  static xe::app::GuideBackgroundTextureCache guide_background;
+  const auto guide_bg_tex = guide_background.Get(imgui_drawer());
 
   const ImVec2 panel_size =
       xe::app::GetGuidePanelSize(guide_bg_tex, io.DisplaySize.y);
@@ -280,7 +286,7 @@ void SigninUI::OnDraw(ImGuiIO& io) {
         profile_map[slot] = xuid;
       }
     }
-    pending_login_profiles_ = std::move(profile_map);
+    profile_manager_->LoginMultiple(profile_map);
     ImGui::CloseCurrentPopup();
     Close();
   }
@@ -288,7 +294,6 @@ void SigninUI::OnDraw(ImGuiIO& io) {
   ImGui::SameLine(0.0f, button_gap);
 
   if (xe::app::DrawTextEffectButton("Cancel", ok_cancel_button_size)) {
-    pending_login_profiles_.clear();
     ImGui::CloseCurrentPopup();
     Close();
   }
@@ -489,26 +494,7 @@ void SigninUI::OnClose() {
                                button_a = std::move(button_a_tex_),
                                button_b = std::move(button_b_tex_)]() {});
 #endif
-  auto pending_login_profiles = std::move(pending_login_profiles_);
   XamDialog::OnClose();
-  DispatchPendingLogins(std::move(pending_login_profiles));
-}
-
-void SigninUI::DispatchPendingLogins(std::map<uint8_t, uint64_t>&& profiles) {
-  if (profiles.empty()) {
-    return;
-  }
-
-  auto* profile_manager = profile_manager_;
-  auto* display_window = kernel_state()->emulator()->display_window();
-  if (display_window) {
-    display_window->app_context().CallInUIThreadDeferred(
-        [profile_manager, profiles = std::move(profiles)]() mutable {
-          profile_manager->LoginMultiple(profiles);
-        });
-  } else {
-    profile_manager->LoginMultiple(profiles);
-  }
 }
 
 std::shared_ptr<xe::ui::ImmediateTexture> SigninUI::GetOrCreateButtonTexture(
@@ -551,16 +537,7 @@ void SigninUI::ReloadProfiles(bool first_draw, uint32_t flags) {
   if (first_draw) {
     // If only one user is requested, request last used controller to sign in.
     if (users_needed_ == 1) {
-      const auto connected_users = kernel_state()->GetConnectedUsers();
-      chosen_slots_[0] = last_user_ < XUserMaxUserCount ? last_user_ : 0;
-      if (connected_users.any() && !connected_users.test(chosen_slots_[0])) {
-        for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
-          if (connected_users.test(i)) {
-            chosen_slots_[0] = i;
-            break;
-          }
-        }
-      }
+      chosen_slots_[0] = last_user_;
     } else {
       for (uint32_t i = 0; i < users_needed_; i++) {
         // TODO: Not sure about this, needs testing on real hardware.

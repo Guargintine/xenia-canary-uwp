@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -206,12 +207,14 @@ class Emulator {
 
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
+  X_STATUS ResetTitle();
 
   const std::unique_ptr<vfs::Device> CreateVfsDevice(
       const std::filesystem::path& path, const std::string_view mount_path);
 
   X_STATUS MountPath(const std::filesystem::path& path,
-                     const std::string_view mount_path);
+                     const std::string_view mount_path,
+                     vfs::Device** out_device = nullptr);
 
   enum class FileSignatureType {
     XEX0,
@@ -347,8 +350,19 @@ class Emulator {
 
   std::string FindLaunchModule();
 
+  X_STATUS LaunchWithMount(
+      const std::filesystem::path& path, std::string_view mount_path,
+      X_STATUS (Emulator::*launch)(const std::filesystem::path&));
+
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
+
+  void SetupFileSystem();
+
+  std::function<std::unique_ptr<apu::AudioSystem>(cpu::Processor*)>
+      audio_system_factory_;
+  bool require_cpu_backend_ = true;
+  std::mutex main_thread_mutex_;
 
   std::filesystem::path command_line_;
   std::filesystem::path storage_root_;

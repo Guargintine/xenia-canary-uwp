@@ -20,6 +20,7 @@
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/async_work.h"
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/smc.h"
 #include "xenia/kernel/util/kernel_fwd.h"
@@ -256,6 +257,9 @@ class KernelState {
                                    bool call_entry = true);
   void UnloadUserModule(const object_ref<UserModule>& module,
                         bool call_entry = true);
+  std::vector<object_ref<UserModule>> GetLoadedUserModules();
+  void RollbackUserModuleLoads(
+      const std::vector<object_ref<UserModule>>& retained_modules);
 
   object_ref<KernelModule> GetKernelModule(const std::string_view name);
   template <typename T>
@@ -273,7 +277,10 @@ class KernelState {
   X_RESULT ApplyTitleUpdate(const object_ref<UserModule> title_module);
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
-  void TerminateTitle();
+  bool TerminateTitle();
+  bool TerminateTitleThreads();
+  void StopDispatch();
+  AsyncWorkGroup& async_work() { return async_work_; }
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
@@ -388,11 +395,13 @@ class KernelState {
   uint32_t kernel_guest_globals_ = 0;
 
   std::atomic<bool> dispatch_thread_running_;
+  bool dispatch_accepting_work_ = true;
   object_ref<XHostThread> dispatch_thread_;
   // Must be guarded by the global critical region.
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  AsyncWorkGroup async_work_;
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;

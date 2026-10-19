@@ -53,6 +53,10 @@ namespace shaders {
 }  // namespace shaders
 
 D3D12Presenter::~D3D12Presenter() {
+  {
+    std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+    AwaitGuestOutputCaptureCompletion();
+  }
   // Await completion of the usage of everything before destroying anything,
   // irrespective of the declaration order in the class.
   // From most likely the latest to most likely the earliest to be signaled, so
@@ -77,6 +81,38 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
   return types;
 }
 
+bool D3D12Presenter::AwaitGuestOutputCaptureCompletion() {
+  if (!capture_submission_pending_) {
+    return true;
+  }
+  if (!capture_fence_signaled_) {
+    const HRESULT signal_result = provider_.GetDirectQueue()->Signal(
+        capture_fence_.Get(), capture_fence_value_);
+    if (FAILED(signal_result)) {
+      XELOGE(
+          "D3D12Presenter: Failed to signal the guest capture fence, result "
+          "0x{:08X}",
+          signal_result);
+      return false;
+    }
+    capture_fence_signaled_ = true;
+  }
+  const HRESULT wait_result =
+      capture_fence_->SetEventOnCompletion(capture_fence_value_, nullptr);
+  if (FAILED(wait_result) ||
+      capture_fence_->GetCompletedValue() == UINT64_MAX) {
+    XELOGE(
+        "D3D12Presenter: Failed to await the guest capture fence, result "
+        "0x{:08X}",
+        wait_result);
+    return false;
+  }
+  capture_submission_pending_ = false;
+  capture_fence_signaled_ = false;
+  capture_submitted_texture_.Reset();
+  return true;
+}
+
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
   {
@@ -94,6 +130,11 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
     return false;
   }
 
+  std::lock_guard<std::mutex> capture_lock(capture_mutex_);
+  if (!AwaitGuestOutputCaptureCompletion()) {
+    return false;
+  }
+
   ID3D12Device* device = provider_.GetDevice();
 
   D3D12_RESOURCE_DESC texture_desc = guest_output_resource->GetDesc();
@@ -106,34 +147,50 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   D3D12_RESOURCE_DESC buffer_desc;
   util::FillBufferResourceDesc(buffer_desc, copy_dest_size,
                                D3D12_RESOURCE_FLAG_NONE);
-  Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-  // Create zeroed not to leak data in the row padding.
-  if (FAILED(device->CreateCommittedResource(
-          &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
-          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
-    XELOGE("D3D12Presenter: Failed to create the guest output capture buffer");
-    return false;
+  if (!capture_buffer_ || capture_buffer_size_ < copy_dest_size) {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      XELOGE(
+          "D3D12Presenter: Failed to create the guest output capture buffer");
+      return false;
+    }
+    capture_buffer_ = std::move(buffer);
+    capture_buffer_size_ = copy_dest_size;
   }
 
   {
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> command_allocator;
-    if (FAILED(
-            device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                           IID_PPV_ARGS(&command_allocator)))) {
+    if (!capture_command_allocator_ &&
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&capture_command_allocator_)))) {
       XELOGE(
           "D3D12Presenter: Failed to create the guest output capturing command "
           "allocator");
       return false;
     }
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
-    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         command_allocator.Get(), nullptr,
-                                         IID_PPV_ARGS(&command_list)))) {
+    if (FAILED(capture_command_allocator_->Reset())) {
+      XELOGE("D3D12Presenter: Failed to reset the guest capture allocator");
+      return false;
+    }
+    HRESULT command_list_result;
+    if (capture_command_list_) {
+      command_list_result = capture_command_list_->Reset(
+          capture_command_allocator_.Get(), nullptr);
+    } else {
+      command_list_result = device->CreateCommandList(
+          0, D3D12_COMMAND_LIST_TYPE_DIRECT, capture_command_allocator_.Get(),
+          nullptr, IID_PPV_ARGS(&capture_command_list_));
+    }
+    if (FAILED(command_list_result)) {
       XELOGE(
           "D3D12Presenter: Failed to create the guest output capturing command "
           "list");
+      capture_command_list_.Reset();
       return false;
     }
+    ID3D12GraphicsCommandList* command_list = capture_command_list_.Get();
 
     D3D12_RESOURCE_BARRIER barrier;
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -146,7 +203,7 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
                   D3D12_RESOURCE_STATE_COPY_SOURCE) {
       command_list->ResourceBarrier(1, &barrier);
     }
-    copy_dest.pResource = buffer.Get();
+    copy_dest.pResource = capture_buffer_.Get();
     copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     D3D12_TEXTURE_COPY_LOCATION copy_source;
     copy_source.pResource = guest_output_resource.Get();
@@ -162,12 +219,15 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
       XELOGE(
           "D3D12Presenter: Failed to close the guest output capturing command "
           "list");
+      // A command list whose Close failed cannot be reset successfully.
+      capture_command_list_.Reset();
       return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     const HRESULT fence_create_result =
-        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        capture_fence_ ? S_OK
+                       : device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                             IID_PPV_ARGS(&capture_fence_));
     if (FAILED(fence_create_result)) {
       XELOGE(
           "D3D12Presenter: Failed to create the guest output capturing fence, "
@@ -176,22 +236,13 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
       return false;
     }
     ID3D12CommandQueue* const direct_queue = provider_.GetDirectQueue();
-    ID3D12CommandList* execute_command_list = command_list.Get();
+    ID3D12CommandList* execute_command_list = command_list;
+    ++capture_fence_value_;
+    capture_submitted_texture_ = guest_output_resource;
+    capture_submission_pending_ = true;
+    capture_fence_signaled_ = false;
     direct_queue->ExecuteCommandLists(1, &execute_command_list);
-    const HRESULT fence_signal_result = direct_queue->Signal(fence.Get(), 1);
-    if (FAILED(fence_signal_result)) {
-      XELOGE(
-          "D3D12Presenter: Failed to enqueue signaling of the guest output "
-          "capturing fence, result 0x{:08X}",
-          fence_signal_result);
-      return false;
-    }
-    const HRESULT fence_wait_result = fence->SetEventOnCompletion(1, nullptr);
-    if (FAILED(fence_wait_result)) {
-      XELOGE(
-          "D3D12Presenter: Failed to await the guest output capturing fence, "
-          "result 0x{:08X}",
-          fence_wait_result);
+    if (!AwaitGuestOutputCaptureCompletion()) {
       return false;
     }
   }
@@ -199,15 +250,15 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   D3D12_RANGE read_range;
   read_range.Begin = copy_dest.PlacedFootprint.Offset;
   read_range.End = copy_dest_size;
-  void* mapping;
-  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
-    XELOGE("D3D12Presenter: Failed to map the guest output capture buffer");
-    return false;
-  }
   image_out.width = uint32_t(texture_desc.Width);
   image_out.height = uint32_t(texture_desc.Height);
   image_out.stride = sizeof(uint32_t) * image_out.width;
   image_out.data.resize(image_out.stride * image_out.height);
+  void* mapping;
+  if (FAILED(capture_buffer_->Map(0, &read_range, &mapping))) {
+    XELOGE("D3D12Presenter: Failed to map the guest output capture buffer");
+    return false;
+  }
   uint32_t* image_out_pixels =
       reinterpret_cast<uint32_t*>(image_out.data.data());
   for (uint32_t y = 0; y < image_out.height; ++y) {
@@ -220,8 +271,10 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
       dest_row[x] = Packed10bpcRGBTo8bpcBytes(source_row[x]);
     }
   }
-  // Unmapping will be done implicitly when the resource goes out of scope and
-  // gets destroyed.
+  // Only visible pixels are copied; old data in reused row padding is never
+  // exposed. Keep Map/Unmap read ranges explicit for CPU cache coherence.
+  const D3D12_RANGE written_range = {0, 0};
+  capture_buffer_->Unmap(0, &written_range);
   return true;
 }
 

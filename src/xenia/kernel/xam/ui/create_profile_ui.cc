@@ -15,7 +15,6 @@
 #include "xenia/ui/window.h"
 #if XE_PLATFORM_WINRT
 #include "xenia-canary-uwp/WinRTKeyboard.h"
-#include "xenia/app/ui_text_effect_helpers.h"
 #endif
 
 namespace xe {
@@ -84,45 +83,29 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
       emulator->kernel_state()->xam_state()->profile_manager();
 
 #if XE_PLATFORM_WINRT
-  ImGuiIO& io = ImGui::GetIO();
-  if (!args.guide_background) {
-    args.guide_background =
-        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer);
-  }
-  const ImVec2 panel_size =
-      xe::app::GetGuidePanelSize(args.guide_background, io.DisplaySize.y);
-  const ImVec2 panel_padding = xe::app::GetGuidePanelPadding();
-  const ImVec2 panel_position = ImGui::GetMainViewport()->Pos;
-  ImGui::SetNextWindowPos(panel_position, ImGuiCond_Always);
-  ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, panel_padding);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-  const bool visible = ImGui::BeginPopupModal(
-      "Create Profile", &args.dialog_open,
-      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-          ImGuiWindowFlags_NoBackground);
-  ImGui::PopStyleVar(3);
-  if (!visible) {
+  if (!xe::app::BeginGuidePopup("Create Profile", &args.dialog_open,
+                                args.guide_state, imgui_drawer)) {
     return false;
   }
-  auto* draw_list = ImGui::GetWindowDrawList();
-  xe::app::DrawGuidePanelBackground(
-      draw_list, args.guide_background, panel_position,
-      ImVec2(panel_position.x + panel_size.x, panel_position.y + panel_size.y));
-  const auto header = xe::app::DrawOverlayHeader(
-      draw_list, panel_position, panel_size, panel_padding,
-      io.DisplaySize.x / 1024.0f, io.DisplaySize.y / 576.0f, "Create Profile");
-  ImGui::SetCursorScreenPos(
-      ImVec2(panel_position.x + panel_padding.x,
-             header.position.y + header.font_size + 55.0f));
-  if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+  if (ImGui::IsWindowAppearing()) {
+    args.guide_activation_armed = false;
+    args.guide_focus_requested = true;
+  }
+  if (xe::app::ConsumeGuideBackPress()) {
     args.dialog_open = false;
     ImGui::CloseCurrentPopup();
-    ImGui::EndPopup();
+    xe::app::EndGuidePopup();
     return false;
   }
+  if (!args.guide_activation_armed &&
+      !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) &&
+      !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+      !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) &&
+      !ImGui::IsKeyDown(ImGuiKey_Space) &&
+      !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+    args.guide_activation_armed = true;
+  }
+  ImGui::BeginDisabled(!args.guide_activation_armed);
 #else
   if (!ImGui::BeginPopupModal("Create Profile", &args.dialog_open,
                               ImGuiWindowFlags_NoCollapse |
@@ -164,21 +147,30 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
 
   ImGui::BeginGroup();
 
+#if !XE_PLATFORM_WINRT
   if (ImGui::IsWindowAppearing()) {
     ImGui::SetKeyboardFocusHere();
-#if XE_PLATFORM_WINRT
-    UWP::ShowKeyboard();
-#endif
   }
+#endif
 
   ImGui::TextUnformatted("Gamertag:");
 
+#if XE_PLATFORM_WINRT
+  if (args.guide_focus_requested && args.guide_activation_armed) {
+    ImGui::SetKeyboardFocusHere();
+    args.guide_focus_requested = false;
+  }
+  // Size the input to the space remaining beside the gamerpic.
+  ImGui::SetNextItemWidth(xe::app::GuideContentWidth());
+#endif
   const bool enter_pressed =
       ImGui::InputText("##Gamertag", args.gamertag, sizeof(args.gamertag),
                        ImGuiInputTextFlags_EnterReturnsTrue);
 
 #if XE_PLATFORM_WINRT
   if (ImGui::IsItemActivated()) {
+    // Activate the text field before showing the native keyboard. Its first B
+    // press then leaves editing, and cannot also close the profile guide.
     UWP::ShowKeyboard();
   }
 #endif
@@ -193,8 +185,12 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
   ImGui::EndGroup();
 
   ImGui::BeginDisabled(!args.valid_gamertag);
-  if (ImGui::Button("Create", half_width_btn) ||
-      (enter_pressed && args.valid_gamertag)) {
+#if XE_PLATFORM_WINRT
+  const bool create_pressed = xe::app::GuideButton("Create", half_width_btn);
+#else
+  const bool create_pressed = ImGui::Button("Create", half_width_btn);
+#endif
+  if (create_pressed || (enter_pressed && args.valid_gamertag)) {
     bool autologin = (profile_manager->GetAccountCount() == 0);
 
     uint32_t reserved_flags = 0;
@@ -267,18 +263,35 @@ bool xeDrawCreateProfile(xe::ui::ImGuiDrawer* imgui_drawer, Emulator* emulator,
     }
     std::ranges::fill(args.gamertag, '\0');
     ImGui::CloseCurrentPopup();
+#if XE_PLATFORM_WINRT
+    args.dialog_open = false;
+#endif
   }
   ImGui::EndDisabled();
   ImGui::SameLine();
 
-  if (ImGui::Button("Cancel", half_width_btn)) {
+#if XE_PLATFORM_WINRT
+  const bool cancel_pressed = xe::app::GuideButton("Cancel", half_width_btn);
+#else
+  const bool cancel_pressed = ImGui::Button("Cancel", half_width_btn);
+#endif
+  if (cancel_pressed) {
     std::ranges::fill(args.gamertag, '\0');
     ImGui::CloseCurrentPopup();
+#if XE_PLATFORM_WINRT
+    args.dialog_open = false;
+#endif
   }
 
+#if XE_PLATFORM_WINRT
+  ImGui::EndDisabled();
+  xe::app::EndGuidePopup();
+  return args.dialog_open;
+#else
   ImGui::EndPopup();
 
   return true;
+#endif
 }
 
 }  // namespace ui

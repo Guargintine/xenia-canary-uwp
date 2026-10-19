@@ -323,6 +323,10 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // Active-frame sequence; capturing a retained image does not advance it.
+  uint64_t GetGuestOutputRefreshCount() const {
+    return guest_output_refresh_count_.load(std::memory_order_acquire);
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -934,6 +938,7 @@ class Presenter {
   // These two images can be accessed by painting in parallel, in an unordered
   // way, with guest output refreshing.
   std::atomic<uint32_t> guest_output_mailbox_acquired_and_ready_{0};
+  std::atomic<uint64_t> guest_output_refresh_count_{0};
   // The "writable" image is different than both "acquired" and "ready" and is
   // accessible only by the guest output refreshing - it's the image that the
   // refresher may write to.

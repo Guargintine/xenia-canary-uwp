@@ -41,6 +41,7 @@ The 27 source commits belong in their existing parent-to-child order. Author tim
 ## Integration decisions
 
 - Preserve upstream CPU, GPU, netplay, profile, content-manager and dependency improvements. Keep the CMake build system and upstream submodule revisions.
+- The v6 compatibility branch targets PC v6.0.0 session-ID and matchmaking behavior while retaining the UWP fixes.
 - Keep the actual Blades frontend and guide-style ImGui windows for UWP. Retain current Xbox Live profile flags, gamerpic initialization and sign-in behavior behind those windows.
 - Scope Xbox/UWP API restrictions and defaults to the UWP build so the desktop paths remain available.
 - Historical orphaned UI code and literal merge markers are resolved against the functioning upstream implementation; the completed Blades frontend is applied last. Two redundant historical changes retain their position as empty commits.

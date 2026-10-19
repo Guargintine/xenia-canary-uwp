@@ -8,6 +8,9 @@
  */
 
 #include "xenia/app/profile_dialogs.h"
+
+#include <array>
+
 #include "third_party/stb/stb_image.h"
 #include "xenia/app/emulator_window.h"
 #include "xenia/app/ui_text_effect_helpers.h"
@@ -18,10 +21,13 @@
 #include "xenia/kernel/xam/user_tracker.h"
 #include "xenia/kernel/xam/xam_ui.h"
 #include "xenia/ui/file_picker.h"
+#include "xenia/ui/guide_layout.h"
+#include "xenia/ui/guide_input.h"
 #include "xenia/ui/imgui_host_notification.h"
 
 #include <xenia/vfs/devices/host_path_entry.h>
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
+#include "xenia/kernel/xam/ui/friend_removal_confirmation.h"
 #include "xenia/kernel/xam/ui/game_achievements_ui.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
 #include "xenia/kernel/xam/ui/signin_ui.h"
@@ -73,13 +79,10 @@ void NoProfileDialog::OnDraw(ImGuiIO& io) {
       screen_min, screen_max,
       ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.55f)));
 
-  static std::shared_ptr<xe::ui::ImmediateTexture> guide_bg_tex = nullptr;
+  static xe::app::GuideBackgroundTextureCache guide_background;
+  const auto guide_bg_tex = guide_background.Get(imgui_drawer());
   static std::shared_ptr<xe::ui::ImmediateTexture> button_a_tex = nullptr;
   static std::shared_ptr<xe::ui::ImmediateTexture> button_b_tex = nullptr;
-  if (!guide_bg_tex) {
-    guide_bg_tex =
-        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer());
-  }
   if (!button_a_tex) {
     button_a_tex = xe::app::LoadButtonTexture(imgui_drawer(), 'A');
   }
@@ -485,7 +488,9 @@ bool ProfileConfigDialog::DrawProfileContextMenu(uint64_t xuid) {
     ImGui::EndDisabled();
 
     if (!emulator_window_->emulator()->is_title_open()) {
+#if !XE_PLATFORM_WINRT
       ImGui::Separator();
+#endif
 
       if (account.IsLiveEnabled()) {
         ImGui::BeginDisabled(!is_signedin);
@@ -629,10 +634,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
     return;
   }
 
-  if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-      !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
-      (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
-       ImGui::IsKeyPressed(ImGuiKey_Escape, false))) {
+  if (xe::app::ConsumeGuideBackPress()) {
     Close();
     ImGui::End();
     return;
@@ -647,12 +649,8 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
       screen_min, screen_max,
       ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.55f)));
 
-  // Load guide background texture
-  static std::shared_ptr<xe::ui::ImmediateTexture> guide_bg_tex = nullptr;
-  if (!guide_bg_tex) {
-    guide_bg_tex =
-        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer());
-  }
+  static xe::app::GuideBackgroundTextureCache guide_background;
+  const auto guide_bg_tex = guide_background.Get(imgui_drawer());
 
   const ImVec2 panel_size =
       xe::app::GetGuidePanelSize(guide_bg_tex, io.DisplaySize.y);
@@ -673,8 +671,11 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
   const float content_start_y =
       header_layout.position.y + header_layout.font_size + 65.0f;
-  const float field_width = 320.0f * ux;
+  const auto content_bounds =
+      xe::ui::GetGuideContentBounds(panel_size.x, viewport->Size.x);
   const float shifted_x = overlay_min.x + panel_padding.x + (20.0f * ux);
+  const float field_width =
+      std::max(1.0f, overlay_min.x + content_bounds.right - shifted_x);
   ImGui::SetCursorScreenPos(ImVec2(shifted_x, content_start_y));
   bool should_open_selected_profile_menu = false;
   ImVec2 selected_profile_popup_anchor = ImVec2(shifted_x, content_start_y);
@@ -715,15 +716,31 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
     bool selected = (selected_xuid_ == xuid);
 
-    // Start with selectable that spans the full width
-    const float item_height = 60.0f * ImGui::GetIO().DisplayFramebufferScale.y;
-    // Adjust position to center with buttons (account for reduced width)
+    // Size rows to the wrapped text and avatar within the guide width.
     const float profile_shift_x = shifted_x + (4.0f * ux);
-    ImGui::SetCursorScreenPos(
-        ImVec2(profile_shift_x, ImGui::GetCursorScreenPos().y));
-    // Reduce width to match actual button rendering (account for ImGui button
-    // padding)
-    const float selectable_width = field_width - (8.0f * ux);
+    const float selectable_width = std::max(1.0f, field_width - (8.0f * ux));
+    const ImVec2 row_min(profile_shift_x, ImGui::GetCursorScreenPos().y);
+    const ImVec2 row_padding(10.0f * io.DisplayFramebufferScale.x,
+                              8.0f * io.DisplayFramebufferScale.y);
+    const ImVec2 icon_size = xe::ui::default_image_icon_size;
+    const float icon_text_gap = 10.0f * io.DisplayFramebufferScale.x;
+    const float text_width =
+        std::max(1.0f, selectable_width - row_padding.x * 2.0f -
+                           icon_size.x - icon_text_gap);
+    const std::array<std::string, 3> profile_lines = {
+        fmt::format("User: {}", account.GetGamertagString()),
+        fmt::format("XUID: {:016X}", xuid),
+        user_index != XUserIndexAny
+            ? fmt::format("Assigned to slot: {}", user_index + 1)
+            : "Profile is not signed in"};
+    float text_height = ImGui::GetStyle().ItemSpacing.y * 2.0f;
+    for (const auto& line : profile_lines) {
+      text_height +=
+          ImGui::CalcTextSize(line.c_str(), nullptr, false, text_width).y;
+    }
+    const float content_height = std::max(icon_size.y, text_height);
+    const float item_height = content_height + row_padding.y * 2.0f;
+    ImGui::SetCursorScreenPos(row_min);
 
     if (selected && should_focus_selected_profile) {
       ImGui::SetKeyboardFocusHere();
@@ -737,9 +754,12 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,
                           ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
 
+    // Selectable otherwise expands its hit rectangle by half ItemSpacing.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     bool activate_profile =
         ImGui::Selectable("##profile_selectable", selected, 0,
                           ImVec2(selectable_width, item_height));
+    ImGui::PopStyleVar();
     if (!activate_profile && ImGui::IsItemFocused() &&
         ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false)) {
       activate_profile = true;
@@ -765,59 +785,45 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
                  ImGui::GetItemRectMax().y);
     }
 
-    // Draw highlight only when focused (not when just selected)
+    const ImVec2 row_max = ImGui::GetItemRectMax();
+    auto* row_draw_list = ImGui::GetWindowDrawList();
+    row_draw_list->PushClipRect(row_min, row_max, true);
+    // Keep the focus outline inside the row.
     if (ImGui::IsItemFocused()) {
-      const ImVec2 padding(2.0f, 2.0f);
       xe::app::DrawConfiguredComboHighlight(
-          ImVec2(ImGui::GetItemRectMin().x - padding.x,
-                 ImGui::GetItemRectMin().y - padding.y),
-          ImVec2(ImGui::GetItemRectMax().x + padding.x,
-                 ImGui::GetItemRectMax().y + padding.y),
+          ImVec2(row_min.x + 1.0f, row_min.y + 1.0f),
+          ImVec2(row_max.x - 1.0f, row_max.y - 1.0f),
           1.6f, 4.0f);
     }
 
-    // Draw profile content on top of the selectable
-    ImVec2 selectable_pos = ImGui::GetItemRectMin();
+    // Overlay the contents on the selectable and advance the row once.
     ImGui::SetCursorScreenPos(ImVec2(
-        selectable_pos.x + 10.0f * ImGui::GetIO().DisplayFramebufferScale.x,
-        selectable_pos.y + 5.0f * ImGui::GetIO().DisplayFramebufferScale.y));
-    ImGui::BeginGroup();
-    {
-      if (profile_icon) {
-        ImGui::Image(reinterpret_cast<ImTextureID>(profile_icon),
-                     xe::ui::default_image_icon_size);
-      } else {
-        if (user_index < XUserMaxUserCount) {
-          const auto icon = imgui_drawer()->GetNotificationIcon(user_index);
-          ImGui::Image(reinterpret_cast<ImTextureID>(icon),
-                       xe::ui::default_image_icon_size);
-        } else {
-          ImGui::Dummy(xe::ui::default_image_icon_size);
-        }
-      }
-
-      ImGui::SameLine(0.0f, 10.0f * ImGui::GetIO().DisplayFramebufferScale.x);
-
-      ImGui::BeginGroup();
-      {
-        ImGui::TextUnformatted(
-            fmt::format("User: {}", account.GetGamertagString()).c_str());
-        ImGui::TextUnformatted(fmt::format("XUID: {:016X}", xuid).c_str());
-        if (user_index != XUserIndexAny) {
-          ImGui::TextUnformatted(
-              fmt::format("Assigned to slot: {}", user_index + 1).c_str());
-        } else {
-          ImGui::TextUnformatted("Profile is not signed in");
-        }
-      }
-      ImGui::EndGroup();
+        row_min.x + row_padding.x,
+        row_min.y + row_padding.y + (content_height - icon_size.y) * 0.5f));
+    if (profile_icon) {
+      ImGui::Image(reinterpret_cast<ImTextureID>(profile_icon), icon_size);
+    } else if (user_index < XUserMaxUserCount) {
+      const auto icon = imgui_drawer()->GetNotificationIcon(user_index);
+      ImGui::Image(reinterpret_cast<ImTextureID>(icon), icon_size);
+    } else {
+      ImGui::Dummy(icon_size);
     }
+    ImGui::SetCursorScreenPos(ImVec2(
+        row_min.x + row_padding.x + icon_size.x + icon_text_gap,
+        row_min.y + row_padding.y + (content_height - text_height) * 0.5f));
+    // Indentation keeps subsequent lines in the text column.
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_width);
+    for (const auto& line : profile_lines) {
+      ImGui::TextUnformatted(line.c_str());
+    }
+    ImGui::PopTextWrapPos();
     ImGui::EndGroup();
+    row_draw_list->PopClipRect();
 
     ImGui::PopID();
-    if (xuid != profiles->rbegin()->first) {
-      ImGui::Separator();
-    }
+    ImGui::SetCursorScreenPos(ImVec2(row_min.x, row_max.y));
+    ImGui::Dummy(ImVec2(0.0f, 8.0f * uy));
   }
 
   if (should_open_selected_profile_menu) {
@@ -1208,6 +1214,10 @@ void ManagerDialog::Initialize(ui::ImGuiDrawer* imgui_drawer,
 }
 
 void ManagerDialog::OnDraw(ImGuiIO& io) {
+  if (direct_friends_) {
+    OnDrawGuide(io);
+    return;
+  }
   if (!manager_opened_) {
     manager_opened_ = true;
     ImGui::OpenPopup("Manager");
@@ -1226,25 +1236,37 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
   ImGuiViewport* viewport = ImGui::GetMainViewport();
   ImVec2 center = viewport->GetCenter();
 
-  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-  if (ImGui::BeginPopupModal("Manager", &manager_opened_,
-                             ImGuiWindowFlags_AlwaysAutoResize)) {
+  kernel::xam::ui::FriendDialogPresentation guide;
+  const kernel::xam::ui::FriendDialogPresentation* presentation = nullptr;
+#if XE_PLATFORM_WINRT
+  guide = kernel::xam::xeMakeNetplayGuidePresentation(imgui_drawer());
+  presentation = &guide;
+#endif
+  if (!presentation) {
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  }
+  if (kernel::xam::ui::BeginFriendPopup("Manager", &manager_opened_,
+                                        ImGuiWindowFlags_AlwaysAutoResize,
+                                        presentation)) {
     const bool close_requested =
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
-        (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
-         ImGui::IsKeyPressed(ImGuiKey_Escape, false));
-    ImVec2 btn_size = ImVec2(200, 40);
+        kernel::xam::ui::ConsumeFriendPopupBackPress(presentation);
+    ImVec2 btn_size = presentation ? ImVec2(ImGui::GetContentRegionAvail().x,
+                                            ImGui::GetFrameHeight())
+                                   : ImVec2(200, 40);
 
     if (is_profile_signed_in) {
       ImGui::Text("You're not logged into a profile!");
-      ImGui::Separator();
+      if (!presentation) {
+        ImGui::Separator();
+      }
     }
 
-    ImGui::SetWindowFontScale(1.2f);
+    if (!presentation) {
+      ImGui::SetWindowFontScale(1.2f);
+    }
 
     ImGui::BeginDisabled(is_profile_signed_in);
-    if (ImGui::Button("Friends", btn_size)) {
+    if (kernel::xam::ui::FriendPopupButton("Friends", btn_size, presentation)) {
       friends_ui_args_.content_args.friends_open = true;
       friends_ui_args_.content_args.first_draw = true;
 
@@ -1256,11 +1278,14 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
     }
     ImGui::EndDisabled();
 
-    ImGui::SameLine();
+    if (!presentation) {
+      ImGui::SameLine();
+    }
 
     ImGui::BeginDisabled(is_profile_signed_in ||
                          !emulator_->GetXboxLiveAPI()->IsConnectedToServer());
-    if (ImGui::Button("Sessions", btn_size)) {
+    if (kernel::xam::ui::FriendPopupButton("Sessions", btn_size,
+                                           presentation)) {
       sessions_args.sessions_open = true;
       ImGui::OpenPopup("Sessions");
     }
@@ -1277,7 +1302,8 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
                          0, 3.0f);
     }
 
-    if (ImGui::Button("Delete Netplay Profiles", btn_size)) {
+    if (kernel::xam::ui::FriendPopupButton("Delete Netplay Profiles", btn_size,
+                                           presentation)) {
       ImGui::OpenPopup("Delete Profiles");
     }
 
@@ -1285,15 +1311,20 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
       ImGui::SetTooltip("Delete profiles to fix XUID mismatch error.");
     }
 
-    ImGui::SameLine();
+    if (!presentation) {
+      ImGui::SameLine();
+    }
 
-    if (ImGui::Button("UPnP and Ports", btn_size)) {
+    if (kernel::xam::ui::FriendPopupButton("UPnP and Ports", btn_size,
+                                           presentation)) {
       upnp_and_ports_args.first_draw = true;
       upnp_and_ports_args.dialog_open = true;
       ImGui::OpenPopup("UPnP and Ports");
     }
 
-    ImGui::SetWindowFontScale(1.0f);
+    if (!presentation) {
+      ImGui::SetWindowFontScale(1.0f);
+    }
 
     if (!sessions_args.sessions_open) {
       sessions_args.first_draw = false;
@@ -1313,17 +1344,21 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
     bool open_deleted_profiles = false;
 
     float btn_height = 25;
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(225, -1), ImVec2(225, -1));
-    if (ImGui::BeginPopupModal("Delete Profiles", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-      if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+    if (!presentation) {
+      ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSizeConstraints(ImVec2(225, -1), ImVec2(225, -1));
+    }
+    if (kernel::xam::ui::BeginFriendPopup("Delete Profiles", nullptr,
+                                          ImGuiWindowFlags_AlwaysAutoResize,
+                                          presentation)) {
+      if (kernel::xam::ui::ConsumeFriendPopupBackPress(presentation)) {
         ImGui::CloseCurrentPopup();
       }
 
       float btn_width = (ImGui::GetContentRegionAvail().x * 0.5f) -
                         (ImGui::GetStyle().ItemSpacing.x * 0.5f);
-      ImVec2 btn_size = ImVec2(btn_width, btn_height);
+      ImVec2 btn_size = ImVec2(
+          btn_width, presentation ? ImGui::GetFrameHeight() : btn_height);
 
       const std::string desc = "Are you sure?";
       const std::string desc2 = "You will be signed out.";
@@ -1341,9 +1376,19 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
         ImGui::Text(desc2.c_str());
       }
 
-      ImGui::Separator();
+      if (!presentation) {
+        ImGui::Separator();
+      }
 
-      if (ImGui::Button("Yes", btn_size)) {
+      const bool opening_input = kernel::xam::ui::FriendPopupOpeningInputHeld();
+      if (kernel::xam::ui::FriendPopupButton("Cancel", btn_size,
+                                             presentation)) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::SameLine();
+      ImGui::BeginDisabled(opening_input);
+      if (kernel::xam::ui::FriendPopupButton("Yes", btn_size, presentation)) {
         if (!is_profile_signed_in) {
           std::map<uint8_t, uint64_t> xuids;
 
@@ -1366,13 +1411,9 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
         ImGui::CloseCurrentPopup();
       }
 
-      ImGui::SameLine();
+      ImGui::EndDisabled();
 
-      if (ImGui::Button("Cancel", btn_size)) {
-        ImGui::CloseCurrentPopup();
-      }
-
-      ImGui::EndPopup();
+      kernel::xam::ui::EndFriendPopup(presentation);
     }
 
     if (open_deleted_profiles) {
@@ -1392,15 +1433,41 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
     xe::kernel::xam::xeDrawUPnPAndPorts(imgui_drawer(), upnp_and_ports_args,
                                         emulator_->GetUPnP());
 
-    ImGui::Separator();
-    if (ImGui::Button("Close") || close_requested) {
+    if (!presentation) {
+      ImGui::Separator();
+    }
+    if (kernel::xam::ui::FriendPopupButton("Close", ImVec2(0, 0),
+                                           presentation) ||
+        close_requested) {
       manager_opened_ = false;
       ImGui::CloseCurrentPopup();
     }
-    ImGui::EndPopup();
+    kernel::xam::ui::EndFriendPopup(presentation);
   }
 
   if (!manager_opened_) {
+    Close();
+    emulator_window_->ToggleFriendsDialog();
+  }
+}
+
+void ManagerDialog::OnDrawGuide(ImGuiIO& io) {
+  auto* profile =
+      emulator_->kernel_state()->xam_state()->GetUserProfile(uint32_t{0});
+  if (!profile) {
+    Close();
+    emulator_window_->ToggleFriendsDialog();
+    return;
+  }
+  if (!manager_opened_) {
+    manager_opened_ = true;
+    auto& content = friends_ui_args_.content_args;
+    content.friends_open = true;
+    content.first_draw = true;
+    content.filter_offline = emulator_->GetXboxLiveAPI()->IsConnectedToServer();
+    ImGui::OpenPopup("Friends");
+  }
+  if (!xeDrawFriendsUI(imgui_drawer(), profile, friends_ui_args_)) {
     Close();
     emulator_window_->ToggleFriendsDialog();
   }
@@ -1449,6 +1516,13 @@ void TitleListUI::LoadProfileTitleList(
 }
 
 void TitleListUI::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  // The prior frame has now consumed the raw texture IDs owned by title_icon.
+  if (guide_close_pending_) {
+    Close();
+    return;
+  }
+#endif
   constexpr const char* kPlayedTitlesWindowName = "##played_titles_window";
 
   if (!has_opened_) {
@@ -1482,13 +1556,10 @@ void TitleListUI::OnDraw(ImGuiIO& io) {
       screen_min, screen_max,
       ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.55f)));
 
-  static std::shared_ptr<xe::ui::ImmediateTexture> guide_bg_tex = nullptr;
+  static xe::app::GuideBackgroundTextureCache guide_background;
+  const auto guide_bg_tex = guide_background.Get(imgui_drawer());
   static std::shared_ptr<xe::ui::ImmediateTexture> button_a_tex = nullptr;
   static std::shared_ptr<xe::ui::ImmediateTexture> button_b_tex = nullptr;
-  if (!guide_bg_tex) {
-    guide_bg_tex =
-        xe::app::LoadConfiguredGuideBackgroundTexture(imgui_drawer());
-  }
   if (!button_a_tex) {
     button_a_tex = xe::app::LoadButtonTexture(imgui_drawer(), 'A');
   }
@@ -1509,9 +1580,13 @@ void TitleListUI::OnDraw(ImGuiIO& io) {
                                     overlay_max);
 
   bool should_close = false;
+#if XE_PLATFORM_WINRT
+  if (xe::app::ConsumeGuideBackPress()) {
+#else
   if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
       (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
        ImGui::IsKeyPressed(ImGuiKey_Escape, false))) {
+#endif
     should_close = true;
   }
 
@@ -1522,14 +1597,15 @@ void TitleListUI::OnDraw(ImGuiIO& io) {
   const float content_start_y =
       header_layout.position.y + header_layout.font_size + 55.0f;
   const float results_height = overlay_max.y - (102.0f * uy) - content_start_y;
-  ImGui::SetCursorScreenPos(
-      ImVec2(overlay_min.x + panel_padding.x, content_start_y));
+  const auto content_bounds =
+      xe::ui::GetGuideContentBounds(panel_size.x, viewport->Size.x);
+  const float content_left = overlay_min.x + content_bounds.left;
+  ImGui::SetCursorScreenPos(ImVec2(content_left, content_start_y));
 
   if (!info_.empty()) {
     if (ImGui::BeginChild("##played_titles_results",
-                          ImVec2(-1.0f, results_height), false,
+                          ImVec2(content_bounds.width(), results_height), false,
                           ImGuiWindowFlags_NoScrollbar)) {
-      const float carousel_outer_padding = 14.0f * ux;
       const float carousel_spacing = 16.0f * ux;
       const float carousel_card_height = 126.0f * uy;
       size_t selected_index = 0;
@@ -1550,76 +1626,93 @@ void TitleListUI::OnDraw(ImGuiIO& io) {
         const auto& entry = info_[ordered_indices[ordered_index]];
         ImGui::PushID(entry.id);
         const bool is_selected = selected_title_ == entry.id;
-        const float card_width = ImGui::GetContentRegionAvail().x;
+        const float card_width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
         const ImVec2 card_min = ImGui::GetCursorScreenPos();
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * ux);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
-        if (ImGui::Selectable("##played_title_card", is_selected,
-                              ImGuiSelectableFlags_None,
-                              ImVec2(card_width, carousel_card_height))) {
-          selected_title_ = entry.id;
-          const ImVec2 next_window_position(ImVec2(
-              overlay_min.x + panel_padding.x, overlay_min.y + (72.0f * uy)));
-          new kernel::xam::ui::GameAchievementsUI(
-              imgui_drawer(), next_window_position, &entry, profile_);
-        }
-        ImGui::PopStyleVar(2);
-        const ImVec2 card_max = ImGui::GetItemRectMax();
-        if (is_selected) {
-          xe::app::DrawConfiguredComboHighlight(
-              ImVec2(card_min.x - carousel_outer_padding,
-                     card_min.y - carousel_outer_padding),
-              ImVec2(card_max.x + carousel_outer_padding,
-                     card_max.y + carousel_outer_padding),
-              1.6f, 6.0f);
-        }
-        ImGui::SameLine(0.0f, 12.0f * ux);
-        if (title_icon.count(entry.id)) {
-          ImGui::Image(
-              reinterpret_cast<ImTextureID>(title_icon.at(entry.id).get()),
-              xe::ui::default_image_icon_size);
-        } else {
-          ImGui::Dummy(xe::ui::default_image_icon_size);
-        }
-        ImGui::SameLine(0.0f, 10.0f * ux);
-        ImGui::BeginGroup();
-        ImGui::PushFont(imgui_drawer()->GetTitleFont());
-        ImGui::TextUnformatted(xe::to_utf8(entry.title_name).c_str());
-        ImGui::PopFont();
-        ImGui::TextUnformatted(
+        const float card_padding = 10.0f * ux;
+        const ImVec2 icon_size = xe::ui::default_image_icon_size;
+        const float text_x = card_min.x + card_padding + icon_size.x + 10.0f * ux;
+        const float text_width =
+            std::max(1.0f, card_min.x + card_width - card_padding - text_x);
+        const std::string title = xe::to_utf8(entry.title_name);
+        const std::string progress =
             fmt::format("{}/{} Achievements unlocked ({} Gamerscore)",
                         entry.unlocked_achievements_count,
-                        entry.achievements_count, entry.title_earned_gamerscore)
-                .c_str());
+                        entry.achievements_count, entry.title_earned_gamerscore);
+        std::string last_played = "Last played: Unknown";
         if (entry.WasTitlePlayed()) {
           const auto time_date = std::chrono::system_clock::to_time_t(
               std::chrono::system_clock::time_point(
                   entry.last_played.time_since_epoch()));
-          ImGui::TextUnformatted(fmt::format("Last played: {:%Y-%m-%d %H:%M}",
-                                             *std::localtime(&time_date))
-                                     .c_str());
-        } else {
-          ImGui::TextUnformatted("Last played: Unknown");
+          last_played = fmt::format("Last played: {:%Y-%m-%d %H:%M}",
+                                     *std::localtime(&time_date));
         }
+        ImGui::PushFont(imgui_drawer()->GetTitleFont());
+        const float title_height =
+            ImGui::CalcTextSize(title.c_str(), nullptr, false, text_width).y;
+        ImGui::PopFont();
+        const float text_height = title_height +
+            ImGui::CalcTextSize(progress.c_str(), nullptr, false, text_width).y +
+            ImGui::CalcTextSize(last_played.c_str(), nullptr, false, text_width).y +
+            ImGui::GetStyle().ItemSpacing.y * 2.0f;
+        const float card_height = std::max(
+            carousel_card_height,
+            std::max(icon_size.y, text_height) + card_padding * 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * ux);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+        // Selectable normally adds half ItemSpacing to its hit rectangle.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+        if (ImGui::Selectable("##played_title_card", is_selected,
+                              ImGuiSelectableFlags_None,
+                              ImVec2(card_width, card_height))) {
+          selected_title_ = entry.id;
+          const ImVec2 next_window_position(
+              content_left, overlay_min.y + 72.0f * uy);
+          new kernel::xam::ui::GameAchievementsUI(
+              imgui_drawer(), next_window_position, &entry, profile_);
+        }
+        ImGui::PopStyleVar(3);
+        const ImVec2 card_max = ImGui::GetItemRectMax();
+        auto* card_draw_list = ImGui::GetWindowDrawList();
+        card_draw_list->PushClipRect(card_min, card_max, true);
+        if (is_selected) {
+          xe::app::DrawConfiguredComboHighlight(
+              ImVec2(card_min.x + 1.0f, card_min.y + 1.0f),
+              ImVec2(card_max.x - 1.0f, card_max.y - 1.0f), 1.6f, 6.0f);
+        }
+        // Render inside the selectable rather than after its full-width row.
+        ImGui::SetCursorScreenPos(
+            ImVec2(card_min.x + card_padding, card_min.y + card_padding));
+        if (title_icon.count(entry.id)) {
+          ImGui::Image(
+              reinterpret_cast<ImTextureID>(title_icon.at(entry.id).get()),
+              icon_size);
+        } else {
+          ImGui::Dummy(icon_size);
+        }
+        ImGui::SetCursorScreenPos(ImVec2(text_x, card_min.y + card_padding));
+        ImGui::BeginGroup();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_width);
+        ImGui::PushFont(imgui_drawer()->GetTitleFont());
+        ImGui::TextUnformatted(title.c_str());
+        ImGui::PopFont();
+        ImGui::TextUnformatted(progress.c_str());
+        ImGui::TextUnformatted(last_played.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::EndGroup();
+        card_draw_list->PopClipRect();
+        ImGui::SetCursorScreenPos(ImVec2(card_min.x, card_max.y));
         ImGui::Dummy(ImVec2(0.0f, carousel_spacing));
         ImGui::PopID();
       }
     }
     ImGui::EndChild();
   } else {
-    ImGui::SetCursorScreenPos(
-        ImVec2(overlay_min.x + panel_padding.x, content_start_y));
-    std::string no_entries_message = "There are no titles, so far.";
+    ImGui::SetCursorScreenPos(ImVec2(content_left, content_start_y));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_bounds.width());
     ImGui::PushFont(imgui_drawer()->GetTitleFont());
-    float windowWidth = ImGui::GetContentRegionAvail().x;
-    ImVec2 textSize = ImGui::CalcTextSize(no_entries_message.c_str());
-    float textOffsetX = (windowWidth - textSize.x) * 0.5f;
-    if (textOffsetX > 0.0f) {
-      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + textOffsetX);
-    }
-    ImGui::Text("%s", no_entries_message.c_str());
+    ImGui::TextUnformatted("There are no titles, so far.");
     ImGui::PopFont();
+    ImGui::PopTextWrapPos();
   }
 
   const float footer_text_size = 13.5f * uy;
@@ -1642,7 +1735,13 @@ void TitleListUI::OnDraw(ImGuiIO& io) {
   ImGui::End();
 
   if (should_close) {
+#if XE_PLATFORM_WINRT
+    // ImGuiDialog deletes after OnDraw, before draw-list submission. Retire on
+    // the next draw so the closing frame can still use this dialog's icons.
+    guide_close_pending_ = true;
+#else
     Close();
+#endif
   }
   return;
 }

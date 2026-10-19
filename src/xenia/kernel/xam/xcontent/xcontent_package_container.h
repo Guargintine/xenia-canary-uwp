@@ -29,10 +29,12 @@ namespace xam {
 
 class ContentPackageContainer final : public ContentPackage {
  public:
-  // Ctor for reading already exisitng packages.
+  // Ctor for reading already exisitng packages. read_only never requests
+  // write access to the host file.
   ContentPackageContainer(vfs::VirtualFileSystem* file_system,
                           const std::string_view device_path,
-                          const std::filesystem::path& package_path);
+                          const std::filesystem::path& package_path,
+                          bool read_only = false);
   // Ctor for creating new packages.
   ContentPackageContainer(vfs::VirtualFileSystem* file_system,
                           const std::string_view device_path,
@@ -64,7 +66,8 @@ class ContentPackageContainer final : public ContentPackage {
                    MappedMemory::Mode open_mode = MappedMemory::Mode::kRead);
   bool CreatePackage(const std::filesystem::path& package_path,
                      const XCONTENT_DATA_INTERNAL& metadata);
-  bool LoadAndVerifyHeader(const std::filesystem::path& package_path);
+  bool LoadAndVerifyHeader(const std::filesystem::path& package_path,
+                           bool read_only);
 
   std::unique_ptr<MappedMemory> package_;
 };

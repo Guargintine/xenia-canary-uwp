@@ -124,14 +124,6 @@ DEFINE_path(
     "for the OS, will be used.",
     "Storage");
 
-DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
-
-DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
-UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
-
-DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
-            "Storage");
-
 DECLARE_bool(force_mount_devkit);
 
 DEFINE_transient_path(target,
@@ -604,6 +596,12 @@ bool EmulatorApp::OnInitialize() {
 }
 
 void EmulatorApp::OnDestroy() {
+#if XE_PLATFORM_WINRT
+  if (emulator_window_) {
+    emulator_window_->WaitForTitleClose();
+    emulator_window_->ShutdownDsu();
+  }
+#endif
   ShutdownEmulatorThreadFromUIThread();
 
   #if !XE_PLATFORM_WINRT
@@ -662,109 +660,6 @@ void EmulatorApp::EmulatorThread() {
 
   app_context().CallInUIThread(
       [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
-
-  const auto fs = emulator_->file_system();
-
-  if (cvars::mount_scratch) {
-    auto scratch_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\SCRATCH", emulator_->storage_root() / "scratch", false);
-    if (!scratch_device->Initialize()) {
-      XELOGE("Unable to scan scratch path");
-    } else {
-      if (!fs->RegisterDevice(std::move(scratch_device))) {
-        XELOGE("Unable to register scratch path");
-      } else {
-        fs->RegisterSymbolicLink("scratch:", "\\SCRATCH");
-      }
-    }
-  }
-
-  if (cvars::mount_cache) {
-    auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE0", emulator_->storage_root() / "cache0", false);
-    if (!cache0_device->Initialize()) {
-      XELOGE("Unable to scan cache0 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache0_device))) {
-        XELOGE("Unable to register cache0 path");
-      } else {
-        fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
-      }
-    }
-
-    auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE1", emulator_->storage_root() / "cache1", false);
-    if (!cache1_device->Initialize()) {
-      XELOGE("Unable to scan cache1 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache1_device))) {
-        XELOGE("Unable to register cache1 path");
-      } else {
-        fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
-      }
-    }
-
-    // Some (older?) games try accessing cache:\ too
-    // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
-    // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
-    // accesses to those devices will go here instead
-    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE", emulator_->storage_root() / "cache", false);
-    if (!cache_device->Initialize()) {
-      XELOGE("Unable to scan cache path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache_device))) {
-        XELOGE("Unable to register cache path");
-      } else {
-        fs->RegisterSymbolicLink("cache:", "\\CACHE");
-      }
-    }
-
-    auto xstorage_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\XSTORAGE", emulator_->storage_root() / "xstorage", false);
-    if (!xstorage_device->Initialize()) {
-      XELOGE("Unable to scan xstorage path");
-    } else {
-      if (!emulator_->file_system()->RegisterDevice(
-              std::move(xstorage_device))) {
-        XELOGE("Unable to register xstorage path");
-      } else {
-        emulator_->file_system()->RegisterSymbolicLink("xstorage:",
-                                                       "\\XSTORAGE");
-      }
-    }
-  }
-
-  if (cvars::force_mount_devkit) {
-    auto devkit_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
-
-    if (!devkit_device->Initialize()) {
-      XELOGE("Unable to scan devkit path");
-    }
-
-    if (!fs->RegisterDevice(std::move(devkit_device))) {
-      XELOGE("Unable to register devkit path");
-    }
-
-    fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
-    fs->RegisterSymbolicLink("e:", "\\DEVKIT");
-  }
-
-  if (cvars::mount_memory_unit) {
-    auto mu_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\MU", "MU", false);
-
-    if (!mu_device->Initialize()) {
-      XELOGE("Unable to scan MU path");
-    }
-
-    if (!fs->RegisterDevice(std::move(mu_device))) {
-      XELOGE("Unable to register MU path");
-    }
-
-    fs->RegisterSymbolicLink("MU:", "\\MU");
-  }
 
   // Set a debug handler.
   // This will respond to debugging requests so we can open the debug UI.
@@ -873,6 +768,7 @@ void EmulatorApp::EmulatorThread() {
     }
   }
 
+#if !XE_PLATFORM_WINRT
   // Grab path from the flag or unnamed argument.
   std::filesystem::path path;
   if (!cvars::target.empty()) {
@@ -905,6 +801,7 @@ void EmulatorApp::EmulatorThread() {
       });
     }
   }
+#endif
 
   // Now, we're going to use this thread to drive events related to emulation.
   while (!emulator_thread_quit_requested_.load(std::memory_order_relaxed)) {

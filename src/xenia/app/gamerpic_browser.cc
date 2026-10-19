@@ -108,6 +108,10 @@ void TitleGamerpicBrowser::CloseGamerpicsThreads() {
 }
 
 void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  OnDrawGuide(io);
+  return;
+#endif
   if (!titles_args_.browser_open) {
     titles_args_.first_draw = true;
     titles_args_.browser_open = true;
@@ -664,8 +668,243 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
   }
 }
 
+#if XE_PLATFORM_WINRT
+void TitleGamerpicBrowser::OnDrawGuide(ImGuiIO& io) {
+  // Retire the browser on the draw after closing, once its last frame rendered.
+  if (titles_args_.first_draw && !titles_args_.browser_open) {
+    Close();
+    emulator_window_->ToggleGamerpicBrowserDialog();
+    return;
+  }
+  if (!titles_args_.first_draw) {
+    titles_args_.first_draw = true;
+    titles_args_.browser_open = true;
+    ImGui::OpenPopup("Gamerpic Browser");
+  }
+  if (BeginGuidePopup("Gamerpic Browser", &titles_args_.browser_open,
+                      guide_state_, imgui_drawer())) {
+    const bool back = ConsumeGuideBackPress();
+    if (back && guide_options_) {
+      guide_options_ = false;
+      guide_activation_armed_ = false;
+      guide_focus_requested_ = true;
+    } else if (back) {
+      titles_args_.browser_open = false;
+      ImGui::CloseCurrentPopup();
+      EndGuidePopup();
+      return;
+    }
+    CleanupTitleImagesThreads();
+    if (!loaded_page_ && IsFutureReady(gamerpic_page_)) {
+      current_page_ = gamerpic_page_.get();
+      LoadGameImagesAsync(current_page_);
+      loaded_page_ = true;
+    }
+    if (!downloaded_dash_gamerpics && IsFutureReady(dashboard_title_)) {
+      LoadDashboardGamerpicsAsync(
+          GetDashboardTitleResult(dashboard_title_, max_retry_count_));
+    }
+
+    if (!guide_activation_armed_ &&
+        !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) &&
+        !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+        !ImGui::IsKeyDown(ImGuiKey_KeypadEnter) &&
+        !ImGui::IsKeyDown(ImGuiKey_Space) &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+      guide_activation_armed_ = true;
+    }
+    ImGui::BeginDisabled(!guide_activation_armed_);
+    if (guide_activation_armed_ && guide_focus_requested_) {
+      ImGui::SetKeyboardFocusHere();
+      guide_focus_requested_ = false;
+    }
+    if (guide_options_) {
+      if (GuideButton("Back to games")) {
+        guide_options_ = false;
+        guide_activation_armed_ = false;
+        guide_focus_requested_ = true;
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::Spacing();
+      ImGui::TextUnformatted("Profile");
+      for (size_t i = 0; i < profiles_.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::RadioButton(profiles_[i].c_str(), selected_profile_ == i)) {
+          selected_profile_ = static_cast<int>(i);
+          profile_ = kernel_state_->xam_state()->GetUserProfile(xuids_[i]);
+          if (profile_) {
+            picture_key_setting_ = GetGamerPictureKey();
+            LoadGamerpic();
+          }
+        }
+        ImGui::PopID();
+      }
+      const auto page_size_label =
+          fmt::format("Games per page: {}", per_page_.load());
+      if (GuideButton(page_size_label.c_str())) {
+        selected_per_page_ = (selected_per_page_ + 1) % 4;
+        per_page_ = 20 + selected_per_page_ * 10;
+        gamerpic_page_ = LoadFirstPage();
+      }
+      ImGui::TextUnformatted("Content types");
+      bool changed = false;
+      for (size_t i = 0; i < std::size(title_type_filter_state_); ++i) {
+        changed |= ImGui::Checkbox(title_type_filter_[i],
+                                   &title_type_filter_state_[i]);
+      }
+      if (changed) {
+        if (std::ranges::none_of(title_type_filter_state_,
+                                 [](bool selected) { return selected; })) {
+          title_type_filter_state_[0] = true;
+        }
+        gamerpic_page_ = LoadFirstPage();
+      }
+      ImGui::Spacing();
+      ImGui::TextUnformatted("Title ID");
+      ImGui::InputText("##GuideTitleId", title_id_, sizeof(title_id_),
+                       ImGuiInputTextFlags_CharsHexadecimal);
+      if (GuideButton("Paste title ID")) {
+        if (const char* text = ImGui::GetClipboardText()) {
+          xe::string_util::copy_truncating(title_id_, text, sizeof(title_id_));
+        }
+      }
+      if (GuideButton("Clear title ID")) {
+        title_id_[0] = 0;
+      }
+      if (kernel_state_->emulator()->is_title_open() &&
+          GuideButton("Use current game")) {
+        xe::string_util::copy_truncating(
+            title_id_, fmt::format("{:08X}", kernel_state_->title_id()),
+            sizeof(title_id_));
+      }
+      const bool valid_title =
+          std::strlen(title_id_) == 8 && IsValidHexString(title_id_);
+      ImGui::BeginDisabled(!valid_title);
+      if (GuideButton("Open title")) {
+        const uint32_t id = string_util::from_string<uint32_t>(title_id_, true);
+        const auto titles = GetSupportedTitlesResult(supported_titles_result_,
+                                                     max_retry_count_);
+        if (titles.contains(id)) {
+          selected_title_gamerpics_ = LoadTitleAsync(id).get().GetTitle();
+          gamerpic_args_.browser_open = true;
+        }
+      }
+      ImGui::EndDisabled();
+    } else {
+      if (GuideButton("Options and title search")) {
+        guide_options_ = true;
+        guide_activation_armed_ = false;
+        guide_focus_requested_ = true;
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::BeginDisabled(!downloaded_dash_gamerpics);
+      if (GuideButton("Xbox 360 Dashboard pictures")) {
+        selected_title_gamerpics_ =
+            GetDashboardTitleResult(dashboard_title_, max_retry_count_);
+        gamerpic_args_.browser_open = true;
+      }
+      ImGui::EndDisabled();
+      ImGui::Spacing();
+      if (!loaded_page_) {
+        ImGui::TextUnformatted("Loading games...");
+      }
+      // Constrain rows to the guide content width.
+      const auto images =
+          immediate_title_images_->load(std::memory_order_acquire);
+      for (const auto& title : current_page_.GetTitles()) {
+        ImGui::PushID(static_cast<int>(title.id));
+        auto* icon = images && images->contains(title.id)
+                         ? images->at(title.id).get()
+                         : imgui_drawer()->GetLoadingTileIcon();
+        if (images && images->contains(title.id)) {
+          imgui_drawer()->RetainTextureForFrame(images->at(title.id));
+        }
+        const float icon_size = std::min(48.0f, GuideContentWidth() * 0.2f);
+        ImGui::Image(reinterpret_cast<ImTextureID>(icon),
+                     ImVec2(icon_size, icon_size));
+        ImGui::SameLine();
+        if (GuideButton(title.name.c_str(), ImVec2(0, icon_size))) {
+          selected_title_gamerpics_ = title;
+          gamerpic_args_.browser_open = true;
+        }
+        ImGui::PopID();
+      }
+      ImGui::Spacing();
+      ImGui::BeginDisabled(!current_page_.GetPreviousPage() ||
+                           !IsFutureReady(gamerpic_page_));
+      if (GuideButton("First page")) {
+        gamerpic_page_ = LoadFirstPage();
+      }
+      if (GuideButton("Previous page")) {
+        gamerpic_page_ = LoadPreviousPage();
+      }
+      ImGui::EndDisabled();
+      const auto page_label =
+          fmt::format("Page {}/{}", current_page_.GetCurrentPage(),
+                      current_page_.GetTotalPages());
+      if (GuideButton(page_label.c_str())) {
+        selected_page_pos_ = current_page_.GetCurrentPage();
+        page_selection_open_ = true;
+        ImGui::OpenPopup("Page Selection");
+      }
+      ImGui::BeginDisabled(!current_page_.GetNextPage() ||
+                           !IsFutureReady(gamerpic_page_));
+      if (GuideButton("Next page")) {
+        gamerpic_page_ = LoadNextPage();
+      }
+      if (GuideButton("Last page")) {
+        gamerpic_page_ = LoadLastPage();
+      }
+      ImGui::EndDisabled();
+    }
+    ImGui::EndDisabled();
+    if (gamerpic_args_.browser_open && !gamerpic_args_.first_draw) {
+      gamerpic_args_.first_draw = true;
+      gamerpic_args_.title_desc = "Game pictures";
+      LoadGamerpicsAsync(selected_title_gamerpics_);
+      ImGui::OpenPopup(gamerpic_args_.title_desc.c_str());
+    }
+    DrawPageSelection(current_page_, "Page Selection");
+    DrawGamerpicsBrowser(selected_title_gamerpics_, gamerpic_args_);
+    if (gamerpic_args_.first_draw && !gamerpic_args_.browser_open) {
+      gamerpic_args_.first_draw = false;
+      selected_title_gamerpics_ = {};
+    }
+    if (GuideButton("Close")) {
+      titles_args_.browser_open = false;
+      ImGui::CloseCurrentPopup();
+    }
+    EndGuidePopup();
+  }
+}
+#endif
+
 void TitleGamerpicBrowser::DrawPageSelection(
     xe::kernel::PageGamerpicsObjectJSON page, std::string title) {
+#if XE_PLATFORM_WINRT
+  if (BeginGuidePopup(title.c_str(), &page_selection_open_, guide_state_,
+                      imgui_drawer())) {
+    const bool back = ConsumeGuideBackPress();
+    if (GuideButton("Cancel") || back) {
+      page_selection_open_ = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SetItemDefaultFocus();
+    ImGui::TextUnformatted("Page");
+    ImGui::InputScalar("##PageInput", ImGuiDataType_U32, &selected_page_pos_,
+                       &selected_page_step_);
+    selected_page_pos_ =
+        std::clamp(selected_page_pos_, uint32_t{1},
+                   std::max(uint32_t{1}, page.GetTotalPages()));
+    if (GuideButton("Go")) {
+      gamerpic_page_ = LoadPageAsync(selected_page_pos_);
+      page_selection_open_ = false;
+      ImGui::CloseCurrentPopup();
+    }
+    EndGuidePopup();
+  }
+  return;
+#endif
   ImGuiViewport* viewport = ImGui::GetMainViewport();
   ImVec2 center = viewport->GetCenter();
 
@@ -718,25 +957,59 @@ void TitleGamerpicBrowser::DrawPageSelection(
 
 void TitleGamerpicBrowser::DrawGamerpicsBrowser(xe::kernel::GameTitle game,
                                                 GamerpicBrowserArgs& args) {
+#if XE_PLATFORM_WINRT
+  if (args.title_desc.empty()) {
+    return;
+  }
+  const bool visible =
+      BeginGuidePopup(args.title_desc.c_str(), &args.browser_open, guide_state_,
+                      imgui_drawer());
+#else
   ImGuiViewport* viewport = ImGui::GetMainViewport();
   ImVec2 center = viewport->GetCenter();
 
   ImGui::SetNextWindowSizeConstraints(ImVec2(500, -1), ImVec2(500, -1));
   ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-  if (ImGui::BeginPopupModal(
-          args.title_desc.c_str(), &args.browser_open,
-          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
+  const bool visible = ImGui::BeginPopupModal(
+      args.title_desc.c_str(), &args.browser_open,
+      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
+#endif
+  if (visible) {
+#if XE_PLATFORM_WINRT
+    if (GuideButton("Back") || ConsumeGuideBackPress()) {
+      args.browser_open = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SetItemDefaultFocus();
+    ImGui::TextWrapped("%s", game.name.c_str());
+    if (GuideButton("Copy title ID")) {
+      ImGui::SetClipboardText(fmt::format("{:08X}", game.id).c_str());
+    }
+    const ImVec2 table_size(-1,
+                            std::max(100.0f, ImGui::GetContentRegionAvail().y));
+    const int picture_columns = std::max(
+        1, static_cast<int>(GuideContentWidth() /
+                            (xe::ui::default_image_icon_size.x +
+                             ImGui::GetStyle().FramePadding.x * 2.0f + 12.0f)));
+#else
     ImVec2 table_size = ImVec2(-1, 435);
+    const int picture_columns = title_gamerpics_columns_;
+#endif
 
+    ImGuiTableFlags picture_table_flags =
+        ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_SizingStretchSame |
+        ImGuiTableFlags_ScrollY;
+#if !XE_PLATFORM_WINRT
+    picture_table_flags |= ImGuiTableFlags_Borders;
+#endif
     if (ImGui::BeginTable(
             fmt::format("GamerpicsTable{:08X}", game.id).c_str(),
-            title_gamerpics_columns_,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedSame |
-                ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY,
-            table_size)) {
+            picture_columns, picture_table_flags, table_size)) {
+#if !XE_PLATFORM_WINRT
       if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
         ImGui::CloseCurrentPopup();
       }
+#endif
 
       UpdateGamerpicIfRequested(game);
 
@@ -756,6 +1029,10 @@ void TitleGamerpicBrowser::DrawGamerpicsBrowser(xe::kernel::GameTitle game,
           if (immediate_gamerpics->at(game.id).contains(gamerpic.big_tile_id)) {
             gamerpic_icon =
                 immediate_gamerpics->at(game.id).at(gamerpic.big_tile_id).get();
+#if XE_PLATFORM_WINRT
+            imgui_drawer()->RetainTextureForFrame(
+                immediate_gamerpics->at(game.id).at(gamerpic.big_tile_id));
+#endif
 
             gamerpic_downloaded = true;
           }
@@ -803,7 +1080,11 @@ void TitleGamerpicBrowser::DrawGamerpicsBrowser(xe::kernel::GameTitle game,
       ImGui::EndTable();
     }
 
+#if XE_PLATFORM_WINRT
+    EndGuidePopup();
+#else
     ImGui::EndPopup();
+#endif
   } else {
     // If the gamerpics dialog closed then stop requesting gamerpics
     CloseGamerpicsThreads();

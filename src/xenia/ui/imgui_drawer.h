@@ -63,6 +63,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   }
 
   ImmediateDrawer* GetImmediateDrawer() { return immediate_drawer_; }
+  // ImGui stores raw texture IDs. A dialog can delete itself before the frame's
+  // draw lists are submitted, so keep its textures alive until submission ends.
+  void RetainTextureForFrame(const std::shared_ptr<ImmediateTexture>& texture) {
+    if (texture) {
+      frame_textures_.push_back(texture);
+    }
+  }
   void SetIgnoreInput(bool ignore);
   bool GetIgnoreInput();
   void Draw(UIDrawContext& ui_draw_context) override;
@@ -157,6 +164,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   Presenter* presenter_ = nullptr;
 
   ImmediateDrawer* immediate_drawer_ = nullptr;
+  std::vector<std::shared_ptr<ImmediateTexture>> frame_textures_;
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;

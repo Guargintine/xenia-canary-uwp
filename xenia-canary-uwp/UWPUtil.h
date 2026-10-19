@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -10,6 +11,25 @@ class Emulator;
 }
 
 namespace UWP {
+struct TitleUpdateCandidate {
+  std::string id;
+  std::string media_id;
+  std::string content_id;
+  std::string download_url;
+  uint32_t version = 0;
+  uint64_t size_kb = 0;
+  uint64_t size_bytes = 0;
+  std::string upload_date;
+  std::string name;
+  std::string base_version;
+};
+
+struct TitleUpdateGameInfo {
+  std::string title_id;
+  std::string media_id;
+  std::string base_version;
+};
+
 struct UnityGameMetadata {
   bool request_started = false;
   bool request_finished = false;
@@ -38,16 +58,24 @@ void SelectGameFromWinRT(xe::Emulator* emu);
 bool HasGamePath();
 std::string ConsumeGamePath();
 void SelectFolder(std::function<void(std::string)> callback);
+// Custom storage selections retain picker-granted access across restarts.
+// Cancellation returns an empty path without an error.
+void SelectStorageFolder(
+    const std::wstring& access_token,
+    std::function<void(std::string path, std::string error)> callback);
 void SelectFile(std::function<void(std::string)> callback);
 void SelectFiles(std::function<void(std::vector<std::string>)> callback);
 bool TestPathPermissions(std::string path);
 std::string GetLocalCache();
 std::string GetLocalState();
+// Installed package version as "major.minor.build.revision".
+std::string GetPackageVersion();
 int GetCoreDPI();
 void SetAutomaticLaunch(std::string game_path);
 void SetDPI(int DPI);
 bool IsUIOpen();
 void SetUIOpen(bool is_open);
+uint64_t GetUIInputCaptureState();
 void LaunchUri(const std::string& url);
 void DownloadAndExtractZip(const std::string& url,
                            const std::string& dest_folder,
@@ -64,14 +92,19 @@ void DownloadPluginsForGame(const std::string& title_id,
 void DownloadConfigForGame(const std::string& title_id,
                            const std::string& dest_folder,
                            std::function<void(bool, std::string)> callback);
-bool ConvertOptimizedConfigJsonToToml(const std::string& json,
-                                      std::string& out_toml);
 std::string GetMediaIdFromPath(const std::string& game_path);
 void EnsureUnityMetadataFetch(const std::string& title_id);
 bool TryGetUnityMetadata(const std::string& title_id,
                          UnityGameMetadata* out_metadata);
-void DownloadTitleUpdatesForGame(
+void ListTitleUpdatesForGame(
     const std::string& title_id, const std::string& media_id,
+    const std::string& base_version,
+    std::function<void(bool, std::vector<TitleUpdateCandidate>, std::string)>
+        callback);
+TitleUpdateGameInfo GetTitleUpdateGameInfo(const std::string& game_path);
+void DownloadTitleUpdateForGame(
+    const std::string& title_id, const std::string& media_id,
+    const TitleUpdateCandidate& candidate,
     const std::string& dest_folder,
     std::function<void(bool, std::vector<std::string>, std::string)> callback);
 }  // namespace UWP

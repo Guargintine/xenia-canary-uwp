@@ -150,14 +150,42 @@ AudioMediaPlayer::AudioMediaPlayer(apu::AudioSystem* audio_system,
       active_song_(nullptr) {};
 
 AudioMediaPlayer::~AudioMediaPlayer() {
-  Stop();
-  DeleteDriver();
+  Shutdown();
 };
+
+void AudioMediaPlayer::StopWorkers() {
+  stopping_ = true;
+  worker_running_ = false;
+  resume_fence_.Signal();
+  {
+    std::unique_lock<xe_mutex> guard(driver_mutex_);
+    if (driver_semaphore_) {
+      driver_semaphore_->Release(1, nullptr);
+    }
+  }
+  if (worker_thread_) {
+    xe::threading::Wait(worker_thread_.get(), false);
+    worker_thread_.reset();
+  }
+  processing_end_fence_.Signal();
+}
+
+void AudioMediaPlayer::Shutdown() {
+  StopWorkers();
+  DeleteDriver();
+  state_ = XmpApp::State::kIdle;
+  active_song_ = nullptr;
+  active_playlist_ = nullptr;
+  playlists_.clear();
+}
 
 void AudioMediaPlayer::WorkerThreadMain() {
   while (worker_running_) {
     if (!IsPlaying()) {
       resume_fence_.Wait();
+    }
+    if (!worker_running_) {
+      break;
     }
 
     if (!active_playlist_) {
@@ -179,6 +207,7 @@ void AudioMediaPlayer::Setup() {
   // sample_buffer_ptr_ = kernel_state_->memory()->SystemHeapAlloc(
   //     xe::apu::AudioDriver::kFrameSamplesMax);
 
+  stopping_ = false;
   worker_running_ = true;
   worker_thread_ = threading::Thread::Create({}, [&] { WorkerThreadMain(); });
   worker_thread_->set_name("Audio Media Player");
@@ -186,6 +215,9 @@ void AudioMediaPlayer::Setup() {
 
 X_STATUS AudioMediaPlayer::Play(uint32_t playlist_handle, uint32_t song_handle,
                                 bool force) {
+  if (stopping_) {
+    return X_STATUS_THREAD_IS_TERMINATING;
+  }
   auto playlist_itr = playlists_.find(playlist_handle);
   if (playlist_itr == playlists_.cend()) {
     return X_STATUS_UNSUCCESSFUL;
@@ -249,18 +281,21 @@ void AudioMediaPlayer::Play() {
   }
 
   // Always apply the stored volume to the newly created driver
-  driver_->SetVolume(volume_);
+  {
+    std::unique_lock<xe_mutex> guard(driver_mutex_);
+    driver_->SetVolume(volume_);
+  }
 
   auto result =
       ProcessAudioLoop(this, driver_.get(), formatContext, codecContext, 0);
 
   // We need to stop playback only if it wasn't
-  if (result != ProcessAudioResult::ForcedFinish) {
+  if (!stopping_ && result != ProcessAudioResult::ForcedFinish) {
     Stop(true, true);
   }
 
   // We're waiting for dangling samples to finish playing.
-  if (result == ProcessAudioResult::Successful) {
+  if (!stopping_ && result == ProcessAudioResult::Successful) {
     xe::threading::Wait(driver_semaphore_.get(), true,
                         std::chrono::milliseconds(500));
   }
@@ -272,6 +307,10 @@ void AudioMediaPlayer::Play() {
   avformat_close_input(&formatContext);
 
   processing_end_fence_.Signal();
+
+  if (stopping_) {
+    return;
+  }
 
   if (result == ProcessAudioResult::ForcedFinish) {
     DeleteDriver();
@@ -290,24 +329,30 @@ void AudioMediaPlayer::Play() {
 }
 
 void AudioMediaPlayer::Pause() {
-  if (!IsPlaying()) {
+  if (stopping_ || !IsPlaying()) {
     return;
   }
 
-  if (driver_) {
-    driver_->Pause();
+  {
+    std::unique_lock<xe_mutex> guard(driver_mutex_);
+    if (driver_) {
+      driver_->Pause();
+    }
   }
   state_ = XmpApp::State::kPaused;
   OnStateChanged();
 };
 
 void AudioMediaPlayer::Stop(bool change_state, bool force) {
-  if (IsIdle()) {
+  if (stopping_ || IsIdle()) {
     return;
   }
 
-  if (driver_ && IsPaused()) {
-    driver_->Resume();
+  {
+    std::unique_lock<xe_mutex> guard(driver_mutex_);
+    if (driver_ && IsPaused()) {
+      driver_->Resume();
+    }
   }
 
   state_ = XmpApp::State::kIdle;
@@ -323,20 +368,23 @@ void AudioMediaPlayer::Stop(bool change_state, bool force) {
 };
 
 void AudioMediaPlayer::Continue() {
-  if (!IsPaused()) {
+  if (stopping_ || !IsPaused()) {
     return;
   }
 
   state_ = XmpApp::State::kPlaying;
   resume_fence_.Signal();
-  if (driver_) {
-    driver_->Resume();
+  {
+    std::unique_lock<xe_mutex> guard(driver_mutex_);
+    if (driver_) {
+      driver_->Resume();
+    }
   }
   OnStateChanged();
 }
 
 X_STATUS AudioMediaPlayer::Next() {
-  if (!active_playlist_) {
+  if (stopping_ || !active_playlist_) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -369,7 +417,7 @@ X_STATUS AudioMediaPlayer::Next() {
 }
 
 X_STATUS AudioMediaPlayer::Previous() {
-  if (!active_playlist_) {
+  if (stopping_ || !active_playlist_) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -434,7 +482,7 @@ std::span<uint8_t> AudioMediaPlayer::LoadSongToMemory() {
 
 void AudioMediaPlayer::AddPlaylist(uint32_t handle,
                                    std::unique_ptr<XmpApp::Playlist> playlist) {
-  if (playlists_.count(handle) != 0) {
+  if (stopping_ || playlists_.count(handle) != 0) {
     return;
   }
 
@@ -447,7 +495,7 @@ void AudioMediaPlayer::AddPlaylist(uint32_t handle,
 }
 
 void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
-  if (playlists_.count(handle) == 0) {
+  if (stopping_ || playlists_.count(handle) == 0) {
     return;
   }
 
@@ -461,6 +509,9 @@ void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
 }
 
 X_STATUS AudioMediaPlayer::SetVolume(float volume) {
+  if (stopping_) {
+    return X_STATUS_THREAD_IS_TERMINATING;
+  }
   volume_.store(std::min(volume, 1.0f));
 
   std::unique_lock<xe_mutex> guard(driver_mutex_);
@@ -495,6 +546,9 @@ void AudioMediaPlayer::SetCaptureCallback(uint32_t callback, uint32_t context,
 }
 
 void AudioMediaPlayer::OnStateChanged() {
+  if (stopping_) {
+    return;
+  }
   kernel_state_->BroadcastNotification(kXNotificationXmpStateChanged,
                                        static_cast<uint32_t>(state_));
 }
@@ -520,7 +574,13 @@ void AudioMediaPlayer::ProcessAudioBuffer(std::vector<float>* buffer) {
                                           callback_, args, xe::countof(args));
     }*/
 
-    driver_->SubmitFrame(buffer->data());
+    {
+      std::unique_lock<xe_mutex> guard(driver_mutex_);
+      if (stopping_) {
+        break;
+      }
+      driver_->SubmitFrame(buffer->data());
+    }
     buffer->erase(buffer->begin(),
                   buffer->begin() + xe::apu::AudioDriver::kFrameSamplesMax);
   }
@@ -530,6 +590,9 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
   DeleteDriver();
 
   std::unique_lock<xe_mutex> guard(driver_mutex_);
+  if (stopping_) {
+    return false;
+  }
   driver_semaphore_ = xe::threading::Semaphore::Create(
       AudioSystem::kMaximumQueuedFrames, AudioSystem::kMaximumQueuedFrames);
 
@@ -545,9 +608,9 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
   }
 
   if (!driver_->Initialize()) {
-    driver_semaphore_.reset();
     driver_->Shutdown();
     driver_.reset();
+    driver_semaphore_.reset();
     return false;
   }
 
@@ -557,13 +620,10 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
 void AudioMediaPlayer::DeleteDriver() {
   std::unique_lock<xe_mutex> guard(driver_mutex_);
   if (driver_) {
-    if (driver_semaphore_) {
-      driver_semaphore_.reset();
-    }
-
     driver_->Shutdown();
     driver_.reset();
   }
+  driver_semaphore_.reset();
 }
 
 }  // namespace apu

@@ -15,6 +15,14 @@ target_sources(xenia-app PRIVATE
 
 # Other app sources (emulator_window, profile_dialogs, etc.)
 xe_platform_sources(xenia-app ${CMAKE_CURRENT_SOURCE_DIR})
+include(${PROJECT_SOURCE_DIR}/cmake/ScreenScraperIdentity.cmake)
+xenia_screenscraper_identity(xenia-app)
+if(WIN32)
+  set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/game_streamer.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/frontend_video_player.cc"
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/include")
+endif()
 
 # Platform-specific entry points
 if(WIN32)

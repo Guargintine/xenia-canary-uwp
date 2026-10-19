@@ -30,7 +30,6 @@ class SigninUI final : public XamDialog {
  private:
   void OnDraw(ImGuiIO& io) override;
   void OnClose() override;
-  void DispatchPendingLogins(std::map<uint8_t, uint64_t>&& profiles);
   std::shared_ptr<xe::ui::ImmediateTexture> GetOrCreateButtonTexture(
       char button);
 
@@ -43,7 +42,6 @@ class SigninUI final : public XamDialog {
 
   bool has_opened_ = false;
   bool focus_requested_ = false;
-  std::map<uint8_t, uint64_t> pending_login_profiles_;
   std::shared_ptr<xe::ui::ImmediateTexture> button_a_tex_;
   std::shared_ptr<xe::ui::ImmediateTexture> button_b_tex_;
   std::string title_;

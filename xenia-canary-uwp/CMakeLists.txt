@@ -16,10 +16,20 @@ add_executable(xenia-uwp WIN32
 # Keep all upstream app dialogs, including netplay, in the packaged app.
 xe_platform_sources(xenia-uwp ${PROJECT_SOURCE_DIR}/src/xenia/app)
 target_include_directories(xenia-uwp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+include(${PROJECT_SOURCE_DIR}/cmake/ScreenScraperIdentity.cmake)
+xenia_screenscraper_identity(xenia-uwp)
 target_compile_definitions(xenia-uwp PRIVATE
   XBYAK_NO_OP_NAMES XBYAK_ENABLE_OMITTED_OPERAND CURL_STATICLIB MINIUPNP_STATICLIB
 )
 target_compile_options(xenia-uwp PRIVATE /bigobj)
+
+# This runtime has a different ABI from Xenia's static XMA decoder. Restrict
+# its matching headers to the dynamic loaders' translation units.
+set_source_files_properties(
+  "${PROJECT_SOURCE_DIR}/src/xenia/app/game_streamer.cc"
+  "${PROJECT_SOURCE_DIR}/src/xenia/app/frontend_video_player.cc" PROPERTIES
+  INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/include"
+)
 target_link_libraries(xenia-uwp PRIVATE
   xenia-apu xenia-apu-nop xenia-apu-xaudio2
   xenia-base xenia-core xenia-cpu xenia-cpu-backend-x64
@@ -64,3 +74,76 @@ set_source_files_properties("${_uwp_tls_license}" PROPERTIES
   VS_DEPLOYMENT_LOCATION "Licenses/wolfSSL"
 )
 target_sources(xenia-uwp PRIVATE "${_uwp_tls_license}")
+
+# Package the embedded CA bundle with its license and checksum.
+set(_uwp_ca_sources
+  "${PROJECT_SOURCE_DIR}/third_party/cacert/cacert.pem"
+  "${PROJECT_SOURCE_DIR}/third_party/cacert/cacert.pem.sha256"
+  "${PROJECT_SOURCE_DIR}/third_party/cacert/LICENSE"
+)
+set_source_files_properties(${_uwp_ca_sources} PROPERTIES
+  VS_DEPLOYMENT_CONTENT 1
+  VS_DEPLOYMENT_LOCATION "Licenses/Mozilla-CA"
+)
+target_sources(xenia-uwp PRIVATE ${_uwp_ca_sources})
+
+file(GLOB _streaming_dlls "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/bin/*.dll")
+set_source_files_properties(${_streaming_dlls} PROPERTIES
+  VS_DEPLOYMENT_CONTENT 1 VS_DEPLOYMENT_LOCATION ".")
+set(_streaming_notices
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/LICENSE.txt"
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/NOTICE"
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/build.ps1"
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/ffmpeg-winrt.patch"
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/ffmpeg-uwp-mf-encoder.patch"
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/SHA256SUMS")
+set_source_files_properties(${_streaming_notices} PROPERTIES
+  VS_DEPLOYMENT_CONTENT 1 VS_DEPLOYMENT_LOCATION "Licenses/Streaming-FFmpeg")
+target_sources(xenia-uwp PRIVATE ${_streaming_dlls} ${_streaming_notices})
+file(GLOB _streaming_source_archives CONFIGURE_DEPENDS
+  "${PROJECT_SOURCE_DIR}/third_party/streaming-ffmpeg/source/*")
+set_source_files_properties(${_streaming_source_archives} PROPERTIES
+  VS_DEPLOYMENT_CONTENT 1
+  VS_DEPLOYMENT_LOCATION "Licenses/Streaming-FFmpeg/source")
+target_sources(xenia-uwp PRIVATE ${_streaming_source_archives})
+
+# Copies the package to release/Xenia-Netplay-<manifest version>.appx and signs
+# it when XENIA_UWP_SIGN_SHA1 is set.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/Package.appxmanifest")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/Package.appxmanifest"
+  _uwp_identity_version_lines
+  REGEX "^[ \t]*Version=\"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\"")
+list(GET _uwp_identity_version_lines 0 _uwp_identity_version_line)
+string(REGEX MATCH "Version=\"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\""
+  _ "${_uwp_identity_version_line}")
+set(XENIA_UWP_PACKAGE_VERSION "${CMAKE_MATCH_1}")
+if(NOT XENIA_UWP_PACKAGE_VERSION)
+  message(FATAL_ERROR "Package.appxmanifest has no Identity Version")
+endif()
+message(STATUS "UWP package version: ${XENIA_UWP_PACKAGE_VERSION}")
+
+set(XENIA_UWP_SIGN_SHA1 "" CACHE STRING
+  "SHA-1 thumbprint of the certificate that signs the release package; empty leaves it unsigned")
+set(_uwp_appx
+  "${CMAKE_CURRENT_BINARY_DIR}/AppPackages/xenia-uwp/xenia-uwp_${XENIA_UWP_PACKAGE_VERSION}_x64_Test/xenia-uwp_${XENIA_UWP_PACKAGE_VERSION}_x64.appx")
+set(_uwp_release_dir "${CMAKE_BINARY_DIR}/release")
+set(_uwp_release "${_uwp_release_dir}/Xenia-Netplay-${XENIA_UWP_PACKAGE_VERSION}.appx")
+set(_uwp_release_commands
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${_uwp_release_dir}"
+  COMMAND ${CMAKE_COMMAND} -E copy "${_uwp_appx}" "${_uwp_release}")
+if(XENIA_UWP_SIGN_SHA1)
+  file(GLOB _uwp_sdk_bin_dirs "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*/x64")
+  list(SORT _uwp_sdk_bin_dirs ORDER DESCENDING)
+  find_program(XENIA_UWP_SIGNTOOL signtool PATHS ${_uwp_sdk_bin_dirs})
+  if(NOT XENIA_UWP_SIGNTOOL)
+    message(FATAL_ERROR "signtool was not found for XENIA_UWP_SIGN_SHA1")
+  endif()
+  list(APPEND _uwp_release_commands
+    COMMAND "${XENIA_UWP_SIGNTOOL}" sign /fd SHA256 /sha1 "${XENIA_UWP_SIGN_SHA1}" "${_uwp_release}")
+endif()
+add_custom_target(xenia-uwp-release
+  ${_uwp_release_commands}
+  COMMENT "Release package: ${_uwp_release}"
+  VERBATIM)
+add_dependencies(xenia-uwp-release xenia-uwp)

@@ -42,6 +42,8 @@ class AudioSystem {
   XmaDecoder* xma_decoder() const { return xma_decoder_.get(); }
 
   virtual X_STATUS Setup(kernel::KernelState* kernel_state);
+  // Stops host processing without releasing resources still visible to guests.
+  void StopWorkers();
   virtual void Shutdown();
 
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg,
@@ -78,6 +80,7 @@ class AudioSystem {
   std::unique_ptr<XmaDecoder> xma_decoder_;
 
   std::atomic<bool> worker_running_ = {false};
+  bool stopping_ = false;
   kernel::object_ref<kernel::XHostThread> worker_thread_;
 
   xe::global_critical_region global_critical_region_;
@@ -99,7 +102,7 @@ class AudioSystem {
   // Event is always there in case we have no clients.
   std::unique_ptr<xe::threading::Event> pending_work_event_;
 
-  bool paused_ = false;
+  std::atomic<bool> paused_ = false;
   threading::Fence pause_fence_;
   std::unique_ptr<threading::Event> resume_event_;
 };

@@ -67,6 +67,7 @@ AudioSystem::~AudioSystem() {
 }
 
 X_STATUS AudioSystem::Setup(kernel::KernelState* kernel_state) {
+  stopping_ = false;
   X_STATUS result = xma_decoder_->Setup(kernel_state);
   if (result) {
     return result;
@@ -172,7 +173,7 @@ void AudioSystem::WorkerThreadMain() {
     }
 
     // Submit only if the host has a free output slot;
-    if (client_callback &&
+    if (worker_running_ && client_callback &&
         xe::threading::Wait(client_semaphores_[client_index].get(), false,
                             std::chrono::milliseconds(0)) ==
             xe::threading::WaitResult::kSuccess) {
@@ -206,13 +207,24 @@ int AudioSystem::FindFreeClient() {
 
 void AudioSystem::Initialize() {}
 
-void AudioSystem::Shutdown() {
-  worker_running_ = false;
+void AudioSystem::StopWorkers() {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    stopping_ = true;
+    worker_running_ = false;
+  }
   pending_work_event_->Set();
+  resume_event_->Set();
+  pause_fence_.Signal();
   if (worker_thread_) {
     worker_thread_->Wait(0, 0, 0, nullptr);
     worker_thread_.reset();
   }
+  xma_decoder_->StopWorkers();
+}
+
+void AudioSystem::Shutdown() {
+  StopWorkers();
 
   // Unregister all active clients to shut down their audio drivers before
   // the semaphores are destroyed with this AudioSystem.
@@ -232,11 +244,16 @@ void AudioSystem::Shutdown() {
       }
     }
   }
+  xma_decoder_->Shutdown();
 }
 
 X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
                                      size_t* out_index) {
   auto global_lock = global_critical_region_.Acquire();
+
+  if (stopping_) {
+    return X_STATUS_THREAD_IS_TERMINATING;
+  }
 
   auto index = FindFreeClient();
   assert_true(index >= 0);
@@ -283,6 +300,9 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
   SCOPE_profile_cpu_f("apu");
 
   auto global_lock = global_critical_region_.Acquire();
+  if (stopping_) {
+    return;
+  }
   assert_true(index < kMaximumClientCount);
   if (index >= kMaximumClientCount || !clients_[index].in_use ||
       !clients_[index].driver) {
@@ -309,6 +329,9 @@ void AudioSystem::UnregisterClient(size_t index) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
+  if (stopping_ || index >= kMaximumClientCount || !clients_[index].in_use) {
+    return;
+  }
 
   std::lock_guard<std::mutex> guard(clients_[index].lock);
 
@@ -405,10 +428,13 @@ bool AudioSystem::Restore(ByteStream* stream) {
 }
 
 void AudioSystem::Pause() {
-  if (paused_) {
-    return;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (stopping_ || paused_) {
+      return;
+    }
+    paused_ = true;
   }
-  paused_ = true;
 
   pending_work_event_->Set();
   pause_fence_.Wait();

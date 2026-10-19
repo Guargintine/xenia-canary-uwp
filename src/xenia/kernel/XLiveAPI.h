@@ -10,8 +10,10 @@
 #ifndef XENIA_KERNEL_XLIVEAPI_H_
 #define XENIA_KERNEL_XLIVEAPI_H_
 
+#include <atomic>
 #include <future>
 #include <span>
+#include <stop_token>
 #include <unordered_set>
 
 #include "xenia/base/byte_order.h"
@@ -104,6 +106,8 @@ class XLiveAPI {
 
   InitState GetInitState() const;
 
+  bool HasInitializationStarted() const { return initialization_started_; }
+
   uint32_t GetNatType() const;
 
   bool IsConnectedToServer() const;
@@ -113,6 +117,7 @@ class XLiveAPI {
   int8_t GetVersionStatus() const;
 
   void clearXnaddrCache();
+  void ResetTitleState();
 
   void StartWhoamiAsync();
 
@@ -129,9 +134,10 @@ class XLiveAPI {
   bool UpdateQoSCache(const uint64_t sessionId,
                       const std::vector<uint8_t> qos_payloade);
 
-  void QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength);
+  void QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength,
+               std::stop_token stop = {});
 
-  response_data QoSGet(uint64_t sessionId);
+  response_data QoSGet(uint64_t sessionId, std::stop_token stop = {});
 
   void SessionModify(uint64_t sessionId, XGI_SESSION_MODIFY* data);
 
@@ -143,8 +149,7 @@ class XLiveAPI {
 
   bool SessionPropertiesSet(uint64_t session_id, const uint64_t xuid);
 
-  const std::vector<xam::Property> SessionPropertiesGet(uint64_t session_id,
-                                                        uint32_t query_id);
+  const std::vector<xam::Property> SessionPropertiesGet(uint64_t session_id);
 
   const std::unique_ptr<SessionObjectJSON> SessionDetails(uint64_t sessionId);
 
@@ -162,7 +167,7 @@ class XLiveAPI {
 
   void DeleteSession(uint64_t sessionId);
 
-  void DeleteAllSessionsByMac();
+  void DeleteAllSessionsByMac(uint32_t timeout = 0);
 
   void DeleteAllSessions();
 
@@ -292,7 +297,8 @@ class XLiveAPI {
 
   sockaddr_in online_ip_ = {};
 
-  InitState initialized_ = InitState::Pending;
+  std::atomic<InitState> initialized_ = InitState::Pending;
+  std::atomic<bool> initialization_started_ = false;
 
   bool xuid_mismatch_ = false;
 
@@ -313,13 +319,16 @@ class XLiveAPI {
   std::map<uint32_t, std::vector<uint8_t>> cached_gamerpics = {};
 
   std::unique_ptr<HTTPResponseObjectJSON> Get(const std::string endpoint,
-                                              const uint32_t timeout = 0);
+                                              const uint32_t timeout = 0,
+                                              std::stop_token stop = {});
 
   std::unique_ptr<HTTPResponseObjectJSON> Post(const std::string endpoint,
                                                const uint8_t* data,
-                                               size_t data_size = 0);
+                                               size_t data_size = 0,
+                                               std::stop_token stop = {});
 
-  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint);
+  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint,
+                                               uint32_t timeout = 0);
 
   std::vector<HTTPResponseObjectJSON> GetMulti(
       std::vector<std::string> urls, const uint32_t per_request_timeout = 0);

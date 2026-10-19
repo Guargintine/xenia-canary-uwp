@@ -8,6 +8,9 @@
  */
 
 #include "xenia/kernel/xam/ui/game_achievements_ui.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/kernel/xam/ui/friend_removal_confirmation.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -27,9 +30,13 @@ GameAchievementsUI::GameAchievementsUI(xe::ui::ImGuiDrawer* imgui_drawer,
 }
 
 GameAchievementsUI::~GameAchievementsUI() {
+#if !XE_PLATFORM_WINRT
   for (auto& entry : achievements_icons_) {
     entry.second.release();
   }
+#endif
+  // UWP retires the dialog before a later draw begins, after its last frame's
+  // raw icon IDs have been consumed. Its unique_ptrs can release normally.
 }
 
 bool GameAchievementsUI::LoadAchievementsData() {
@@ -172,6 +179,10 @@ void GameAchievementsUI::DrawTitleAchievementInfo(
 }
 
 void GameAchievementsUI::OnDraw(ImGuiIO& io) {
+#if XE_PLATFORM_WINRT
+  OnDrawGuide(io);
+  return;
+#endif
   ImGui::SetNextWindowPos(drawing_position_, ImGuiCond_FirstUseEver);
 
   const auto xenia_window_size = ImGui::GetMainViewport()->Size;
@@ -222,6 +233,84 @@ void GameAchievementsUI::OnDraw(ImGuiIO& io) {
 
   ImGui::End();
 };
+
+#if XE_PLATFORM_WINRT
+void GameAchievementsUI::OnDrawGuide(ImGuiIO& io) {
+  // Keep achievement icons alive until the frame that closed the guide has
+  // rendered. Closing the popup itself restores focus to the played-title list.
+  if (!guide_open_) {
+    Close();
+    return;
+  }
+  const std::string popup_name = fmt::format("Achievements##{}", window_id_);
+  if (!guide_initialized_) {
+    guide_initialized_ = true;
+    ImGui::OpenPopup(popup_name.c_str());
+  }
+  const auto presentation = xeMakeNetplayGuidePresentation(imgui_drawer());
+  if (!BeginFriendPopup(popup_name.c_str(), &guide_open_, 0, &presentation)) {
+    // Another modal may supersede this independently drawn dialog.
+    guide_open_ = false;
+    return;
+  }
+  if (ConsumeFriendPopupBackPress(&presentation)) {
+    guide_open_ = false;
+    ImGui::CloseCurrentPopup();
+    EndFriendPopup(&presentation);
+    return;
+  }
+
+  const bool focus_requested =
+      !guide_activation_armed_ && !FriendPopupOpeningInputHeld();
+  if (focus_requested) {
+    guide_activation_armed_ = true;
+  }
+  ImGui::BeginDisabled(!guide_activation_armed_);
+  if (focus_requested) {
+    ImGui::SetKeyboardFocusHere();
+  }
+  if (FriendPopupButton("Back", ImVec2(0, 0), &presentation)) {
+    guide_open_ = false;
+    ImGui::CloseCurrentPopup();
+    ImGui::EndDisabled();
+    EndFriendPopup(&presentation);
+    return;
+  }
+  ImGui::SetItemDefaultFocus();
+  const auto title_name = xe::to_utf8(title_info_.title_name);
+  ImGui::TextWrapped("%s", title_name.c_str());
+  ImGui::Checkbox("Show locked details", &show_locked_info_);
+  ImGui::Spacing();
+
+  if (achievements_info_.empty()) {
+    ImGui::TextWrapped("No achievements data is available.");
+  }
+  for (const auto& entry : achievements_info_) {
+    const auto* icon = GetIcon(entry);
+    const float icon_size =
+        std::min(xe::ui::default_image_icon_size.x,
+                 std::max(1.0f, ImGui::GetContentRegionAvail().x * 0.25f));
+    if (icon) {
+      ImGui::Image(reinterpret_cast<ImTextureID>(icon),
+                   ImVec2(icon_size, icon_size));
+    } else {
+      ImGui::Dummy(ImVec2(icon_size, icon_size));
+    }
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextWrapped("%s", GetAchievementTitle(entry).c_str());
+    ImGui::Text("%u G", entry.gamerscore);
+    ImGui::EndGroup();
+    ImGui::TextWrapped("%s", GetAchievementDescription(entry).c_str());
+    if (entry.IsUnlocked()) {
+      ImGui::TextWrapped("%s", GetUnlockedTime(entry).c_str());
+    }
+    ImGui::Spacing();
+  }
+  ImGui::EndDisabled();
+  EndFriendPopup(&presentation);
+}
+#endif
 
 }  // namespace ui
 }  // namespace xam

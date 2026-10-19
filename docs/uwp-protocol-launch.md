@@ -28,3 +28,13 @@ protocol activation replaces this return URI, so a later activation without
 `launchOnExit` does not return to an earlier frontend. Game paths are consumed
 once, and launches wait for emulator initialization, including when
 `skip_frontend` is enabled.
+
+When a game requests another XEX, Xenia saves the requested module and launch
+data and asks Xbox to restart the app automatically. The saved request takes
+precedence over the original frontend game path. The frontend return URI is
+carried in restart arguments and persisted for recovery if automatic restart
+fails. It is restored only with a saved title request and consumed once.
+
+An internal title restart does not launch the return URI. In-process disc swaps
+also preserve it. Closing the game or Xenia normally returns to the original
+frontend, including after multiple title restarts.

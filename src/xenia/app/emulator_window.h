@@ -11,21 +11,32 @@
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "xenia/app/gamerpic_browser.h"
+#include "xenia/app/game_patch_dialog.h"
+#include "xenia/app/game_title_update_dialog.h"
+#include "xenia/app/frontend_video_player.h"
 #include "xenia/app/netplay_settings_dialog.h"
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/app/updater.h"
 #include "xenia/app/updater_dialog.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/app/guide_dialog.h"
+#endif
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/kernel/xam/xam_loader_data.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/ui/host_guide_navigation.h"
 #include "xenia/ui/immediate_drawer.h"
 #include "xenia/ui/menu_item.h"
 #include "xenia/ui/presenter.h"
@@ -38,6 +49,9 @@ namespace xe {
 namespace app {
 
 class ConsoleSettingsDialog;
+class DsuIntegration;
+class ScreenScraperFrontend;
+namespace screenscraper { class Service; }
 class ContentListDialog;
 
 struct RecentTitleEntry {
@@ -96,6 +110,13 @@ class EmulatorWindow {
   void ShutdownGraphicsSystemPresenterPainting();
 
   void OnEmulatorInitialized();
+#if XE_PLATFORM_WINRT
+  void ShutdownDsu();
+  void WaitForTitleClose();
+  void SelectRemoteGame(const std::filesystem::path& path, const std::string& name);
+  std::filesystem::path SelectedFrontendGame() const;
+  screenscraper::Service& screen_scraper_service();
+#endif
 
   xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file);
   void UpdateTitle();
@@ -116,7 +137,9 @@ class EmulatorWindow {
   void ToggleXMPConfigDialog();
   void ToggleConsoleSettingsDialog();
   void ToggleContentListDialog();
-  void ToggleFriendsDialog();
+  // Toggles the content list for one title ID, 0 lists all.
+  void ToggleContentListDialogForTitle(uint32_t title_id);
+  void ToggleFriendsDialog(bool guide_style = false);
   void ToggleUpdaterDialog();
   void ToggleCompletionDialog();
   void ToggleNetplaySettingsDialog();
@@ -125,6 +148,9 @@ class EmulatorWindow {
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
 
   void ExtractContent(const std::filesystem::path file = "");
+  // Extracts the packages into extract_dir with a progress dialog.
+  void ExtractContentTo(const std::vector<std::filesystem::path>& package_files,
+                        const std::filesystem::path& extract_dir);
 
   // Types of button functions for hotkeys.
   enum class ButtonFunctions {
@@ -226,6 +252,10 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
     std::shared_ptr<std::vector<Emulator::ContentInstallEntry>>
         installation_entries_;
+#if XE_PLATFORM_WINRT
+    GuideDialogState guide_state_;
+    bool guide_popup_opened_ = false;
+#endif
   };
 
   class DisplayConfigDialog final : public ui::ImGuiDialog {
@@ -263,12 +293,15 @@ class EmulatorWindow {
 
 #if XE_PLATFORM_WINRT
   enum class HostGuideAction {
-    kClose,
-    kFriends,
+    kContinue,
+    kFriends = 1,
     kProfiles,
     kNetworkSettings,
     kNetworkStatus,
     kGamerpics,
+    kRestartGame,
+    kQuitGame,
+    kExitXenia,
   };
 
   class WinRTHostGuideDialog final : public ui::ImGuiDialog {
@@ -276,7 +309,9 @@ class EmulatorWindow {
 
    public:
     WinRTHostGuideDialog(ui::ImGuiDrawer* drawer, EmulatorWindow& window)
-        : ui::ImGuiDialog(drawer), emulator_window_(window) {}
+        : ui::ImGuiDialog(drawer),
+          emulator_window_(window),
+          background_dialog_count_(drawer->GetDialogCount() - 1) {}
 
    protected:
     void OnDraw(ImGuiIO& io) override;
@@ -284,21 +319,41 @@ class EmulatorWindow {
 
    private:
     EmulatorWindow& emulator_window_;
-    HostGuideAction selected_action_ = HostGuideAction::kClose;
+    HostGuideNavigation navigation_;
+    size_t background_dialog_count_ = 0;
     bool focus_requested_ = true;
+    std::optional<HostGuideAction> close_action_;
     std::shared_ptr<ui::ImmediateTexture> background_;
+    std::string background_texture_path_;
     std::shared_ptr<ui::ImmediateTexture> button_a_;
     std::shared_ptr<ui::ImmediateTexture> button_b_;
   };
 
+  void BeginTitleClose(
+      std::optional<kernel::xam::LoaderData> restart = std::nullopt);
+  void CompleteTitleClose();
   void ShowHostGuide();
-  void HostGuideClosed(WinRTHostGuideDialog* dialog, HostGuideAction action);
+  void HostGuideClosed(WinRTHostGuideDialog* dialog);
+  void HostGuideOpenPage(WinRTHostGuideDialog* dialog, HostGuideAction action);
+  void ExecuteHostGuideAction(HostGuideAction action);
 
   class WinRTFrontendDialog final : public ui::ImGuiDialog {
    public:
     WinRTFrontendDialog(ui::ImGuiDrawer* imgui_drawer,
                         EmulatorWindow& emulator_window)
         : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+    ~WinRTFrontendDialog() override;
+    void SelectRemoteGame(const std::string& path, const std::string& name) {
+      selected_game_path_ = path;
+      selected_game_name_ = name;
+      show_search_panel_ = false;
+      search_panel_list_focus_requested_ = false;
+      search_selected_game_path_.clear();
+      active_frontend_page_ = FrontendPage::kGameList;
+      remote_focus_requested_ = true;
+    }
+    const std::string& selected_path() const { return selected_game_path_; }
+    void StopVideoBackground();
 
    protected:
     void OnDraw(ImGuiIO& io) override;
@@ -354,11 +409,28 @@ class EmulatorWindow {
       std::string value;
     };
 
-    bool EnablePatchesForTitle(const std::filesystem::path& patches_dir,
-                               const std::string& title_id);
+    void OpenPatchEditor(const std::filesystem::path& directory,
+                         const std::string& title_id);
+    std::shared_ptr<int> async_lifetime_ = std::make_shared<int>(0);
+    std::unique_ptr<GamePatchDialog> patch_editor_;
+    std::unique_ptr<GameTitleUpdateDialog> title_update_dialog_;
+    enum class StorageFolderTarget { kPrimaryGames, kAdditionalGames, kConfig, kMedia };
+    struct StorageFolderResult {
+      std::mutex mutex;
+      StorageFolderTarget target;
+      bool ready = false;
+      std::string path;
+      std::string error;
+    };
+    void ApplyStorageFolder(StorageFolderTarget target, const std::string& path);
+    void PickStorageFolder(StorageFolderTarget target);
+    void CompleteStorageFolderPicker();
     void DrawNoProfilePrompt(ImGuiIO& io);
 
     std::shared_ptr<ui::ImmediateTexture> GetOrCreateBackground();
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateThemeTexture(
+        const std::string& path, std::string& loaded_path,
+        std::shared_ptr<ui::ImmediateTexture>& texture);
     std::shared_ptr<ui::ImmediateTexture> GetOrCreateBackgroundFallback();
     std::shared_ptr<ui::ImmediateTexture> GetOrCreateImageTexture(
         const std::string& image_path);
@@ -369,14 +441,28 @@ class EmulatorWindow {
     std::shared_ptr<ui::ImmediateTexture> background_tex_;
     std::shared_ptr<ui::ImmediateTexture> background_fallback_tex_;
     std::shared_ptr<ui::ImmediateTexture> xenia_logo_tex_;
+    std::string background_texture_path_;
+    std::string background_fallback_texture_path_;
+    std::string xenia_logo_texture_path_;
     std::shared_ptr<ui::ImmediateTexture> button_a_tex_;
     std::shared_ptr<ui::ImmediateTexture> button_b_tex_;
     std::shared_ptr<ui::ImmediateTexture> button_x_tex_;
     std::shared_ptr<ui::ImmediateTexture> button_y_tex_;
-    std::string selected_path_;
+    std::unique_ptr<FrontendVideoPlayer> background_video_;
+    std::shared_ptr<ui::ImmediateTexture> background_video_texture_;
+    std::string background_video_path_;
+    std::string background_video_error_;
+    uint64_t artwork_revision_ = 0;
+    std::shared_ptr<StorageFolderResult> storage_folder_result_;
+    std::string storage_path_status_;
+    bool storage_focus_requested_ = false;
+    bool remote_focus_requested_ = false;
     std::string selected_game_path_;
     std::string selected_game_name_;
-    bool show_path_warning_ = false;
+    std::string metadata_scroll_path_;
+    double metadata_scroll_elapsed_ = 0;
+    float metadata_scroll_range_ = 0;
+    int metadata_scroll_frame_ = -1;
     FrontendPage active_frontend_page_ = FrontendPage::kGameList;
     bool show_action_status_ = false;
     std::string action_status_;
@@ -524,6 +610,10 @@ class EmulatorWindow {
   std::atomic<bool> cancel_request;
 #if XE_PLATFORM_WINRT
   std::unique_ptr<EmulatorWindow::WinRTFrontendDialog> gamelist_;
+  std::unique_ptr<DsuIntegration> dsu_;
+  std::unique_ptr<ScreenScraperFrontend> screenscraper_;
+  std::future<X_STATUS> title_close_result_;
+  std::optional<kernel::xam::LoaderData> title_restart_data_;
   std::unique_ptr<WinRTHostGuideDialog> host_guide_;
   std::shared_ptr<int> host_guide_lifetime_ = std::make_shared<int>(0);
 #endif

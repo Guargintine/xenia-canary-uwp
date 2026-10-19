@@ -1,0 +1,10 @@
+FFmpeg 6.0, commit ea3d24bbe3c58b171e55fe2151fc7ffaca3ab3d2
+Licensed under LGPL 2.1 or later; see LICENSE.txt.
+
+Corresponding source is included in:
+source/ffmpeg-ea3d24bbe3c58b171e55fe2151fc7ffaca3ab3d2.tar.gz
+Upstream: https://github.com/FFmpeg/FFmpeg
+
+Local modifications are in ffmpeg-winrt.patch and
+ffmpeg-uwp-mf-encoder.patch. build.ps1 applies both patches and contains
+the build configuration. SHA256SUMS records the distributed inputs.

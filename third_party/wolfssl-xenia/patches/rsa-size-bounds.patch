@@ -1,0 +1,86 @@
+--- a/wolfssl/wolfcrypt/sp_int.h
++++ b/wolfssl/wolfcrypt/sp_int.h
+@@ -786,6 +786,10 @@
+ #define MP_BITS_CNT(bits)                                       \
+         ((((bits) + SP_WORD_SIZE - 1) / SP_WORD_SIZE) * 2 + 1)
+ 
++/* Compare the digit-rounded storage required by the input and maximum. */
++#define MP_BITS_OVER_MAX(bits, max) \
++    (MP_BITS_CNT(bits) > MP_BITS_CNT(max))
++
+ #ifdef WOLFSSL_SMALL_STACK
+ /*
+  * Dynamic memory allocation of mp_int.
+@@ -837,9 +841,12 @@
+ #define DECL_MP_INT_SIZE(name, bits)                            \
+     unsigned char name##d[MP_INT_SIZEOF(MP_BITS_CNT(bits))];    \
+     sp_int* (name) = (sp_int*)name##d
+-/* Zero out mp_int of minimal size. */
++/* Never clear more than the declared static digit buffer. */
++#define MP_INT_ZERO_SIZE(name, bits)                                      \
++    ((sizeof(name##d) < MP_INT_SIZEOF(MP_BITS_CNT(bits))) ?                 \
++        sizeof(name##d) : MP_INT_SIZEOF(MP_BITS_CNT(bits)))
+ #define NEW_MP_INT_SIZE(name, bits, heap, type) \
+-    XMEMSET(name, 0, MP_INT_SIZEOF(MP_BITS_CNT(bits)))
++    XMEMSET((name), 0, MP_INT_ZERO_SIZE(name, bits))
+ /* Dispose of static mp_int. */
+ #define FREE_MP_INT_SIZE(name, heap, type) WC_DO_NOTHING
+ /* Type to force compiler to not complain about size. */
+--- a/wolfcrypt/src/rsa.c
++++ b/wolfcrypt/src/rsa.c
+@@ -49,6 +49,11 @@
+ 
+ #include <wolfssl/wolfcrypt/rsa.h>
+ 
++/* The other integer implementations allocate full-sized temporaries. */
++#ifndef MP_BITS_OVER_MAX
++    #define MP_BITS_OVER_MAX(bits, max) 0
++#endif
++
+ #ifdef WOLFSSL_AFALG_XILINX_RSA
+ #include <wolfssl/wolfcrypt/port/af_alg/wc_afalg.h>
+ #endif
+@@ -691,6 +696,10 @@
+         return 0;
+     }
+ #endif
++
++    if (MP_BITS_OVER_MAX(mp_bitsused(&key->n), RSA_MAX_SIZE)) {
++        return WC_KEY_SIZE_E;
++    }
+ 
+ #ifdef WOLFSSL_SMALL_STACK
+     rng = (WC_RNG*)XMALLOC(sizeof(WC_RNG), NULL, DYNAMIC_TYPE_RNG);
+@@ -2499,6 +2508,10 @@
+     DECL_MP_INT_SIZE_DYN(rndi, mp_bitsused(&key->n), RSA_MAX_SIZE);
+ #endif /* WC_RSA_BLINDING && !WC_NO_RNG */
+ 
++    if (MP_BITS_OVER_MAX(mp_bitsused(&key->n), RSA_MAX_SIZE)) {
++        return WC_KEY_SIZE_E;
++    }
++
+     (void)rng;
+ 
+ #if defined(WC_RSA_BLINDING) && !defined(WC_NO_RNG)
+@@ -2649,6 +2662,10 @@
+ {
+     DECL_MP_INT_SIZE_DYN(tmp, mp_bitsused(&key->n), RSA_MAX_SIZE);
+     int    ret = 0;
++
++    if (MP_BITS_OVER_MAX(mp_bitsused(&key->n), RSA_MAX_SIZE)) {
++        return WC_KEY_SIZE_E;
++    }
+ 
+     (void)rng;
+ 
+@@ -3043,6 +3060,10 @@
+ {
+     int ret = 0;
+     DECL_MP_INT_SIZE_DYN(c, mp_bitsused(&key->n), RSA_MAX_SIZE);
++
++    if (MP_BITS_OVER_MAX(mp_bitsused(&key->n), RSA_MAX_SIZE)) {
++        return WC_KEY_SIZE_E;
++    }
+ 
+     NEW_MP_INT_SIZE(c, mp_bitsused(&key->n), key->heap, DYNAMIC_TYPE_RSA);
+ #ifdef MP_INT_SIZE_CHECK_NULL

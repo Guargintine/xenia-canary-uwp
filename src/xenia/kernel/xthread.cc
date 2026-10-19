@@ -83,7 +83,9 @@ XThread::~XThread() {
   kernel_state_->UnregisterThread(this);
 
   // Notify processor of our impending destruction.
-  emulator()->processor()->OnThreadDestroyed(thread_id_);
+  if (registered_with_processor_) {
+    emulator()->processor()->OnThreadDestroyed(thread_id_);
+  }
 
   thread_.reset();
 
@@ -311,6 +313,9 @@ void XThread::FreeStack() {
 }
 
 X_STATUS XThread::Create() {
+  std::lock_guard creation_lock(creation_mutex_);
+  if (shutdown_requested_) return X_STATUS_UNSUCCESSFUL;
+
   // Thread kernel object.
   if (!CreateNative<X_KTHREAD>()) {
     XELOGW("Unable to allocate thread object");
@@ -417,6 +422,12 @@ X_STATUS XThread::Create() {
 
   params.stack_size = 16_MiB;  // Allocate a big host stack.
   thread_ = xe::threading::Thread::Create(params, [this]() {
+    auto expected = StartState::kPending;
+    if (!start_state_.compare_exchange_strong(expected, StartState::kStarted)) {
+      emulator()->processor()->OnThreadExit(thread_id_);
+      ReleaseHandle();
+      return;
+    }
     // Set thread ID override. This is used by logging.
     xe::threading::set_current_thread_id(handle());
 
@@ -432,6 +443,7 @@ X_STATUS XThread::Create() {
     cpu::ThreadState::Bind(this->thread_state());
     running_ = true;
     Execute();
+    start_state_ = StartState::kExiting;
     running_ = false;
     current_thread_ = nullptr;
     current_xthread_tls_ = nullptr;
@@ -463,6 +475,7 @@ X_STATUS XThread::Create() {
 
   // Notify processor of our creation.
   emulator()->processor()->OnThreadCreated(handle(), thread_state_, this);
+  registered_with_processor_ = true;
 
   if ((creation_params_.creation_flags & X_CREATE_SUSPENDED) == 0) {
     // Start the thread now that we're all setup.
@@ -510,6 +523,7 @@ X_STATUS XThread::Exit(int exit_code) {
   current_thread_ = nullptr;
   xe::Profiler::ThreadExit();
 
+  start_state_ = StartState::kExiting;
   running_ = false;
   ReleaseHandle();
 
@@ -529,6 +543,7 @@ X_STATUS XThread::Terminate(int exit_code) {
   // Notify processor of our exit.
   emulator()->processor()->OnThreadExit(thread_id_);
 
+  start_state_ = StartState::kExiting;
   running_ = false;
   if (XThread::IsInThread(this)) {
     ReleaseHandle();
@@ -539,6 +554,66 @@ X_STATUS XThread::Terminate(int exit_code) {
   }
 
   return X_STATUS_SUCCESS;
+}
+
+bool XThread::TerminateForTitleShutdown() {
+  std::lock_guard creation_lock(creation_mutex_);
+  shutdown_requested_ = true;
+  if (!thread_) return true;
+
+  const auto finished = [this] {
+    return xe::threading::Wait(thread_.get(), false,
+                               std::chrono::milliseconds::zero());
+  };
+  auto status = finished();
+  if (status == xe::threading::WaitResult::kSuccess) return true;
+  if (status != xe::threading::WaitResult::kTimeout) return false;
+
+  auto expected = StartState::kPending;
+  const bool cancelled = start_state_.compare_exchange_strong(
+      expected, StartState::kCancelled);
+  const auto resume_until_finished = [this, &finished] {
+    uint32_t suspend_count = 1;
+    while (suspend_count) {
+      if (!thread_->Resume(&suspend_count)) {
+        return finished() == xe::threading::WaitResult::kSuccess;
+      }
+    }
+    return xe::threading::Wait(thread_.get(), false) ==
+           xe::threading::WaitResult::kSuccess;
+  };
+  if (cancelled || expected == StartState::kCancelled) {
+    return resume_until_finished();
+  }
+
+  while (!running_ && start_state_ != StartState::kExiting) {
+    uint32_t suspend_count = 1;
+    while (suspend_count) {
+      if (!thread_->Resume(&suspend_count)) {
+        return finished() == xe::threading::WaitResult::kSuccess;
+      }
+    }
+    status = xe::threading::Wait(thread_.get(), false,
+                                 std::chrono::milliseconds(1));
+    if (status == xe::threading::WaitResult::kSuccess) return true;
+    if (status != xe::threading::WaitResult::kTimeout) return false;
+  }
+  bool suspended;
+  {
+    auto global_lock = xe::global_critical_region::AcquireDirect();
+    suspended = thread_->Suspend();
+  }
+  if (!suspended) {
+    return finished() == xe::threading::WaitResult::kSuccess;
+  }
+  if (start_state_ == StartState::kExiting) return resume_until_finished();
+  if (!emulator()->processor()->StepToGuestSafePoint(thread_id_)) {
+    XELOGE("Could not stop guest thread {:08X} at a safe point", thread_id_);
+    return false;
+  }
+  if (XFAILED(Terminate(0))) return false;
+  return xe::threading::Wait(thread_.get(), false) ==
+         xe::threading::WaitResult::kSuccess;
 }
 
 void XThread::Execute() {
@@ -1179,6 +1254,13 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     params.create_suspended = true;  // Not done restoring yet.
     params.stack_size = 16_MiB;
     thread->thread_ = xe::threading::Thread::Create(params, [thread, state]() {
+      auto expected = StartState::kPending;
+      if (!thread->start_state_.compare_exchange_strong(expected,
+                                                       StartState::kStarted)) {
+        thread->emulator()->processor()->OnThreadExit(thread->thread_id_);
+        thread->ReleaseHandle();
+        return;
+      }
       // Set thread ID override. This is used by logging.
       xe::threading::set_current_thread_id(thread->handle());
 
@@ -1205,6 +1287,8 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
       uint32_t pc = state.context.pc;
       thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_, pc);
 
+      thread->start_state_ = StartState::kExiting;
+      thread->running_ = false;
       current_thread_ = nullptr;
       current_xthread_tls_ = nullptr;
 
@@ -1218,6 +1302,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
     // Notify processor we were recreated.
     thread->emulator()->processor()->OnThreadCreated(
         thread->handle(), thread->thread_state(), thread);
+    thread->registered_with_processor_ = true;
   }
 
   return object_ref<XThread>(thread);

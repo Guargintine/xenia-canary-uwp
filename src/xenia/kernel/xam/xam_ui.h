@@ -22,6 +22,10 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
+namespace ui {
+struct FriendDialogPresentation;
+}
+
 class XamDialog : public xe::ui::ImGuiDialog {
  public:
   void set_close_callback(std::function<void()> close_callback) {
@@ -125,29 +129,36 @@ bool xeDrawProfileContent(xe::ui::ImGuiDrawer* imgui_drawer,
                           std::function<void()> on_profile_change,
                           uint64_t* selected_xuid, bool request_focus = false);
 
+ui::FriendDialogPresentation xeMakeNetplayGuidePresentation(
+    xe::ui::ImGuiDrawer* imgui_drawer);
+
 bool xeDrawFriendsContent(
     xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
     ui::FriendsContentArgs& args, std::vector<X_ONLINE_FRIEND>& presences,
     std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>&
         immediate_gamerpics);
 
-bool xeDrawFriendContent(xe::ui::ImGuiDrawer* imgui_drawer,
-                         UserProfile* profile,
-                         std::shared_ptr<xe::ui::ImmediateTexture> icon_texture,
-                         const X_ONLINE_FRIEND& presence,
-                         uint64_t* selected_xuid_, uint64_t* removed_xuid_);
+bool xeDrawFriendContent(
+    xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
+    std::shared_ptr<xe::ui::ImmediateTexture> icon_texture,
+    const X_ONLINE_FRIEND& presence, uint64_t* selected_xuid_,
+    uint64_t* removed_xuid_,
+    const ui::FriendDialogPresentation* presentation = nullptr);
 
-bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
-                     ui::AddFriendArgs& args);
+bool xeDrawAddFriend(
+    xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
+    ui::AddFriendArgs& args,
+    const ui::FriendDialogPresentation* presentation = nullptr);
 
 bool xeDrawSessionsContent(
     xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
     ui::SessionsContentArgs& sessions_args,
     std::vector<std::unique_ptr<SessionObjectJSON>>* sessions);
 
-bool xeDrawSessionContent(xe::ui::ImGuiDrawer* imgui_drawer,
-                          UserProfile* profile,
-                          std::unique_ptr<SessionObjectJSON>& session);
+bool xeDrawSessionContent(
+    xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
+    std::unique_ptr<SessionObjectJSON>& session,
+    const ui::FriendDialogPresentation* presentation = nullptr);
 
 bool xeDrawMyDeletedProfiles(xe::ui::ImGuiDrawer* imgui_drawer,
                              ui::MyDeletedProfilesArgs& args,
