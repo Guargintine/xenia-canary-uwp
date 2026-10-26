@@ -33,9 +33,9 @@ jobs:
       - name: Fetch submodules
         shell: pwsh
         run: |
-          # Not used by the UWP build: the aarch64 JIT, the shader compiler
-          # sources (bytecode is checked in) and the lint tool.
-          $skip = @('third_party/xbyak_aarch64', 'third_party/DirectXShaderCompiler', 'third_party/cpplint')
+          # Not used by the UWP build: the aarch64 JIT and the lint tool.
+          # (DirectXShaderCompiler stays: the D3D12 code includes dxcapi.h.)
+          $skip = @('third_party/xbyak_aarch64', 'third_party/cpplint')
           $paths = git config -f .gitmodules --get-regexp 'submodule\..*\.path' |
             ForEach-Object { ($_ -split ' ', 2)[1] } |
             Where-Object { $skip -notcontains $_ }
