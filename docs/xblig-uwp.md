@@ -16,9 +16,11 @@ Club packages) in the UWP app for Xbox One / Series consoles in Developer Mode.
   XamContentFlush and content fixes, missing XAM exports, and the storage
   device notification fix.
 - UWP changes:
-  - The user mode alias space uses `VirtualAlloc2FromApp` and
-    `MapViewOfFile3FromApp`, like `MapFileView` already does in the app
-    container.
+  - The user mode alias space falls back to `VirtualAlloc2FromApp` and
+    `MapViewOfFile3FromApp` in builds without the desktop or games API
+    partitions. Current SDKs expose the desktop functions to UWP games (the
+    GAMES partition), so this build uses `VirtualAlloc2` and `MapViewOfFile3`,
+    like the rest of Xenia's memory code.
   - The launcher is looked for in `<storage root>\XNA\Xna_TitleLauncher.xex`
     and in an `XNA` folder next to the indie game package, not only in the
     working directory (read only on UWP).
@@ -31,21 +33,26 @@ Club packages) in the UWP app for Xbox One / Series consoles in Developer Mode.
 
 ## Setup on the console
 
-The storage root is the app's `LocalState` folder (Device Portal, File
-explorer, `LocalAppData\XeniaXBLIG.Experimental_<id>\LocalState`).
+Everything below can go on internal storage through Device Portal's File
+explorer. The app's storage root is its `LocalState` folder:
+`LocalAppData\XeniaXBLIG.Experimental_t2rrnbpbeykme\LocalState`.
 
 1. `Xna_TitleLauncher.xex` from the Xbox 360 system update (USB update
    package, `$SystemUpdate`). Put it in a folder of its own, because that
-   folder is mounted as `game:`. Either:
-   - `LocalState\XNA\`, or
-   - an `XNA` folder next to the indie games, e.g. `E:\Indie\XNA\`, or
-   - any path, set as `xna_host_path` in the config.
+   folder is mounted as `game:`. The app looks in `LocalState\XNA\`, then in
+   an `XNA` folder next to the indie game package, e.g.
+   `DevelopmentFiles\Games\xbox360\Indie\XNA\`. Setting `xna_host_path` in
+   the config replaces both (a relative path resolves against the storage
+   root).
 2. The XNA runtime title update `tu32000100_00000000` for 584E07D2, dumped
-   from your own console. Install it once: select any game in the library,
-   Manage DLC, pick the file. It lands in
-   `LocalState\content\0000000000000000\584E07D2\000B0000`.
-3. Indie game packages go in a game folder like any other title. Launching
-   one installs it as content and boots the launcher with it.
+   from your own console. Copy it to
+   `LocalState\content\0000000000000000\584E07D2\000B0000\`, or install it
+   with Manage DLC on any game if the file picker can reach it.
+3. Indie game packages go in a game folder like any other title, e.g.
+   `DevelopmentFiles\Games\xbox360\Indie\` with the Games directory set to
+   `D:/DevelopmentFiles/Games/xbox360` in the app's settings (or a USB drive
+   under the default `E:/Games/xbox360`). Launching one installs it as content
+   and boots the launcher with it.
 
 Config:
 
