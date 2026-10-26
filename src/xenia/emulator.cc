@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <future>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -39,6 +40,7 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -68,6 +70,11 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
 
+#if XE_PLATFORM_WINRT
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Storage.Pickers.h>
+#endif
+
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
               "General");
@@ -95,6 +102,8 @@ DEFINE_int32(priority_class, 0,
 
 DECLARE_int32(console_type);
 
+DECLARE_bool(upnp);
+
 namespace xe {
 using namespace xe::literals;
 
@@ -114,6 +123,7 @@ Emulator::Emulator(const std::filesystem::path& command_line,
     : on_launch(),
       on_terminate(),
       on_exit(),
+      on_presence_change(),
       command_line_(command_line),
       storage_root_(storage_root),
       content_root_(content_root),
@@ -142,7 +152,17 @@ Emulator::Emulator(const std::filesystem::path& command_line,
     }
   }
 
-#if XE_PLATFORM_WIN32 == 1
+  xbox_live_api_ = std::make_unique<kernel::XLiveAPI>();
+  network_adapter_manager_ = std::make_unique<kernel::NetworkAdapterManager>();
+  upnp_ = std::make_unique<kernel::UPnP>();
+
+  network_adapter_manager_->Initialize();
+
+  if (cvars::upnp) {
+    upnp_->Initialize();
+  }
+
+#if XE_PLATFORM_WIN32 == 1 && !XE_PLATFORM_WINRT
   // Show a disclaimer that links to the quickstart
   // guide the first time they ever open the emulator
   uint64_t persistent_flags = GetPersistentEmulatorFlags();
@@ -188,6 +208,9 @@ Emulator::~Emulator() {
   processor_.reset();
 
   export_resolver_.reset();
+
+  upnp_.reset();
+  network_adapter_manager_.reset();
 
   ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);
 }
@@ -478,18 +501,23 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   FILE* file = xe::filesystem::OpenFile(path, "rb");
 
   if (!file) {
-    return FileSignatureType::Unknown;
+    return Emulator::FileSignatureType::Unknown;
   }
 
-  const uint64_t file_size = std::filesystem::file_size(path);
+  std::error_code size_error;
+  const uint64_t file_size = std::filesystem::file_size(path, size_error);
   constexpr int64_t header_size = 4;
 
-  if (file_size < header_size) {
-    return FileSignatureType::Unknown;
+  if (size_error || file_size < header_size) {
+    fclose(file);
+    return Emulator::FileSignatureType::Unknown;
   }
 
   char file_magic[header_size];
-  fread(file_magic, sizeof(file_magic), 1, file);
+  if (fread(file_magic, sizeof(file_magic), 1, file) != 1) {
+    fclose(file);
+    return FileSignatureType::Unknown;
+  }
 
   fourcc_t magic_value =
       make_fourcc(file_magic[0], file_magic[1], file_magic[2], file_magic[3]);
@@ -506,21 +534,21 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
     case xe::cpu::kXEX25Signature:
       return FileSignatureType::XEX25;
     case xe::cpu::kXEX1Signature:
-      return FileSignatureType::XEX1;
+      return Emulator::FileSignatureType::XEX1;
     case xe::cpu::kXEX2Signature:
-      return FileSignatureType::XEX2;
+      return Emulator::FileSignatureType::XEX2;
     case xe::vfs::kCONSignature:
-      return FileSignatureType::CON;
+      return Emulator::FileSignatureType::CON;
     case xe::vfs::kLIVESignature:
-      return FileSignatureType::LIVE;
+      return Emulator::FileSignatureType::LIVE;
     case xe::vfs::kPIRSSignature:
-      return FileSignatureType::PIRS;
+      return Emulator::FileSignatureType::PIRS;
     case xe::vfs::kXSFSignature:
       return FileSignatureType::XISO;
     case xe::cpu::kXBESignature:
       return FileSignatureType::XBE;
     case xe::cpu::kElfSignature:
-      return FileSignatureType::ELF;
+      return Emulator::FileSignatureType::ELF;
     default:
       break;
   }
@@ -528,19 +556,25 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   magic_value = make_fourcc(file_magic[0], file_magic[1], 0, 0);
 
   if (xe::kernel::kEXESignature == magic_value) {
-    return FileSignatureType::EXE;
+    return Emulator::FileSignatureType::EXE;
   }
 
   file = xe::filesystem::OpenFile(path, "rb");
-  xe::filesystem::Seek(file, -header_size, SEEK_END);
-  fread(file_magic, 1, header_size, file);
+  if (!file) {
+    return FileSignatureType::Unknown;
+  }
+  if (!xe::filesystem::Seek(file, -header_size, SEEK_END) ||
+      fread(file_magic, 1, header_size, file) != header_size) {
+    fclose(file);
+    return FileSignatureType::Unknown;
+  }
   fclose(file);
 
   magic_value =
       make_fourcc(file_magic[0], file_magic[1], file_magic[2], file_magic[3]);
 
   if (xe::vfs::kZarMagic == magic_value) {
-    return FileSignatureType::ZAR;
+    return Emulator::FileSignatureType::ZAR;
   }
 
   // Check if XISO
@@ -550,11 +584,16 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   XELOGI("Checking for XISO");
 
   if (device->Initialize()) {
-    return FileSignatureType::XISO;
+    return Emulator::FileSignatureType::XISO;
   }
 
   XELOGE("{}: {} ({:08X})", __func__, path.extension(), magic_value);
-  return FileSignatureType::Unknown;
+  return Emulator::FileSignatureType::Unknown;
+}
+
+Emulator::FileSignatureType GetFileSignature(
+    const std::filesystem::path& path) {
+  return Emulator::GetFileSignature(path);
 }
 
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
@@ -917,6 +956,18 @@ X_STATUS Emulator::InstallContentPackage(
     const std::filesystem::path& path, ContentInstallEntry& installation_info) {
   installation_info.installation_state_ = InstallState::preparing;
 
+  // Callers may install directly without first presenting the package details.
+  // Populate the current ContentManager installation paths in that case.
+  if (installation_info.data_installation_path_.empty()) {
+    X_STATUS header_result =
+        ProcessContentPackageHeader(path, installation_info);
+    if (XFAILED(header_result)) {
+      installation_info.installation_state_ = InstallState::failed;
+      return header_result;
+    }
+    installation_info.installation_state_ = InstallState::preparing;
+  }
+
   auto package =
       kernel_state_->content_manager()->OpenAndMountPackage(path, "");
 
@@ -1166,6 +1217,21 @@ X_STATUS Emulator::CreateZarchivePackage(
   return X_STATUS_SUCCESS;
 }
 
+void Emulator::DumpXLast() {
+  if (game_info_database_) {
+    if (game_info_database_->GetXLast()) {
+      const std::string title_ver =
+          title_version().empty() ? "" : " - " + title_version();
+      const std::string filename =
+          fmt::format("{:08X}{}.xml", title_id(), title_ver);
+
+      game_info_database_->GetXLast()->Dump(storage_root() / filename);
+    } else {
+      XELOGI("XLast data not found");
+    }
+  }
+}
+
 void Emulator::Pause() {
   if (paused_) {
     return;
@@ -1326,6 +1392,37 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
 
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
+#if XE_PLATFORM_WINRT
+  // Disc swapping is requested by a guest thread. The picker must be created
+  // on the UI thread while the guest waits for its asynchronous result.
+  if (!display_window_ || display_window_->app_context().IsInUIThread()) {
+    return {};
+  }
+  auto result = std::make_shared<std::promise<std::filesystem::path>>();
+  auto future = result->get_future();
+  if (!display_window_->app_context().CallInUIThread([result]() {
+        try {
+          winrt::Windows::Storage::Pickers::FileOpenPicker picker;
+          picker.FileTypeFilter().Append(L"*");
+          picker.PickSingleFileAsync().Completed([result](const auto& operation,
+                                                          const auto&) {
+            try {
+              auto file = operation.GetResults();
+              result->set_value(file
+                                    ? std::filesystem::path(file.Path().c_str())
+                                    : std::filesystem::path());
+            } catch (const winrt::hresult_error&) {
+              result->set_value({});
+            }
+          });
+        } catch (const winrt::hresult_error&) {
+          result->set_value({});
+        }
+      })) {
+    return {};
+  }
+  return future.get();
+#else
   std::filesystem::path path = "";
 
   auto file_picker = xe::ui::FilePicker::Create();
@@ -1348,6 +1445,7 @@ const std::filesystem::path Emulator::GetNewDiscPath(
     }
   }
   return path;
+#endif
 }
 
 bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
@@ -1441,6 +1539,9 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     });
   }
 
+  GetXboxLiveAPI()->DeleteAllSessionsByMac();
+  kernel_state()->xam_state()->StopPeriodicMaintenance();
+
   // Now suspend ourself (we should be a guest thread).
   current_thread->Suspend(nullptr);
 
@@ -1463,6 +1564,17 @@ void Emulator::WaitUntilExit() {
     }
   }
 
+#if XE_PLATFORM_WINRT
+  // A restore replaces the main thread inside the loop. Reset title state only
+  // after the final exit, and avoid repeating TerminateTitle's notification.
+  main_thread_ = nullptr;
+  if (is_title_open()) {
+    title_id_ = std::nullopt;
+    title_name_.clear();
+    title_version_.clear();
+    on_terminate();
+  }
+#endif
   on_exit();
 }
 
@@ -1654,6 +1766,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     kernel_state_->xam_state()->LoadSpaInfo(db.get());
 
     kernel_state_->xam_state()->user_tracker()->AddTitleToPlayedList();
+    kernel_state_->xam_state()->user_tracker()->AddDefaultProperties();
+    kernel_state_->xam_state()->user_tracker()->AddDefaultContexts();
 
     if (game_info_database_->IsValid()) {
       title_name_ = game_info_database_->GetTitleName(static_cast<XLanguage>(
@@ -1822,6 +1936,20 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                        module->hash().value());
     }
   }
+
+  if (cvars::upnp) {
+    upnp_->Start();
+  }
+
+  // 565507E0, and 415607F2 don't call XNetStartup or WSAStartup.
+  // Initialize server connection ourself.
+  // Titles can still be logged into Xbox-Live even if network layer isn't
+  // initialized.
+  // Initialize before title calls any XNet functions that depend on XNADDR e.g.
+  // NetDll_XNetGetTitleXnAddr
+  kernel_state()->GetXboxLiveAPI()->Init();
+
+  kernel_state()->xam_state()->StartPeriodicMaintenance();
 
   // Resume the main thread now.
   // If the debugger has requested a suspend this will just decrement the

@@ -500,7 +500,9 @@ bool D3D12Provider::Initialize() {
 
   // Get the graphics analysis interface, will silently fail if PIX is not
   // attached.
+#if !XE_PLATFORM_WINRT
   pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&graphics_analysis_));
+#endif
   return true;
 }
 uint32_t D3D12Provider::CreateUploadResource(

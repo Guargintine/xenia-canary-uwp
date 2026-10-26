@@ -14,32 +14,46 @@
 #include <string>
 #include <thread>
 
-#include "xenia/app/discord/discord_presence.h"
+#include "third_party/fmt/include/fmt/format.h"
+
+// clang-format off
+// We want to include platform.h first to define NOMINMAX to prevent window.h
+// from defining the macros.
+#include "xenia/base/platform.h"
+#include "third_party/libcurl/include/curl/curl.h"
+// clang-format on
+
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
-#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
 #include "xenia/debug/ui/debug_window.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/util/net_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/ui/file_picker.h"
+#include "xenia/ui/imgui_host_notification.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/devices/host_path_device.h"
 
+#if !XE_PLATFORM_WINRT
+#include "xenia/app/discord/discord_presence.h"
+#endif
+
 // Available audio systems:
 #include "xenia/apu/nop/nop_audio_system.h"
 #if XE_PLATFORM_LINUX
 #include "xenia/apu/alsa/alsa_audio_system.h"
 #endif  // XE_PLATFORM_LINUX
-#if !XE_PLATFORM_ANDROID
+#if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
 #include "xenia/apu/sdl/sdl_audio_system.h"
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_WIN32
@@ -47,8 +61,10 @@
 #endif  // XE_PLATFORM_WIN32
 
 // Available graphics systems:
+#if !XE_PLATFORM_WINRT
 #include "xenia/gpu/null/null_graphics_system.h"
-#if !XE_PLATFORM_MAC
+#endif
+#if !XE_PLATFORM_MAC && !XE_PLATFORM_WINRT
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #endif
 #if XE_PLATFORM_WIN32
@@ -60,11 +76,13 @@
 #include "xenia/hid/keyboard/keyboard_hid.h"
 #endif  // XE_PLATFORM_LINUX
 #include "xenia/hid/nop/nop_hid.h"
-#if !XE_PLATFORM_ANDROID
+#if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
 #include "xenia/hid/sdl/sdl_hid.h"
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_WIN32
+#if !XE_PLATFORM_WINRT
 #include "xenia/hid/keyboard/keyboard_hid.h"
+#endif
 #include "xenia/hid/xinput/xinput_hid.h"
 #endif  // XE_PLATFORM_WIN32
 
@@ -116,7 +134,8 @@ DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
 
 DECLARE_bool(force_mount_devkit);
 
-DEFINE_transient_path(target, "",
+DEFINE_transient_path(target,
+                      "",
                       "Specifies the target .xex or .iso to execute.",
                       "General");
 #ifndef XE_PLATFORM_WIN32
@@ -131,10 +150,16 @@ DEFINE_transient_bool(portable, true,
 
 DECLARE_bool(debug);
 
-DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
+#if !XE_PLATFORM_WINRT
+DECLARE_bool(discord);
+#endif
+
+DECLARE_int32(discord_presence_user_index);
 
 DECLARE_int32(window_size_x);
 DECLARE_int32(window_size_y);
+
+DECLARE_bool(upnp);
 
 namespace xe {
 namespace app {
@@ -220,9 +245,11 @@ class EmulatorApp final : public xe::ui::WindowedApp {
           }
 
           // Skip xinput for "any" and use SDL
+#if !XE_PLATFORM_WINRT
           if (creator.name.compare("xinput") == 0) {
             continue;
           }
+#endif
 
           auto instance = creator.instantiate(std::forward<Args>(args)...);
           if (instance) {
@@ -324,9 +351,9 @@ std::unique_ptr<apu::AudioSystem> EmulatorApp::CreateAudioSystem(
 #if XE_PLATFORM_LINUX
   factory.Add<apu::alsa::ALSAAudioSystem>("alsa");
 #endif  // XE_PLATFORM_LINUX
-#if !XE_PLATFORM_ANDROID
+#if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
   factory.Add<apu::sdl::SDLAudioSystem>("sdl");
-#endif  // !XE_PLATFORM_ANDROID
+#endif  // !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
   factory.Add<apu::nop::NopAudioSystem>("nop");
   return factory.Create(cvars::apu, processor);
 }
@@ -404,14 +431,16 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
   // placed in `xe::gpu` and shared between the backends rather than duplicated
   // between them.
   const std::string gpu_implementation_name = cvars::gpu;
+#if !XE_PLATFORM_WINRT
   if (gpu_implementation_name == "null") {
     return std::make_unique<gpu::null::NullGraphicsSystem>();
   }
+#endif
   Factory<gpu::GraphicsSystem> factory;
 #if XE_PLATFORM_WIN32
   factory.Add<gpu::d3d12::D3D12GraphicsSystem>("d3d12");
 #endif  // XE_PLATFORM_WIN32
-#if !XE_PLATFORM_MAC
+#if !XE_PLATFORM_MAC && !XE_PLATFORM_WINRT
   factory.Add<gpu::vulkan::VulkanGraphicsSystem>("vulkan");
 #endif
   std::unique_ptr<gpu::GraphicsSystem> gpu_implementation =
@@ -430,12 +459,14 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
         "compatible with Direct3D 12 feature level 11_0.\n"
         "\n"
 #endif  // XE_PLATFORM_WIN32
+#if !XE_PLATFORM_WINRT
         "For Vulkan, the Vulkan runtime must be installed, and the GPU must "
         "support at least Vulkan 1.0. The Vulkan runtime can be downloaded at "
         "https://vulkan.lunarg.com/sdk/home.\n"
         "\n"
         "Also, ensure that you have the latest driver installed for your GPU.\n"
         "\n"
+#endif  // !XE_PLATFORM_WINRT
 #endif  // XE_PLATFORM_ANDROID
         "See https://xenia.jp/faq/ for more information and the system "
         "requirements.");
@@ -451,16 +482,16 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
   } else {
     Factory<hid::InputDriver, ui::Window*, size_t> factory;
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 || XE_PLATFORM_WINRT
     factory.Add("xinput", xe::hid::xinput::Create);
-#endif  // XE_PLATFORM_WIN32
-#if !XE_PLATFORM_ANDROID
+#endif  // XE_PLATFORM_WIN32 || XE_PLATFORM_WINRT
+#if !XE_PLATFORM_ANDROID && !XE_PLATFORM_WINRT
     factory.Add("sdl", xe::hid::sdl::Create);
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_LINUX
     factory.Add("keyboard", xe::hid::keyboard::Create);
 #endif
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
     // WinKey input driver should always be the last input driver added!
     factory.Add("keyboard", xe::hid::keyboard::Create);
 #endif  // XE_PLATFORM_WIN32
@@ -536,9 +567,18 @@ bool EmulatorApp::OnInitialize() {
   cache_root = std::filesystem::absolute(cache_root);
   XELOGI("Host cache root: {}", cache_root);
 
+  #if !XE_PLATFORM_WINRT
   if (cvars::discord) {
     discord::DiscordPresence::Initialize();
     discord::DiscordPresence::NotPlaying();
+  }
+  #endif
+
+  // Initialize Curl
+  CURLcode status = curl_global_init(CURL_GLOBAL_DEFAULT);
+  if (status != CURLE_OK) {
+    XELOGE("Cannot initialize CURL! Error code: {}",
+           static_cast<uint32_t>(status));
   }
 
   // Create the emulator but don't initialize so we can setup the window.
@@ -566,13 +606,31 @@ bool EmulatorApp::OnInitialize() {
 void EmulatorApp::OnDestroy() {
   ShutdownEmulatorThreadFromUIThread();
 
+  #if !XE_PLATFORM_WINRT
   if (cvars::discord) {
     discord::DiscordPresence::Shutdown();
   }
+  #endif
 
   Profiler::Dump();
   // The profiler needs to shut down before the graphics context.
   Profiler::Shutdown();
+
+  // TODO(Adrian): Close all dialogs in use by emulator window.
+  emulator_window_->ShutdownUpdaterDialog();
+
+#pragma region NetplayCleanup
+  emulator_->ShutdownUPnP();
+
+  // Delete sessions on shutdown.
+  emulator_->GetXboxLiveAPI()->DeleteAllSessionsByMac();
+
+  emulator_->GetXboxLiveAPI()->~XLiveAPI();
+
+  // Causes crash if multiplexing connections haven't finished.
+  // XLiveAPI should destroy the multiplexing handles before cleanup.
+  // curl_global_cleanup();
+#pragma endregion
 
   // Write all cvar overrides to the config.
   config::SaveConfig();
@@ -661,6 +719,20 @@ void EmulatorApp::EmulatorThread() {
         fs->RegisterSymbolicLink("cache:", "\\CACHE");
       }
     }
+
+    auto xstorage_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\XSTORAGE", emulator_->storage_root() / "xstorage", false);
+    if (!xstorage_device->Initialize()) {
+      XELOGE("Unable to scan xstorage path");
+    } else {
+      if (!emulator_->file_system()->RegisterDevice(
+              std::move(xstorage_device))) {
+        XELOGE("Unable to register xstorage path");
+      } else {
+        emulator_->file_system()->RegisterSymbolicLink("xstorage:",
+                                                       "\\XSTORAGE");
+      }
+    }
   }
 
   if (cvars::force_mount_devkit) {
@@ -714,13 +786,61 @@ void EmulatorApp::EmulatorThread() {
   }
 
   emulator_->on_launch.AddListener([&](auto title_id, const auto& game_title) {
-    if (cvars::discord) {
-      discord::DiscordPresence::PlayingTitle(
-          game_title.empty() ? "Unknown Title" : std::string(game_title));
-    }
+#if !XE_PLATFORM_WINRT
+    discord::DiscordPresence::PlayingTitle(
+        game_title.empty() ? "Unknown Title" : std::string(game_title),
+        "In Game");
+#endif
     app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
     emulator_thread_event_->Set();
   });
+
+#if !XE_PLATFORM_WINRT
+  emulator_->on_presence_change.AddListener([&](const auto& game_title,
+                                                const auto& presence_string) {
+    const std::string title =
+        game_title.empty() ? "Unknown Title" : std::string(game_title);
+
+    discord::DiscordPresence::PlayingTitle(title, xe::to_utf8(presence_string));
+  });
+
+  emulator_->on_session_change.AddListener(
+      [this](const xe::kernel::XSESSION_INFO* session_info, uint32_t party_size,
+             uint32_t party_max, uint64_t host_xuid) {
+        discord::DiscordPresence::UpdateSession(emulator_->title_id(),
+                                                session_info, party_size,
+                                                party_max, host_xuid);
+      });
+
+  discord::DiscordPresence::SetJoinRequestHandler(
+      [this](xe::kernel::X_INVITE_INFO invite) {
+        const auto show_notification = [this](const std::string& title) {
+          app_context().CallInUIThread([this, title]() {
+            new xe::ui::HostNotificationWindow(
+                emulator_->imgui_drawer(), "Join Failed!", title.c_str(), 0);
+          });
+        };
+
+        if (invite.title_id != emulator_->title_id()) {
+          show_notification("User is playing a different game.");
+          return;
+        }
+
+        const uint32_t user_index = cvars::discord_presence_user_index;
+        kernel::xam::UserProfile* profile =
+            emulator_->kernel_state()->xam_state()->GetUserProfile(user_index);
+
+        if (!profile) {
+          show_notification("User not logged in.");
+          return;
+        }
+
+        invite.xuid_invitee = profile->GetOnlineXUID();
+        profile->SetSelfInvite(invite);
+        emulator_->kernel_state()->BroadcastNotification(
+            kXNotificationLiveInviteAccepted, user_index);
+      });
+#endif
 
   emulator_->on_shader_storage_initialization.AddListener(
       [this](bool initializing) {
@@ -734,14 +854,24 @@ void EmulatorApp::EmulatorThread() {
   });
 
   emulator_->on_terminate.AddListener([]() {
+#if !XE_PLATFORM_WINRT
     if (cvars::discord) {
       discord::DiscordPresence::NotPlaying();
     }
+#endif
   });
 
   // Enable emulator input now that the emulator is properly loaded.
   app_context().CallInUIThread(
       [this]() { emulator_window_->OnEmulatorInitialized(); });
+
+  if (cvar::updated_arg_present) {
+    if (cvar::updated) {
+      emulator_window_->UpdateCompletionNotification();
+    } else {
+      emulator_window_->ToggleCompletionDialog();
+    }
+  }
 
   // Grab path from the flag or unnamed argument.
   std::filesystem::path path;

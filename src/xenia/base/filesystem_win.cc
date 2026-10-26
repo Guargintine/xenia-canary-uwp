@@ -17,6 +17,10 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
+#if XE_PLATFORM_WINRT
+#include <fileapifromapp.h>
+#include "xenia-canary-uwp/UWPUtil.h"
+#endif
 #include "xenia/base/string.h"
 
 namespace xe {
@@ -46,10 +50,17 @@ std::filesystem::path GetExecutablePath() {
 }
 
 std::filesystem::path GetExecutableFolder() {
+#if XE_PLATFORM_WINRT
+  return UWP::GetLocalState();
+#else
   return GetExecutablePath().parent_path();
+#endif
 }
 
 std::filesystem::path GetUserFolder() {
+#if XE_PLATFORM_WINRT
+  return UWP::GetLocalState();
+#else
   std::filesystem::path result;
   PWSTR path;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT,
@@ -58,11 +69,17 @@ std::filesystem::path GetUserFolder() {
     CoTaskMemFree(path);
   }
   return result;
+#endif
 }
 
 bool CreateEmptyFile(const std::filesystem::path& path) {
+#if XE_PLATFORM_WINRT
+  auto handle = CreateFileFromAppW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
   auto handle = CreateFileW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
+#endif
   if (handle == INVALID_HANDLE_VALUE) {
     return false;
   }
@@ -193,7 +210,11 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
   // We assume we've already created the file in the caller.
   DWORD creation_disposition = OPEN_EXISTING;
+#if XE_PLATFORM_WINRT
+  HANDLE handle = CreateFileFromAppW(
+#else
   HANDLE handle = CreateFileW(
+#endif
       path.c_str(), open_access, share_mode, nullptr, creation_disposition,
       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {

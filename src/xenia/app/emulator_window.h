@@ -10,10 +10,18 @@
 #ifndef XENIA_APP_EMULATOR_WINDOW_H_
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
+#include "xenia/app/gamerpic_browser.h"
+#include "xenia/app/netplay_settings_dialog.h"
 #include "xenia/app/profile_dialogs.h"
+#include "xenia/app/updater.h"
+#include "xenia/app/updater_dialog.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/ui/imgui_dialog.h"
@@ -55,6 +63,8 @@ class EmulatorWindow {
 
   virtual ~EmulatorWindow();
 
+  void ShutdownUpdaterDialog();
+
   static std::unique_ptr<EmulatorWindow> Create(
       Emulator* emulator, ui::WindowedAppContext& app_context, uint32_t width,
       uint32_t height);
@@ -77,6 +87,9 @@ class EmulatorWindow {
   ui::WindowedAppContext& app_context() const { return app_context_; }
   ui::Window* window() const { return window_.get(); }
   ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
+  std::shared_ptr<ui::ImGuiDrawer> imgui_drawer_shared() const {
+    return imgui_drawer_;
+  }
 
   ui::Presenter* GetGraphicsSystemPresenter() const;
   void SetupGraphicsSystemPresenterPainting();
@@ -88,6 +101,7 @@ class EmulatorWindow {
   void UpdateTitle();
   void SetFullscreen(bool fullscreen);
   void ToggleFullscreen();
+  void SetAutoCheckForUpdates(const bool state);
   void SetInitializingShaderStorage(bool initializing);
 
   void TakeScreenshot();
@@ -95,10 +109,18 @@ class EmulatorWindow {
   void SaveImage(const std::filesystem::path& path,
                  const xe::ui::RawImage& image);
 
+  void UpdateCompletionNotification();
+
   void ToggleProfilesConfigDialog();
+  void ToggleGamerpicBrowserDialog();
   void ToggleXMPConfigDialog();
   void ToggleConsoleSettingsDialog();
   void ToggleContentListDialog();
+  void ToggleFriendsDialog();
+  void ToggleUpdaterDialog();
+  void ToggleCompletionDialog();
+  void ToggleNetplaySettingsDialog();
+  void ToggleNetplayStatusDialog();
 
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
 
@@ -239,10 +261,171 @@ class EmulatorWindow {
     float volume_ = 0.0f;
   };
 
+#if XE_PLATFORM_WINRT
+  enum class HostGuideAction {
+    kClose,
+    kFriends,
+    kProfiles,
+    kNetworkSettings,
+    kNetworkStatus,
+    kGamerpics,
+  };
+
+  class WinRTHostGuideDialog final : public ui::ImGuiDialog {
+    friend class EmulatorWindow;
+
+   public:
+    WinRTHostGuideDialog(ui::ImGuiDrawer* drawer, EmulatorWindow& window)
+        : ui::ImGuiDialog(drawer), emulator_window_(window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+    void OnClose() override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+    HostGuideAction selected_action_ = HostGuideAction::kClose;
+    bool focus_requested_ = true;
+    std::shared_ptr<ui::ImmediateTexture> background_;
+    std::shared_ptr<ui::ImmediateTexture> button_a_;
+    std::shared_ptr<ui::ImmediateTexture> button_b_;
+  };
+
+  void ShowHostGuide();
+  void HostGuideClosed(WinRTHostGuideDialog* dialog, HostGuideAction action);
+
+  class WinRTFrontendDialog final : public ui::ImGuiDialog {
+   public:
+    WinRTFrontendDialog(ui::ImGuiDrawer* imgui_drawer,
+                        EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {}
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    enum class FrontendPage {
+      kGameList = 0,
+      kSettings,
+      kPaths,
+      kAbout,
+      kCount,
+    };
+
+    enum class ActionPopupMode {
+      kInfo,
+      kManualPatchPrompt,
+      kManualPluginPrompt,
+      kManualConfigPrompt,
+      kExistingDownloadPrompt,
+      kPerGameConfigPrompt,
+    };
+
+    enum class ManualInstallKind { kNone, kPatch, kPlugin, kConfig };
+
+    enum class PerGameConfigValueType {
+      kUnknown,
+      kBool,
+      kInt,
+      kUInt,
+      kUInt64,
+      kDouble,
+      kString,
+      kPath,
+    };
+
+    enum class PerGameConfigFocusSide {
+      kNone,
+      kLeft,
+      kRight,
+    };
+
+    struct PerGameConfigOption {
+      std::string name;
+      std::string category;
+      std::string description;
+      std::string default_value;
+      PerGameConfigValueType value_type = PerGameConfigValueType::kUnknown;
+      std::vector<std::string> enum_values;
+    };
+
+    struct PerGameConfigEntry {
+      std::string category;
+      std::string value;
+    };
+
+    bool EnablePatchesForTitle(const std::filesystem::path& patches_dir,
+                               const std::string& title_id);
+    void DrawNoProfilePrompt(ImGuiIO& io);
+
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateBackground();
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateBackgroundFallback();
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateImageTexture(
+        const std::string& image_path);
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateXeniaLogo();
+    std::shared_ptr<ui::ImmediateTexture> GetOrCreateButtonTexture(char button);
+
+    EmulatorWindow& emulator_window_;
+    std::shared_ptr<ui::ImmediateTexture> background_tex_;
+    std::shared_ptr<ui::ImmediateTexture> background_fallback_tex_;
+    std::shared_ptr<ui::ImmediateTexture> xenia_logo_tex_;
+    std::shared_ptr<ui::ImmediateTexture> button_a_tex_;
+    std::shared_ptr<ui::ImmediateTexture> button_b_tex_;
+    std::shared_ptr<ui::ImmediateTexture> button_x_tex_;
+    std::shared_ptr<ui::ImmediateTexture> button_y_tex_;
+    std::string selected_path_;
+    std::string selected_game_path_;
+    std::string selected_game_name_;
+    bool show_path_warning_ = false;
+    FrontendPage active_frontend_page_ = FrontendPage::kGameList;
+    bool show_action_status_ = false;
+    std::string action_status_;
+    ActionPopupMode action_popup_mode_ = ActionPopupMode::kInfo;
+    ManualInstallKind pending_manual_kind_ = ManualInstallKind::kNone;
+    std::filesystem::path pending_manual_destination_;
+    std::string pending_manual_title_id_;
+    ManualInstallKind pending_existing_download_kind_ =
+        ManualInstallKind::kNone;
+    std::filesystem::path pending_existing_download_destination_;
+    std::string pending_existing_download_title_id_;
+    bool action_popup_should_close_ = false;
+    bool action_popup_focus_requested_ = false;
+    bool show_per_game_config_editor_ = false;
+    bool per_game_config_popup_focus_requested_ = false;
+    std::filesystem::path pending_per_game_config_path_;
+    std::string pending_per_game_config_title_id_;
+    bool per_game_config_remove_mode_ = false;
+    std::string per_game_config_add_candidate_;
+    std::string per_game_config_add_preview_option_;
+    std::string selected_per_game_config_option_;
+    std::string pending_per_game_config_title_display_;
+    PerGameConfigFocusSide per_game_config_focus_jump_request_ =
+        PerGameConfigFocusSide::kNone;
+    std::string per_game_config_last_focused_control_id_;
+    std::string per_game_config_control_jump_request_;
+    std::vector<PerGameConfigOption> per_game_config_options_;
+    std::map<std::string, PerGameConfigEntry> per_game_config_entries_;
+    char per_game_config_buffer_[65536] = {};
+    char cl_buffer_[128] = {};
+    std::unordered_map<std::string, std::string> cached_game_title_ids_;
+    std::unordered_map<std::string, std::shared_ptr<ui::ImmediateTexture>>
+        game_image_textures_;
+    bool show_search_panel_ = false;
+    bool search_panel_focus_input_requested_ = false;
+    bool search_panel_list_focus_requested_ = false;
+    bool show_game_context_menu_ = false;
+    bool game_context_menu_focus_requested_ = false;
+    bool search_gamepad_y_was_down_ = false;
+    std::string search_selected_game_path_;
+    char search_input_buffer_[128] = {};
+    bool no_profile_prompt_dismissed_ = false;
+  };
+
+#endif  // XE_PLATFORM_WINRT
+
   explicit EmulatorWindow(Emulator* emulator,
                           ui::WindowedAppContext& app_context, uint32_t width,
                           uint32_t height);
-
   bool Initialize();
 
   // For comparisons, use GetSwapPostEffectForCvarValue instead as the default
@@ -268,10 +451,22 @@ class EmulatorWindow {
   void OnMouseUp(const ui::MouseEvent& e);
   void FileOpen();
   void FileClose();
+  struct DlcInstallContext {
+    std::filesystem::path source_path;
+    Emulator::ContentInstallEntry entry;
+    std::string description;
+  };
+
+  enum class DlcInstallMode { kManual, kAutoDownload };
+
   void InstallContent();
+  void InstallContentForTitle(const std::string& title_id,
+                              const std::filesystem::path& storage_root,
+                              DlcInstallMode mode);
   void ExtractZarchive();
   void CreateZarchive();
   void ShowContentDirectory();
+  void DumpXLast();
   void CpuTimeScalarReset();
   void CpuTimeScalarSetHalf();
   void CpuTimeScalarSetDouble();
@@ -284,7 +479,8 @@ class EmulatorWindow {
   void ShowCompatibility();
   void ShowFAQ();
   void ShowBuildCommit();
-
+  void ShowUpdateAvailableDialog(const std::string& commit,
+                                 const std::string& date);
   EmulatorWindow::ControllerHotKey ProcessControllerHotkey(int buttons);
   void VibrateController(xe::hid::InputSystem* input_sys, uint32_t user_index,
                          bool vibrate = true);
@@ -304,11 +500,14 @@ class EmulatorWindow {
 
   void ClearDialogs();
 
+  friend class ProfileConfigDialog;
+
   Emulator* emulator_;
   ui::WindowedAppContext& app_context_;
   EmulatorWindowListener window_listener_;
   std::unique_ptr<ui::Window> window_;
-  std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+  // shared_ptr needed for gamerpic browser
+  std::shared_ptr<ui::ImGuiDrawer> imgui_drawer_;
   std::unique_ptr<DisplayConfigGameConfigLoadCallback>
       display_config_game_config_load_callback_;
   // Creation may fail, in this case immediate drawer UI must not be drawn.
@@ -320,6 +519,15 @@ class EmulatorWindow {
   std::string base_title_;
   bool initializing_shader_storage_ = false;
 
+  std::shared_ptr<Updater> updater_;
+  std::shared_future<CheckForUpdateInfo> update_info_;
+  std::atomic<bool> cancel_request;
+#if XE_PLATFORM_WINRT
+  std::unique_ptr<EmulatorWindow::WinRTFrontendDialog> gamelist_;
+  std::unique_ptr<WinRTHostGuideDialog> host_guide_;
+  std::shared_ptr<int> host_guide_lifetime_ = std::make_shared<int>(0);
+#endif
+
   std::unique_ptr<DisplayConfigDialog> display_config_dialog_;
   std::unique_ptr<ConsoleSettingsDialog> console_settings_dialog_;
   std::unique_ptr<ContentListDialog> content_list_dialog_;
@@ -327,9 +535,23 @@ class EmulatorWindow {
   // messages back to guest.
   std::unique_ptr<ProfileConfigDialog> profile_config_dialog_;
 
+  std::unique_ptr<TitleGamerpicBrowser> gamerpic_browser_dialog_;
+
   std::unique_ptr<XMPConfigDialog> xmp_config_dialog_;
 
+  std::unique_ptr<ManagerDialog> friends_manager_dialog_;
+
+  std::unique_ptr<UpdaterDialog> updater_dialog_;
+
+  std::unique_ptr<UpdaterCompletionDialog> updater_completion_dialog_;
+
+  std::unique_ptr<NetplaySettingsDialog> netplay_settings_dialog_;
+
+  std::unique_ptr<NetplayStatusDialog> netplay_status_dialog_;
+
   std::vector<RecentTitleEntry> recently_launched_titles_;
+
+  void DetachProfileConfigDialog(ProfileConfigDialog* dialog);
 };
 
 }  // namespace app

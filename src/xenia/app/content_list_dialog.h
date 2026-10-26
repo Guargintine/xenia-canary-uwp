@@ -73,7 +73,7 @@ class ContentListDialog final : public ui::ImGuiDialog {
   EmulatorWindow& emulator_window_;
   kernel::xam::ContentManager* content_manager_;
 
-  uint32_t selected_entry_ = 0;
+  size_t selected_entry_ = 0;
 
   std::map<XContentType, std::vector<ContentListEntry>> enumerated_entries_;
   std::optional<const ContentListEntry*> pending_boot_ = std::nullopt;

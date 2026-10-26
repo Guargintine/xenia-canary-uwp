@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <limits>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -813,6 +815,11 @@ dword_result_t IoCreateDevice_entry(pointer_t<X_DRIVER_OBJECT> driver_object,
   // We'll alloc some scratch space for it so it doesn't cause any exceptions
   auto kernel_mem = ctx->kernel_state->memory();
 
+  if (device_extension_size >
+      std::numeric_limits<uint16_t>::max() - sizeof(X_DEVICE_OBJECT)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
   uint32_t required_size =
       sizeof(X_DEVICE_OBJECT) + xe::align<uint32_t>(device_extension_size, 8);
 
@@ -825,7 +832,8 @@ dword_result_t IoCreateDevice_entry(pointer_t<X_DRIVER_OBJECT> driver_object,
   out->type = 3;  // maybe device object's Ob type?
 
   // this stores the total object size, without alignment!
-  out->device_extension_size = device_extension_size + sizeof(X_DEVICE_OBJECT);
+  out->device_extension_size =
+      static_cast<uint16_t>(device_extension_size + sizeof(X_DEVICE_OBJECT));
 
   // from 17559
   if (device_type == 7 || device_type == 58 || device_type == 62 ||

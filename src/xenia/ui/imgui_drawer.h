@@ -62,6 +62,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
     SetImmediateDrawer(new_immediate_drawer);
   }
 
+  ImmediateDrawer* GetImmediateDrawer() { return immediate_drawer_; }
+  void SetIgnoreInput(bool ignore);
+  bool GetIgnoreInput();
   void Draw(UIDrawContext& ui_draw_context) override;
 
   void ClearDialogs();
@@ -83,6 +86,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
     return locked_achievement_icon_.get();
   }
 
+  ImmediateTexture* GetLoadingTileIcon() { return loading_tile_icon_.get(); }
+
   ImFont* GetTitleFont() {
     if (!GetIO().Fonts->Fonts[1]->IsLoaded()) {
       return GetIO().Fonts->Fonts[0];
@@ -94,6 +99,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void SetGuideButtonAction(std::function<void(uint8_t)> func);
 
   bool IsAnyDialogOpen() const { return !dialogs_.empty(); };
+  size_t GetDialogCount() const { return dialogs_.size(); }
 
  protected:
   void OnKeyDown(KeyEvent& e) override;
@@ -155,6 +161,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // detaching the presenter.
   std::unique_ptr<ImmediateTexture> font_texture_;
   std::unique_ptr<ImmediateTexture> locked_achievement_icon_;
+  std::unique_ptr<ImmediateTexture> loading_tile_icon_;
 
   std::vector<std::unique_ptr<ImmediateTexture>> notification_icon_textures_;
 
@@ -171,6 +178,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;
 
+  bool ignore_input_ = false;
   bool are_notifications_enabled_ = true;
 };
 

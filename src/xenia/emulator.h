@@ -20,8 +20,11 @@
 #include "xenia/apu/audio_media_player.h"
 #include "xenia/base/delegate.h"
 #include "xenia/base/exception_handler.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/upnp.h"
 #include "xenia/kernel/util/game_info_database.h"
+#include "xenia/kernel/util/network_adapter_manager.h"
 #include "xenia/kernel/util/xlast.h"
 #include "xenia/memory.h"
 #include "xenia/patcher/patcher.h"
@@ -176,6 +179,16 @@ class Emulator {
   kernel::util::GameInfoDatabase* game_info_database() const {
     return game_info_database_.get();
   }
+
+  kernel::NetworkAdapterManager* GetNetworkAdapterManager() {
+    return network_adapter_manager_.get();
+  }
+
+  kernel::UPnP* GetUPnP() { return upnp_.get(); }
+  void ShutdownUPnP() { upnp_.reset(); }
+
+  kernel::XLiveAPI* GetXboxLiveAPI() { return xbox_live_api_.get(); }
+
   // Initializes the emulator and configures all components.
   // The given window is used for display and the provided functions are used
   // to create subsystems as required.
@@ -218,8 +231,8 @@ class Emulator {
     Unknown
   };
 
-  // Determine the executable signature
-  FileSignatureType GetFileSignature(const std::filesystem::path& path);
+  // Determine the executable signature without requiring a running emulator.
+  static FileSignatureType GetFileSignature(const std::filesystem::path& path);
 
   // Launches a game from the given file path.
   // This will attempt to infer the type of the given file (such as an iso, etc)
@@ -275,10 +288,9 @@ class Emulator {
   // Migrates data from content to content/xuid with respect to common data.
   X_STATUS DataMigration(const uint64_t xuid);
 
-  X_STATUS ProcessContentPackageHeader(const std::filesystem::path& path,
-                                       ContentInstallEntry& installation_info);
-
   // Extract content of package to content specific directory.
+  X_STATUS ProcessContentPackageHeader(const std::filesystem::path& path,
+                                     ContentInstallEntry& installation_info);
   X_STATUS InstallContentPackage(const std::filesystem::path& path,
                                  ContentInstallEntry& installation_info);
 
@@ -299,6 +311,8 @@ class Emulator {
     bool hasError{false};
   };
 
+  void DumpXLast();
+
   void Pause();
   void Resume();
   bool is_paused() const { return paused_; }
@@ -316,6 +330,10 @@ class Emulator {
   xe::Delegate<> on_patch_apply;
   xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
+  xe::Delegate<const std::string_view, const std::u16string_view>
+      on_presence_change;
+  xe::Delegate<const kernel::XSESSION_INFO*, uint32_t, uint32_t, uint64_t>
+      on_session_change;
 
  private:
   enum : uint64_t { EmulatorFlagDisclaimerAcknowledged = 1ULL << 0 };
@@ -371,11 +389,18 @@ class Emulator {
   kernel::object_ref<kernel::XHostThread> plugin_loader_thread_;
   std::optional<uint32_t> title_id_;  // Currently running title ID
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
+  std::unique_ptr<kernel::NetworkAdapterManager> network_adapter_manager_;
+  std::unique_ptr<kernel::UPnP> upnp_;
+  std::unique_ptr<kernel::XLiveAPI> xbox_live_api_;
 
   bool paused_;
   bool restoring_;
   threading::Fence restore_fence_;  // Fired on restore finish.
 };
+
+// Determine the executable signature
+Emulator::FileSignatureType GetFileSignature(const std::filesystem::path& path);
+
 
 }  // namespace xe
 

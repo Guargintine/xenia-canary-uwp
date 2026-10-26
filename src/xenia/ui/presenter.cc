@@ -15,7 +15,9 @@
 #include "xenia/base/platform.h"
 #include "xenia/ui/window.h"
 
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/UWPUtil.h"
+#elif XE_PLATFORM_WIN32
 #include "xenia/ui/window_win.h"
 #endif
 
@@ -240,6 +242,9 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   // reconnect).
   bool draw_ui = !ui_drawers_.empty();
   bool do_paint = force_paint || draw_ui;
+#if XE_PLATFORM_WINRT
+  UWP::SetUIOpen(draw_ui);
+#endif
   // Reset ui_thread_paint_requested_ unconditionally also, regardless of
   // whether the UI needs to be drawn - the flag may be set to try reconnecting,
   // for example.
@@ -1205,7 +1210,7 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(
   // surface, the existence of `surface_` (which implies that `window_` exists
   // too) must be the condition for a non-null monitor, not just the existence
   // of `window_`.
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
   HMONITOR surface_new_win32_monitor = nullptr;
   if (surface_) {
     HWND hwnd = static_cast<const Win32Window*>(window_)->hwnd();
@@ -1264,7 +1269,7 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
   if (!surface_) {
     return false;
   }
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
   return surface_win32_monitor_ != nullptr;
 #else
   return true;

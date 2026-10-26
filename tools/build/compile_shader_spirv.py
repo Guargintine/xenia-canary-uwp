@@ -111,10 +111,16 @@ def main():
             return 1
 
         # Step 2: spirv-opt
+        # Older supported SDKs expose compact-ids but predate canonicalize-ids.
+        # Retain the current canonicalization pass whenever the tool has it.
+        opt_help = subprocess.run([spirv_opt, "--help"], capture_output=True,
+                                  text=True, check=True)
+        id_pass = ("--canonicalize-ids" if "--canonicalize-ids" in opt_help.stdout
+                   else "--compact-ids")
         result = subprocess.run([
-            spirv_opt, "-O", "-O", "--canonicalize-ids",
+            spirv_opt, "-O", "-O", id_pass,
             glslang_spv, "-o", opt_spv,
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             print(f"ERROR: spirv-opt failed for {src_name}", file=sys.stderr)
             if result.stderr:
@@ -123,7 +129,8 @@ def main():
 
         # Step 3: spirv-dis
         result = subprocess.run([spirv_dis, "-o", dis_txt, opt_spv],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True)
         if result.returncode != 0:
             print(f"ERROR: spirv-dis failed for {src_name}", file=sys.stderr)
             if result.stderr:

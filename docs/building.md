@@ -10,7 +10,7 @@ drivers.
 
 * Windows 10 or later
 * [Visual Studio 2022 or later](https://www.visualstudio.com/downloads/)
-* CMake 3.10+ (or C++ CMake tools for Windows)
+* CMake 3.20+ (or C++ CMake tools for Windows)
 * Windows 11 SDK version 10.0.22000.0 (for Visual Studio 2022, this or any newer version)
 * [Python 3.6+ 64-bit](https://www.python.org/downloads/)
   * Ensure Python is in PATH.
@@ -26,13 +26,13 @@ xb setup
 xb build
 
 
-# Pull latest changes, rebase, update submodules, and run premake:
+# Pull latest changes, rebase, update submodules, and configure CMake:
 xb pull
 
-# Run premake and open Visual Studio (run the 'xenia-app' project):
+# Configure CMake and open Visual Studio (run the 'xenia-app' project):
 xb devenv
 
-# Run premake to update the sln/vcproj's:
+# Configure CMake (the old command name remains as a compatibility alias):
 xb premake
 
 # Format code to the style guide:
@@ -72,6 +72,17 @@ xb gputest
 # Generate SPIR-V binaries and header files:
 xb genspirv
 -->
+
+### UWP / Xbox
+
+See [Building the UWP / Xbox application](building-uwp.md) for the CMake
+preset, SDK requirements and package deployment. The UWP target includes the
+Blades frontend and shared netplay dialogs. Use its separate `build/uwp`
+directory rather than the historical Premake-based project.
+
+[Windows URI / RetroPass launches](uwp-protocol-launch.md) remain supported.
+The [integration record](uwp-netplay-rebase.md) lists the original commit order
+and validation results.
 
 #### Debugging
 

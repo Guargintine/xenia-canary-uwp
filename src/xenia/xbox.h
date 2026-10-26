@@ -122,6 +122,9 @@ typedef uint32_t X_HRESULT;
                                   : (static_cast<X_HRESULT>(((x) & 0xFFFF) | (X_FACILITY_WIN32 << 16) | \
                                     0x80000000L)))
 
+#define X_HRESULT_FACILITY(hr) (((hr) >> 16) & 0x1fff)
+#define X_WIN32_FROM_HRESULT(hr) (X_HRESULT_FACILITY(hr) == X_FACILITY_WIN32 ? ((hr) & 0xFFFF) : hr)
+
 #define X_E_FALSE                               static_cast<X_HRESULT>(0x80000000L)
 #define X_E_SUCCESS                             X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS)
 #define X_E_ACCESS_DENIED                       X_HRESULT_FROM_WIN32(X_ERROR_ACCESS_DENIED)
@@ -135,10 +138,12 @@ typedef uint32_t X_HRESULT;
 #define X_E_NOTFOUND                            X_HRESULT_FROM_WIN32(X_ERROR_NOT_FOUND)
 #define X_E_NO_SUCH_USER                        X_HRESULT_FROM_WIN32(X_ERROR_NO_SUCH_USER)
 #define X_E_FUNCTION_FAILED                     X_HRESULT_FROM_WIN32(X_ERROR_FUNCTION_FAILED)
+#define X_E_INSUFFICIENT_BUFFER                 X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER)
 
 // Sockets/networking.
-#define X_INVALID_SOCKET (uint32_t)(~0)
-#define X_SOCKET_ERROR (uint32_t)(-1)
+#define X_INVALID_SOCKET (uint64_t)(~0)
+#define X_SOCKET_ERROR (int32_t)(-1)
+#define X_FD_SETSIZE 64
 
 // clang-format on
 enum X_FILE_ATTRIBUTES : uint32_t {

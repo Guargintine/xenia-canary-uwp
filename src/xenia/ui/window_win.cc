@@ -930,9 +930,9 @@ bool Win32Window::HandleKeyboard(
       // Guarantee input driver receives the unicode corresponding to its
       // virtual key.
       e.set_virtual_key(VirtualKey::kNone);
-      e.set_unicode(wParam);
+      e.set_unicode(static_cast<uint16_t>(wParam));
 
-      int16_t vk_result = VkKeyScanW(wParam);
+      int16_t vk_result = VkKeyScanW(static_cast<WCHAR>(wParam));
 
       if (vk_result >= 0) {
         VirtualKey vk = VirtualKey(LOBYTE(vk_result));
@@ -1080,7 +1080,7 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
         batched_size_update_contained_wm_size_ = true;
       } else {
         WindowDestructionReceiver destruction_receiver(this);
-        HandleSizeUpdate(destruction_receiver, wParam);
+        HandleSizeUpdate(destruction_receiver, static_cast<DWORD>(wParam));
         if (destruction_receiver.IsWindowDestroyedOrClosed()) {
           break;
         }

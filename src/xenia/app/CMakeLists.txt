@@ -6,7 +6,7 @@ else()
   add_executable(xenia-app)
 endif()
 
-set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_canary")
+set_target_properties(xenia-app PROPERTIES OUTPUT_NAME "xenia_canary_netplay")
 
 # Main source
 target_sources(xenia-app PRIVATE
@@ -47,6 +47,7 @@ endif()
 target_compile_definitions(xenia-app PRIVATE
   XBYAK_NO_OP_NAMES
   XBYAK_ENABLE_OMITTED_OPERAND
+  CURL_STATICLIB
 )
 
 # Core libraries (all platforms)
@@ -76,6 +77,7 @@ target_link_libraries(xenia-app PRIVATE
   mspack
   snappy
   xxhash
+  libcurl
 )
 
 # Vulkan/SPIR-V backends (not macOS)

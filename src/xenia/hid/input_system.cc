@@ -16,7 +16,7 @@
 #include "xenia/hid/input_driver.h"
 #include "xenia/kernel/util/shim_utils.h"
 
-#ifdef XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
 #include "xenia/hid/portal/hardware_portal.h"
 #endif  // XE_PLATFORM_WIN32
 
@@ -32,8 +32,16 @@ DEFINE_double(
     right_stick_deadzone_percentage, 0.0,
     "Defines deadzone level for right stick. Allowed range [0.0-1.0].", "HID");
 
+DEFINE_double(
+    left_trigger_deadzone_percentage, 0.0,
+    "Defines deadzone level for left trigger. Allowed range [0.0-1.0].", "HID");
+DEFINE_double(
+    right_trigger_deadzone_percentage, 0.0,
+    "Defines deadzone level for right trigger. Allowed range [0.0-1.0].",
+    "HID");
+
 InputSystem::InputSystem(xe::ui::Window* window) : window_(window) {
-#ifdef XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PLATFORM_WINRT
   portal_ = std::make_unique<HardwarePortal>();
 #endif  // XE_PLATFORM_WIN32
 }
@@ -193,7 +201,7 @@ void InputSystem::ToggleVibration() {
 
 void InputSystem::AdjustDeadzoneLevels(const uint8_t slot,
                                        X_INPUT_GAMEPAD* gamepad) {
-  if (slot > XUserMaxUserCount) {
+  if (slot >= XUserMaxUserCount) {
     return;
   }
 
@@ -249,6 +257,17 @@ void InputSystem::AdjustDeadzoneLevels(const uint8_t slot,
         gamepad->thumb_rx < deadzone_x_value) {
       gamepad->thumb_rx = 0;
     }
+  }
+  if (cvars::left_trigger_deadzone_percentage > 0.0 &&
+      cvars::left_trigger_deadzone_percentage <= 1.0 &&
+      gamepad->left_trigger < 255.0 * cvars::left_trigger_deadzone_percentage) {
+    gamepad->left_trigger = 0;
+  }
+  if (cvars::right_trigger_deadzone_percentage > 0.0 &&
+      cvars::right_trigger_deadzone_percentage <= 1.0 &&
+      gamepad->right_trigger <
+          255.0 * cvars::right_trigger_deadzone_percentage) {
+    gamepad->right_trigger = 0;
   }
 }
 

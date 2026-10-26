@@ -16,6 +16,10 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/platform_win.h"
 
+#if XE_PLATFORM_WINRT
+#include <fileapifromapp.h>
+#endif
+
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | \
                             WINAPI_PARTITION_SYSTEM | WINAPI_PARTITION_GAMES)
 #define XE_BASE_MAPPED_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
@@ -85,10 +89,12 @@ class Win32MappedMemory : public MappedMemory {
     if (length) {
       size_ = aligned_length;
     } else {
-      DWORD length_high;
-      size_t map_length = GetFileSize(file_handle, &length_high);
-      map_length |= static_cast<uint64_t>(length_high) << 32;
-      size_ = map_length - aligned_offset;
+      LARGE_INTEGER map_length;
+      if (!GetFileSizeEx(file_handle, &map_length) ||
+          uint64_t(map_length.QuadPart) < aligned_offset) {
+        return false;
+      }
+      size_ = size_t(map_length.QuadPart) - aligned_offset;
     }
 
     return true;
@@ -134,8 +140,13 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
   auto mm = std::make_unique<Win32MappedMemory>();
   mm->view_access_ = view_access;
 
+#if XE_PLATFORM_WINRT
+  mm->file_handle =
+      CreateFileFromAppW(path.c_str(), file_access, file_share, nullptr,
+#else
   mm->file_handle = CreateFile(path.c_str(), file_access, file_share, nullptr,
-                               create_mode, FILE_ATTRIBUTE_NORMAL, nullptr);
+#endif
+                         create_mode, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (mm->file_handle == Win32MappedMemory::kFileHandleInvalid) {
     return nullptr;
   }
@@ -169,10 +180,12 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(
   if (length) {
     mm->size_ = aligned_length;
   } else {
-    DWORD length_high;
-    size_t map_length = GetFileSize(mm->file_handle, &length_high);
-    map_length |= static_cast<uint64_t>(length_high) << 32;
-    mm->size_ = map_length - aligned_offset;
+    LARGE_INTEGER map_length;
+    if (!GetFileSizeEx(mm->file_handle, &map_length) ||
+        uint64_t(map_length.QuadPart) < aligned_offset) {
+      return nullptr;
+    }
+    mm->size_ = size_t(map_length.QuadPart) - aligned_offset;
   }
 
   return std::move(mm);
@@ -252,8 +265,13 @@ class Win32ChunkedMappedMemoryWriter : public ChunkedMappedMemoryWriter {
       DWORD mapping_protect = PAGE_READWRITE;
       DWORD view_access = FILE_MAP_READ | FILE_MAP_WRITE;
 
+#if XE_PLATFORM_WINRT
+      file_handle_ =
+          CreateFileFromAppW(path.c_str(), file_access, file_share, nullptr,
+#else
       file_handle_ = CreateFile(path.c_str(), file_access, file_share, nullptr,
-                                create_mode, FILE_ATTRIBUTE_NORMAL, nullptr);
+#endif
+                             create_mode, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (file_handle_ == Win32MappedMemory::kFileHandleInvalid) {
         return false;
       }

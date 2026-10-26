@@ -26,7 +26,9 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#if !XE_PLATFORM_WINRT
 #include <shobjidl.h>
+#endif
 #include <tpcshrd.h>
 #include <windows.h>
 #include <windowsx.h>

@@ -17,6 +17,9 @@
 #include "xenia/xbox.h"
 
 DECLARE_bool(allow_mic_initialization);
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/UWPUtil.h"
+#endif
 
 namespace xe {
 namespace kernel {
@@ -60,7 +63,7 @@ dword_result_t XamInputGetCapabilitiesEx_entry(
   if (!caps) {
     return X_ERROR_BAD_ARGUMENTS;
   }
-
+ 
   caps.Zero();
 
   if ((flags & X_INPUT_FLAG::X_INPUT_FLAG_ANY_USER) != 0) {

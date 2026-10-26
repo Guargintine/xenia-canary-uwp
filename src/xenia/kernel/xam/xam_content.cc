@@ -27,7 +27,7 @@
 #include "xenia/xbox.h"
 
 DEFINE_int32(
-    license_mask, 0,
+    license_mask, 1 ,
     "Set license mask for activated content.\n"
     " 0 = No licenses enabled.\n"
     " 1 = First license enabled. Generally the full version license in\n"
@@ -47,7 +47,7 @@ dword_result_t XamContentGetLicenseMask_entry(lpdword_t mask_ptr,
   }
 
   auto run = [mask_ptr](uint32_t& extended_error, uint32_t& length) {
-    X_RESULT result = X_ERROR_FUNCTION_FAILED;
+    X_RESULT result = X_E_FAIL;
 
     // Remark: This cannot be reflected as on console. Xenia can boot games
     // directly and XBLA games can be repacked to ZAR. For these titles we must
@@ -961,8 +961,8 @@ dword_result_t XamContentGetAttributesInternal_entry(
   info->ftCreationTime = file_info->create_timestamp;
   info->ftLastAccessTime = file_info->access_timestamp;
   info->ftLastWriteTime = file_info->write_timestamp;
-  info->nFileSizeHigh = file_info->total_size >> 32;
-  info->nFileSizeLow = file_info->total_size;
+  info->nFileSizeHigh = static_cast<uint32_t>(file_info->total_size >> 32);
+  info->nFileSizeLow = static_cast<uint32_t>(file_info->total_size);
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, 0);
