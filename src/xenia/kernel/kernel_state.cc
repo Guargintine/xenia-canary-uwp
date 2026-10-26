@@ -1115,7 +1115,12 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     has_notified_startup_ = true;
     listener->EnqueueNotification(kXNotificationSystemUI,
                                   xam_state()->IsUIActive());
-    listener->EnqueueNotification(kXNotificationSystemStorageDevicesChanged, 0);
+    // 415607FA: Doesn't like receiving this notification on boot. Causes game
+    // to crash.
+    if (title_id() == kDashboardID) {
+      listener->EnqueueNotification(kXNotificationSystemStorageDevicesChanged,
+                                    0);
+    }
 
     const auto signed_in_players =
         xam_state()->profile_manager()->GetUsedUserSlots().to_ulong();
