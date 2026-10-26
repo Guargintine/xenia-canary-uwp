@@ -155,6 +155,31 @@ class GameScanner {
     return (value & xe::XEX_MODULE_TITLE) && !(value & excluded);
   }
 
+  // Xbox Live Indie Game (XNA Creators Club) packages hold only .NET
+  // assemblies. They are marketplace content owned by the XNA host: 584E07D2
+  // ("Indie Games") or 584E07D1 (XNA Game Studio Connect deployments).
+  static bool IsIndieGamePackage(std::ifstream& file,
+                                 xe::XContentType type) {
+    using namespace xe::kernel::xam;
+    if (type == xe::XContentType::kCommunityGame ||
+        type == xe::XContentType::kXNACommunity) {
+      return true;
+    }
+    if (type != xe::XContentType::kMarketplaceContent) {
+      return false;
+    }
+    constexpr auto title_id_offset =
+        offsetof(XContentContainerHeader, content_metadata) +
+        offsetof(XContentMetadata, execution_info) +
+        offsetof(xe::xex2_opt_execution_info, title_id);
+    xe::be<uint32_t> title_id;
+    if (!ReadAt(file, title_id_offset, title_id)) {
+      return false;
+    }
+    const uint32_t owner = title_id;
+    return owner == 0x584E07D2 || owner == 0x584E07D1;
+  }
+
   static std::optional<std::string> ReadContainerName(
       const std::filesystem::path& path) {
     using namespace xe::kernel::xam;
@@ -167,11 +192,14 @@ class GameScanner {
                 type)) {
       return std::nullopt;
     }
-    // Match the desktop content browser's bootable package types.
+    // Match the desktop content browser's bootable package types, plus Xbox
+    // Live Indie Games: marketplace packages owned by the XNA host titles,
+    // which Emulator::LaunchStfsContainer hands to the XNA title launcher.
     if (type != xe::XContentType::kArcadeTitle &&
         type != xe::XContentType::kGameDemo &&
         type != xe::XContentType::kInstalledGame &&
-        type != xe::XContentType::kXbox360Title) {
+        type != xe::XContentType::kXbox360Title &&
+        !IsIndieGamePackage(file, type)) {
       return std::nullopt;
     }
 

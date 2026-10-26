@@ -944,6 +944,47 @@ X_STATUS Emulator::LaunchDiscArchive(const std::filesystem::path& path) {
   return result;
 }
 
+// Finds the XNA Indie Player launcher (Xna_TitleLauncher.xex). xna_host_path
+// wins when set; a relative one is tried against the storage root first,
+// because on UWP the working directory is the read-only package folder.
+// Otherwise the launcher is looked for in an XNA folder in the storage root,
+// then in an XNA folder next to the indie game package, then in the working
+// directory. Its folder is mounted as game:, so a folder of its own is best.
+static std::filesystem::path FindXnaTitleLauncher(
+    const std::filesystem::path& storage_root,
+    const std::filesystem::path& package_path) {
+  const std::filesystem::path launcher_name("Xna_TitleLauncher.xex");
+  std::vector<std::filesystem::path> candidates;
+  if (!cvars::xna_host_path.empty()) {
+    const std::filesystem::path configured = cvars::xna_host_path;
+    if (configured.is_relative() && !storage_root.empty()) {
+      candidates.push_back(storage_root / configured);
+    }
+    candidates.push_back(configured);
+  } else {
+    if (!storage_root.empty()) {
+      candidates.push_back(storage_root / "XNA" / launcher_name);
+    }
+    candidates.push_back(package_path.parent_path() / "XNA" / launcher_name);
+    std::error_code cwd_error;
+    const std::filesystem::path cwd = std::filesystem::current_path(cwd_error);
+    if (!cwd_error) {
+      candidates.push_back(cwd / launcher_name);
+    }
+  }
+  for (std::filesystem::path candidate : candidates) {
+    std::error_code error;
+    if (auto absolute_path = std::filesystem::absolute(candidate, error);
+        !error) {
+      candidate = absolute_path.lexically_normal();
+    }
+    if (std::filesystem::is_regular_file(candidate, error)) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
 std::optional<kernel::util::XnaGameInfo> Emulator::ReadMountedXnaGameInfo() {
   const std::string game_info_path =
       fmt::format("{}\\GameInfo.bin", kDefaultGameSymbolicLink);
@@ -978,35 +1019,24 @@ X_STATUS Emulator::LaunchXnaGame(const std::filesystem::path& path,
   XELOGI("  Game title ID:    {:08X}", info.community_title_id);
   XELOGI("  Virtual title ID: {}", info.virtual_title_id);
 
-  if (cvars::xna_host_path.empty()) {
-    const std::filesystem::path default_xna_title_launcher = std::filesystem::current_path() /=
-        std::string("Xna_TitleLauncher.xex");
-
-   if (std::filesystem::exists(default_xna_title_launcher)) {
-      cvars::xna_host_path = default_xna_title_launcher;
-   } else {
-     XELOGE(
-         "This package is an Xbox Live Indie Game. It contains only .NET "
-         "Compact Framework assemblies (no default.xex), which the console "
-         "runs through its XNA host executable (title 584E07D2 plus its title "
-         "update).");
-
-     return X_STATUS_NOT_SUPPORTED;
-   }
+  const std::filesystem::path host_path =
+      FindXnaTitleLauncher(storage_root_, path);
+  if (host_path.empty()) {
+    if (!cvars::xna_host_path.empty()) {
+      XELOGE("xna_host_path does not exist: {}",
+             xe::path_to_utf8(cvars::xna_host_path));
+      return X_STATUS_NO_SUCH_FILE;
+    }
+    XELOGE(
+        "This package is an Xbox Live Indie Game. It contains only .NET "
+        "Compact Framework assemblies (no default.xex), which the console "
+        "runs through its XNA host executable (title 584E07D2 plus its title "
+        "update). Put Xna_TitleLauncher.xex in {} or in an XNA folder next to "
+        "the game, or set xna_host_path.",
+        xe::path_to_utf8(storage_root_ / "XNA"));
+    return X_STATUS_NOT_SUPPORTED;
   }
-
-  // Resolve relative paths against the working directory: the host is
-  // mounted by its parent folder, and a bare file name has an empty parent.
-  std::filesystem::path host_path = cvars::xna_host_path;
-  std::error_code absolute_error;
-  if (auto absolute_path = std::filesystem::absolute(host_path, absolute_error);
-      !absolute_error) {
-    host_path = absolute_path.lexically_normal();
-  }
-  if (!std::filesystem::is_regular_file(host_path)) {
-    XELOGE("xna_host_path does not exist: {}", xe::path_to_utf8(host_path));
-    return X_STATUS_NO_SUCH_FILE;
-  }
+  XELOGI("XNA title launcher: {}", xe::path_to_utf8(host_path));
 
   XELOGW(
       "XBLIG support is experimental: the XNA runtime runs in emulated kernel "

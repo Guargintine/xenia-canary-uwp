@@ -316,10 +316,23 @@ struct PlaceholderFunctions {
     if (!kernelbase) {
       return;
     }
+#ifndef XE_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+    // App container (UWP / Xbox Developer Mode): prefer the FromApp variants,
+    // the same functions MapFileView uses there. They take the same arguments
+    // as the desktop ones.
     virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
-        GetProcAddress(kernelbase, "VirtualAlloc2"));
+        GetProcAddress(kernelbase, "VirtualAlloc2FromApp"));
     map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
-        GetProcAddress(kernelbase, "MapViewOfFile3"));
+        GetProcAddress(kernelbase, "MapViewOfFile3FromApp"));
+#endif
+    if (!virtual_alloc2) {
+      virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
+          GetProcAddress(kernelbase, "VirtualAlloc2"));
+    }
+    if (!map_view_of_file3) {
+      map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
+          GetProcAddress(kernelbase, "MapViewOfFile3"));
+    }
     unmap_view_of_file2 = reinterpret_cast<UnmapViewOfFile2Fn>(
         GetProcAddress(kernelbase, "UnmapViewOfFile2"));
   }

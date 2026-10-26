@@ -52,6 +52,9 @@ set_target_properties(xenia-uwp PROPERTIES
   VS_GLOBAL_AppxPackageSigningEnabled false
   VS_GLOBAL_AppxAutoIncrementPackageRevision false
   VS_GLOBAL_AppxBundle Never
+  # Produce the sideloading package (AppPackages/..._Test) on every build, so
+  # xenia-uwp-release has an .appx to copy and sign.
+  VS_GLOBAL_GenerateAppxPackageOnBuild true
 )
 
 # Relative deployment locations preserve the exact paths the Blades UI loads.
@@ -107,7 +110,7 @@ set_source_files_properties(${_streaming_source_archives} PROPERTIES
   VS_DEPLOYMENT_LOCATION "Licenses/Streaming-FFmpeg/source")
 target_sources(xenia-uwp PRIVATE ${_streaming_source_archives})
 
-# Copies the package to release/Xenia-Netplay-<manifest version>.appx and signs
+# Copies the package to release/Xenia-XBLIG-<manifest version>.appx and signs
 # it when XENIA_UWP_SIGN_SHA1 is set.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/Package.appxmanifest")
@@ -128,7 +131,7 @@ set(XENIA_UWP_SIGN_SHA1 "" CACHE STRING
 set(_uwp_appx
   "${CMAKE_CURRENT_BINARY_DIR}/AppPackages/xenia-uwp/xenia-uwp_${XENIA_UWP_PACKAGE_VERSION}_x64_Test/xenia-uwp_${XENIA_UWP_PACKAGE_VERSION}_x64.appx")
 set(_uwp_release_dir "${CMAKE_BINARY_DIR}/release")
-set(_uwp_release "${_uwp_release_dir}/Xenia-Netplay-${XENIA_UWP_PACKAGE_VERSION}.appx")
+set(_uwp_release "${_uwp_release_dir}/Xenia-XBLIG-${XENIA_UWP_PACKAGE_VERSION}.appx")
 set(_uwp_release_commands
   COMMAND ${CMAKE_COMMAND} -E make_directory "${_uwp_release_dir}"
   COMMAND ${CMAKE_COMMAND} -E copy "${_uwp_appx}" "${_uwp_release}")
