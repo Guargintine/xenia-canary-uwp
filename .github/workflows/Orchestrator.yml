@@ -1,17 +1,9 @@
 name: Orchestrator
 
+# The XBLIG branch builds through xblig-uwp.yml. Keep this desktop pipeline
+# for manual runs only, so pushes here do not start a second, unrelated build.
 on:
-  push:
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - 'LICENSE'
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - 'LICENSE'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -1,0 +1,188 @@
+name: Xenia XBLIG UWP
+
+# Builds the UWP / Xbox Developer Mode package with Xbox Live Indie Game
+# support, signs it with a throwaway certificate (CN=XeniaXBLIG, the
+# Publisher in Package.appxmanifest) and publishes it as a prerelease.
+
+on:
+  push:
+    branches: [xblig-netplay]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xblig-uwp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: UWP package (x64)
+    runs-on: windows-2022
+    timeout-minutes: 330
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch submodules
+        shell: pwsh
+        run: |
+          # Not used by the UWP build: the aarch64 JIT, the shader compiler
+          # sources (bytecode is checked in) and the lint tool.
+          $skip = @('third_party/xbyak_aarch64', 'third_party/DirectXShaderCompiler', 'third_party/cpplint')
+          $paths = git config -f .gitmodules --get-regexp 'submodule\..*\.path' |
+            ForEach-Object { ($_ -split ' ', 2)[1] } |
+            Where-Object { $skip -notcontains $_ }
+          git submodule update --init --depth 1 --jobs 8 -- $paths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Ensure the UWP C++ tools are installed
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 not found' }
+          Write-Output "Visual Studio: $vs"
+          $component = 'Microsoft.VisualStudio.ComponentGroup.UWP.VC'
+          $have = & $vswhere -latest -products * -version '[17.0,18.0)' -requires $component -property installationPath
+          if ($have) {
+            Write-Output "$component is installed"
+          } else {
+            Write-Output "Adding $component"
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+              'modify', '--installPath', "`"$vs`"", '--add', $component,
+              '--quiet', '--norestart', '--nocache')
+            Write-Output "vs_installer exit code: $($process.ExitCode)"
+            if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { exit $process.ExitCode }
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake --preset uwp 2>&1 | Tee-Object -FilePath configure.log
+          exit $LASTEXITCODE
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build/uwp --config Release --target xenia-uwp -- `
+            /m:3 /p:CL_MPCount=2 /p:UapAppxPackageBuildMode=SideloadOnly `
+            /nologo /v:minimal 2>&1 | Tee-Object -FilePath build.log
+          exit $LASTEXITCODE
+
+      - name: Sign package
+        id: package
+        shell: pwsh
+        run: |
+          $appx = Get-ChildItem -Path build/uwp -Recurse -File -Include *.appx, *.msix |
+            Where-Object { $_.FullName -notmatch '\\Dependencies\\' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $appx) {
+            Get-ChildItem -Path build/uwp -Recurse -Directory -Filter AppPackages | ForEach-Object FullName
+            throw 'No .appx package was produced'
+          }
+          Write-Output "Package: $($appx.FullName)"
+
+          $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=XeniaXBLIG' `
+            -KeyUsage DigitalSignature -FriendlyName 'Xenia XBLIG CI signing' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+
+          [xml]$manifest = Get-Content xenia-canary-uwp/Package.appxmanifest
+          $version = $manifest.Package.Identity.Version
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $signed = Join-Path (Resolve-Path out) "Xenia-XBLIG-$version.appx"
+          Copy-Item $appx.FullName $signed
+          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint $signed
+          if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
+
+          $deps = Join-Path $appx.DirectoryName 'Dependencies\x64'
+          if (Test-Path $deps) { Copy-Item (Join-Path $deps '*.appx') out/ }
+          Export-Certificate -Cert $cert -FilePath out/XeniaXBLIG.cer | Out-Null
+          Get-ChildItem out | Format-Table Name, Length -AutoSize
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-xblig-uwp-x64
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "xblig-uwp-${{ github.run_number }}-${{ github.run_attempt }}"
+          $notes = @(
+            'Experimental Xenia Canary UWP build with Xbox Live Indie Game support, for Xbox One / Series consoles in Developer Mode.',
+            '',
+            'Install Xenia-XBLIG-*.appx through Device Portal (add Microsoft.VCLibs.x64.14.00.appx as its dependency if asked), then set the app type to Game.',
+            'Setup: docs/xblig-uwp.md. Built from ${{ github.sha }}.'
+          ) -join "`n"
+          $files = Get-ChildItem out -File | ForEach-Object FullName
+          gh release create $tag @files --target ${{ github.sha }} --prerelease `
+            --title "Xenia XBLIG UWP ${{ steps.package.outputs.version }} (build ${{ github.run_number }})" `
+            --notes $notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Report errors
+        if: failure()
+        shell: pwsh
+        run: |
+          function Escape([string]$s) { $s.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
+          $root = $env:GITHUB_WORKSPACE + '\'
+          $pattern = '(\b(fatal )?error [A-Z]*\d+|: error :|CMake Error|error MSB\d+|error LNK\d+|(src|xenia-canary-uwp)\\.*: warning C\d+)'
+          $lines = @()
+          foreach ($log in @('configure.log', 'build.log')) {
+            if (Test-Path $log) {
+              $lines += Select-String -Path $log -Pattern $pattern |
+                ForEach-Object { $_.Line.Trim().Replace($root, '') }
+            }
+          }
+          $lines = @($lines | Select-Object -Unique)
+          if ($lines.Count -eq 0) {
+            $last = @('build.log', 'configure.log') | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($last) { $lines = @(Get-Content $last -Tail 60 | ForEach-Object { $_.Replace($root, '') }) }
+          }
+          Write-Output "$($lines.Count) error lines"
+          $chunks = New-Object System.Collections.Generic.List[string]
+          $current = ''
+          foreach ($line in $lines) {
+            if ($line.Length -gt 700) { $line = $line.Substring(0, 700) + ' ...' }
+            if ($current.Length + $line.Length -gt 3800) { $chunks.Add($current); $current = '' }
+            $current += $line + "`n"
+          }
+          if ($current) { $chunks.Add($current) }
+          $part = 0
+          foreach ($chunk in ($chunks | Select-Object -First 10)) {
+            $part++
+            Write-Output "::error title=Build errors ${part}::$(Escape $chunk)"
+          }
+          ($lines | Select-Object -First 400) -join "`n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore

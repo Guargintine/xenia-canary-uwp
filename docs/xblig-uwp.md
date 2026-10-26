@@ -64,3 +64,12 @@ Config:
   run on a console before.
 - `LocalState\xenia.log` shows `Xbox Live Indie Game detected`,
   `XNA title launcher:` and, on failures, the reason.
+
+## Building
+
+`.github/workflows/xblig-uwp.yml` builds the package on GitHub Actions
+(`windows-2022`, Visual Studio 2022 with the UWP C++ tools) on every push to
+`xblig-netplay`, signs it with a throwaway `CN=XeniaXBLIG` certificate and
+publishes it as a prerelease with its `Microsoft.VCLibs` dependency. The
+desktop Orchestrator pipeline is manual only on this branch. To build locally,
+see [building-uwp.md](building-uwp.md).
