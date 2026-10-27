@@ -182,6 +182,9 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
       command_list_result = device->CreateCommandList(
           0, D3D12_COMMAND_LIST_TYPE_DIRECT, capture_command_allocator_.Get(),
           nullptr, IID_PPV_ARGS(&capture_command_list_));
+      if (SUCCEEDED(command_list_result)) {
+        capture_command_list_->SetName(L"Presenter guest output capture");
+      }
     }
     if (FAILED(command_list_result)) {
       XELOGE(
@@ -420,6 +423,12 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     }
     // From now on, in case of any failure, DestroySwapChain must be called
     // before returning.
+    XELOGD3D(
+        "D3D12Presenter: created a {}x{} swap chain ({} buffers) for a {}x{} "
+        "surface",
+        new_swap_chain_width, new_swap_chain_height,
+        uint32_t(PaintContext::kSwapChainBufferCount), new_surface_width,
+        new_surface_height);
     paint_context_.swap_chain_width = new_swap_chain_width;
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
@@ -1173,8 +1182,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
   paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
+      provider_.LogDeviceRemoval("Present (DXGI_ERROR_DEVICE_REMOVED)");
       return PaintResult::kGpuLostExternally;
     case DXGI_ERROR_DEVICE_RESET:
+      provider_.LogDeviceRemoval("Present (DXGI_ERROR_DEVICE_RESET)");
       return PaintResult::kGpuLostResponsible;
     default:
       return SUCCEEDED(present_result) ? PaintResult::kPresented
@@ -1514,6 +1525,8 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         "swap chain");
     return false;
   }
+  // Named for Device Removed Extended Data reports.
+  paint_context_.command_list->SetName(L"Presenter paint and UI");
   // Command lists are created in an open state.
   paint_context_.command_list->Close();
 

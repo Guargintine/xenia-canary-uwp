@@ -821,6 +821,8 @@ bool D3D12CommandProcessor::SetupContext() {
     XELOGE("Failed to create the graphics command list");
     return false;
   }
+  // Named for Device Removed Extended Data reports.
+  command_list_->SetName(L"Guest GPU commands");
   // Initially in open state, wait until a deferred command list submission.
   command_list_->Close();
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
@@ -3582,6 +3584,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
     device_removed_ = true;
+    GetD3D12Provider().LogDeviceRemoval("the guest GPU command processor");
     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                  DXGI_ERROR_DEVICE_REMOVED);
     return false;

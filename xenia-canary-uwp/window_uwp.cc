@@ -16,6 +16,8 @@
 #include <XeniaUWP.h>
 #include <UWPUtil.h>
 
+#include "xenia/base/logging.h"
+
 namespace xe {
 namespace ui {
 UWPWindow::UWPWindow(WindowedAppContext& app_context,
@@ -62,8 +64,11 @@ bool UWPWindow::OpenImpl() {
     auto hdi = winrt::Windows::Graphics::Display::Core::HdmiDisplayInformation::
         GetForCurrentView();
     if (hdi) {
-      width = hdi.GetCurrentDisplayMode().ResolutionWidthInRawPixels();
-      height = hdi.GetCurrentDisplayMode().ResolutionHeightInRawPixels();
+      auto mode = hdi.GetCurrentDisplayMode();
+      width = mode.ResolutionWidthInRawPixels();
+      height = mode.ResolutionHeightInRawPixels();
+      XELOGI("UWP display mode: {}x{} at {:.2f} Hz (console model 0x{:08X})",
+             width, height, mode.RefreshRate(), uint32_t(info.deviceId));
     }
   }
 

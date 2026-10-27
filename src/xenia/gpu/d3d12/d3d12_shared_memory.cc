@@ -87,6 +87,8 @@ bool D3D12SharedMemory::Initialize() {
       return false;
     }
   }
+  // Named for Device Removed Extended Data page fault reports.
+  buffer_->SetName(L"Shared memory");
   buffer_gpu_address_ = buffer_->GetGPUVirtualAddress();
   buffer_uav_writes_commit_needed_ = false;
 

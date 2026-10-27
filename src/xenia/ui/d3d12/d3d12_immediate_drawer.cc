@@ -253,6 +253,8 @@ std::unique_ptr<ImmediateTexture> D3D12ImmediateDrawer::CreateTexture(
           &util::kHeapPropertiesDefault, heap_flag_create_not_zeroed,
           &resource_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
           IID_PPV_ARGS(&resource)))) {
+    // Named for Device Removed Extended Data page fault reports.
+    resource->SetName(L"UI texture");
     // Create and fill the upload buffer.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_footprint;
     UINT64 upload_size;

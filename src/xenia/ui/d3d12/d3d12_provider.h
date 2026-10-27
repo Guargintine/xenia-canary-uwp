@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_D3D12_D3D12_PROVIDER_H_
 #define XENIA_UI_D3D12_D3D12_PROVIDER_H_
 
+#include <atomic>
 #include <memory>
 
 #include "xenia/ui/d3d12/d3d12_api.h"
@@ -165,6 +166,14 @@ class D3D12Provider : public GraphicsProvider {
   // Call this after operations that fail to get detailed error info.
   void LogD3D12DebugMessages() const;
 
+  // Logs why the device was lost: the removal reason and, if it was recorded
+  // (d3d12_dred), the GPU operations that did not complete and what was
+  // allocated at a faulting address. Only the first call logs, as several
+  // threads notice the same loss.
+  void LogDeviceRemoval(const char* noticed_by) const;
+  // Logs the GPU memory in use against the budget the system gives the app.
+  void LogVideoMemoryInfo(const char* when) const;
+
  private:
   D3D12Provider() = default;
 
@@ -215,6 +224,8 @@ class D3D12Provider : public GraphicsProvider {
   bool rasterizer_ordered_views_supported_;
   bool alpha_blend_factor_supported_;
   bool unaligned_block_textures_supported_;
+
+  mutable std::atomic_flag device_removal_logged_;
 };
 
 }  // namespace d3d12

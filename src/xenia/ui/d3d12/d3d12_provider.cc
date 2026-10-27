@@ -9,16 +9,26 @@
 
 #include "xenia/ui/d3d12/d3d12_provider.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/string.h"
 #include "xenia/ui/d3d12/d3d12_immediate_drawer.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 DEFINE_bool(d3d12_debug, false, "Enable Direct3D 12 and DXGI debug layer.",
             "D3D12");
+DEFINE_bool(
+    d3d12_dred, XE_PLATFORM_WINRT,
+    "Record Device Removed Extended Data: if the Direct3D 12 device is lost, "
+    "the log gets the GPU operations that did not complete and the allocation "
+    "at a faulting address. Costs a little GPU time.",
+    "D3D12");
 DEFINE_bool(d3d12_break_on_error, false,
             "Break on Direct3D 12 validation errors.", "D3D12");
 DEFINE_bool(d3d12_break_on_warning, false,
@@ -254,6 +264,22 @@ bool D3D12Provider::Initialize() {
     }
   }
 
+  // Device Removed Extended Data has to be set up before the device is
+  // created. Not every system provides it.
+  if (cvars::d3d12_dred) {
+    ID3D12DeviceRemovedExtendedDataSettings* dred_settings;
+    if (SUCCEEDED(
+            pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(
+          D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->Release();
+      XELOGD3D("Direct3D 12 DRED enabled");
+    } else {
+      XELOGD3D("Direct3D 12 DRED is unavailable");
+    }
+  }
+
   // Create the DXGI factory.
   IDXGIFactory2* dxgi_factory;
   if (FAILED(pfn_create_dxgi_factory2_(debug ? DXGI_CREATE_FACTORY_DEBUG : 0,
@@ -416,6 +442,9 @@ bool D3D12Provider::Initialize() {
     }
   }
 
+  // Named for Device Removed Extended Data reports.
+  direct_queue->SetName(L"Xenia direct queue");
+
   dxgi_factory_ = dxgi_factory;
   device_ = device;
   direct_queue_ = direct_queue;
@@ -497,6 +526,8 @@ bool D3D12Provider::Initialize() {
       alpha_blend_factor_supported_ ? "yes" : "no",
       uint32_t(resource_binding_tier_), uint32_t(tiled_resources_tier_),
       unaligned_block_textures_supported_ ? "yes" : "no");
+
+  LogVideoMemoryInfo("after device creation");
 
   // Get the graphics analysis interface, will silently fail if PIX is not
   // attached.
@@ -587,6 +618,230 @@ void D3D12Provider::LogD3D12DebugMessages() const {
 
   info_queue->ClearStoredMessages();
   info_queue->Release();
+}
+
+namespace {
+
+const char* DeviceRemovedReasonDescription(HRESULT reason) {
+  switch (reason) {
+    case S_OK:
+      return "the device is not removed";
+    case DXGI_ERROR_DEVICE_HUNG:
+      return "DXGI_ERROR_DEVICE_HUNG, the GPU stopped responding to a command";
+    case DXGI_ERROR_DEVICE_REMOVED:
+      return "DXGI_ERROR_DEVICE_REMOVED, the GPU or its driver went away";
+    case DXGI_ERROR_DEVICE_RESET:
+      return "DXGI_ERROR_DEVICE_RESET, a badly formed command reset the GPU";
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+      return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+    case DXGI_ERROR_INVALID_CALL:
+      return "DXGI_ERROR_INVALID_CALL, the API was used in an invalid way";
+    case E_OUTOFMEMORY:
+      return "E_OUTOFMEMORY";
+    default:
+      return "unrecognized";
+  }
+}
+
+const char* BreadcrumbOpName(D3D12_AUTO_BREADCRUMB_OP op) {
+  switch (op) {
+#define XE_D3D12_BREADCRUMB_OP(name) \
+  case D3D12_AUTO_BREADCRUMB_OP_##name:  \
+    return #name;
+    XE_D3D12_BREADCRUMB_OP(SETMARKER)
+    XE_D3D12_BREADCRUMB_OP(BEGINEVENT)
+    XE_D3D12_BREADCRUMB_OP(ENDEVENT)
+    XE_D3D12_BREADCRUMB_OP(DRAWINSTANCED)
+    XE_D3D12_BREADCRUMB_OP(DRAWINDEXEDINSTANCED)
+    XE_D3D12_BREADCRUMB_OP(EXECUTEINDIRECT)
+    XE_D3D12_BREADCRUMB_OP(DISPATCH)
+    XE_D3D12_BREADCRUMB_OP(COPYBUFFERREGION)
+    XE_D3D12_BREADCRUMB_OP(COPYTEXTUREREGION)
+    XE_D3D12_BREADCRUMB_OP(COPYRESOURCE)
+    XE_D3D12_BREADCRUMB_OP(COPYTILES)
+    XE_D3D12_BREADCRUMB_OP(RESOLVESUBRESOURCE)
+    XE_D3D12_BREADCRUMB_OP(CLEARRENDERTARGETVIEW)
+    XE_D3D12_BREADCRUMB_OP(CLEARUNORDEREDACCESSVIEW)
+    XE_D3D12_BREADCRUMB_OP(CLEARDEPTHSTENCILVIEW)
+    XE_D3D12_BREADCRUMB_OP(RESOURCEBARRIER)
+    XE_D3D12_BREADCRUMB_OP(EXECUTEBUNDLE)
+    XE_D3D12_BREADCRUMB_OP(PRESENT)
+    XE_D3D12_BREADCRUMB_OP(RESOLVEQUERYDATA)
+    XE_D3D12_BREADCRUMB_OP(BEGINSUBMISSION)
+    XE_D3D12_BREADCRUMB_OP(ENDSUBMISSION)
+    XE_D3D12_BREADCRUMB_OP(ATOMICCOPYBUFFERUINT)
+    XE_D3D12_BREADCRUMB_OP(ATOMICCOPYBUFFERUINT64)
+    XE_D3D12_BREADCRUMB_OP(RESOLVESUBRESOURCEREGION)
+    XE_D3D12_BREADCRUMB_OP(WRITEBUFFERIMMEDIATE)
+    XE_D3D12_BREADCRUMB_OP(SETPIPELINESTATE1)
+    XE_D3D12_BREADCRUMB_OP(BARRIER)
+    XE_D3D12_BREADCRUMB_OP(BEGIN_COMMAND_LIST)
+#undef XE_D3D12_BREADCRUMB_OP
+    default:
+      return nullptr;
+  }
+}
+
+const char* DredAllocationTypeName(D3D12_DRED_ALLOCATION_TYPE type) {
+  switch (type) {
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_QUEUE:
+      return "command queue";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_ALLOCATOR:
+      return "command allocator";
+    case D3D12_DRED_ALLOCATION_TYPE_PIPELINE_STATE:
+      return "pipeline state";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_LIST:
+      return "command list";
+    case D3D12_DRED_ALLOCATION_TYPE_FENCE:
+      return "fence";
+    case D3D12_DRED_ALLOCATION_TYPE_DESCRIPTOR_HEAP:
+      return "descriptor heap";
+    case D3D12_DRED_ALLOCATION_TYPE_HEAP:
+      return "heap";
+    case D3D12_DRED_ALLOCATION_TYPE_QUERY_HEAP:
+      return "query heap";
+    case D3D12_DRED_ALLOCATION_TYPE_COMMAND_SIGNATURE:
+      return "command signature";
+    case D3D12_DRED_ALLOCATION_TYPE_RESOURCE:
+      return "resource";
+    default:
+      return "object";
+  }
+}
+
+std::string DebugObjectName(const char* name_a, const wchar_t* name_w) {
+  if (name_w && *name_w) {
+    return xe::to_utf8(
+        std::u16string_view(reinterpret_cast<const char16_t*>(name_w)));
+  }
+  if (name_a && *name_a) {
+    return name_a;
+  }
+  return "unnamed";
+}
+
+void LogDredAllocations(const char* label,
+                        const D3D12_DRED_ALLOCATION_NODE* node) {
+  for (uint32_t i = 0; node && i < 16; node = node->pNext, ++i) {
+    XELOGE("DRED:   {} {} \"{}\"", label,
+           DredAllocationTypeName(node->AllocationType),
+           DebugObjectName(node->ObjectNameA, node->ObjectNameW));
+  }
+}
+
+}  // namespace
+
+void D3D12Provider::LogDeviceRemoval(const char* noticed_by) const {
+  if (!device_ || device_removal_logged_.test_and_set()) {
+    return;
+  }
+  const HRESULT reason = device_->GetDeviceRemovedReason();
+  XELOGE("Direct3D 12 device lost, noticed by {}: 0x{:08X} ({})", noticed_by,
+         uint32_t(reason), DeviceRemovedReasonDescription(reason));
+  LogVideoMemoryInfo("at the device loss");
+
+  ID3D12DeviceRemovedExtendedData* dred;
+  if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&dred)))) {
+    XELOGE("DRED: no data (not supported here, or d3d12_dred is off)");
+    xe::FlushLog();
+    return;
+  }
+
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+  const HRESULT breadcrumbs_result =
+      dred->GetAutoBreadcrumbsOutput(&breadcrumbs);
+  if (FAILED(breadcrumbs_result)) {
+    XELOGE("DRED: no breadcrumbs (0x{:08X})", uint32_t(breadcrumbs_result));
+  } else {
+    uint32_t incomplete_lists = 0;
+    for (const D3D12_AUTO_BREADCRUMB_NODE* node =
+             breadcrumbs.pHeadAutoBreadcrumbNode;
+         node; node = node->pNext) {
+      const uint32_t count = node->BreadcrumbCount;
+      const uint32_t completed =
+          node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+      if (completed >= count) {
+        continue;
+      }
+      if (++incomplete_lists > 8) {
+        XELOGE("DRED: more command lists did not complete");
+        break;
+      }
+      XELOGE(
+          "DRED: command list \"{}\" on queue \"{}\" completed {} of {} "
+          "operations",
+          DebugObjectName(node->pCommandListDebugNameA,
+                          node->pCommandListDebugNameW),
+          DebugObjectName(node->pCommandQueueDebugNameA,
+                          node->pCommandQueueDebugNameW),
+          completed, count);
+      if (!node->pCommandHistory) {
+        continue;
+      }
+      const uint32_t first = completed > 8 ? completed - 8 : 0;
+      const uint32_t end = std::min(count, completed + 4);
+      for (uint32_t i = first; i < end; ++i) {
+        const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+        const char* op_name = BreadcrumbOpName(op);
+        XELOGE("DRED:   {} {} {}", i == completed ? "->" : "  ", i,
+               op_name ? std::string(op_name)
+                       : fmt::format("operation {}", int(op)));
+      }
+    }
+    if (!incomplete_lists) {
+      XELOGE("DRED: every recorded command list completed");
+    }
+  }
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+  const HRESULT page_fault_result =
+      dred->GetPageFaultAllocationOutput(&page_fault);
+  if (FAILED(page_fault_result)) {
+    XELOGE("DRED: no page fault data (0x{:08X})", uint32_t(page_fault_result));
+  } else if (!page_fault.PageFaultVA) {
+    XELOGE("DRED: no GPU page fault");
+  } else {
+    XELOGE("DRED: GPU page fault at virtual address 0x{:016X}",
+           uint64_t(page_fault.PageFaultVA));
+    LogDredAllocations("allocated there:",
+                       page_fault.pHeadExistingAllocationNode);
+    LogDredAllocations("recently freed there:",
+                       page_fault.pHeadRecentFreedAllocationNode);
+  }
+  dred->Release();
+  xe::FlushLog();
+}
+
+void D3D12Provider::LogVideoMemoryInfo(const char* when) const {
+  if (!device_ || !dxgi_factory_) {
+    return;
+  }
+  IDXGIFactory4* dxgi_factory_4;
+  if (FAILED(dxgi_factory_->QueryInterface(IID_PPV_ARGS(&dxgi_factory_4)))) {
+    return;
+  }
+  IDXGIAdapter3* adapter_3;
+  const HRESULT adapter_result = dxgi_factory_4->EnumAdapterByLuid(
+      device_->GetAdapterLuid(), IID_PPV_ARGS(&adapter_3));
+  dxgi_factory_4->Release();
+  if (FAILED(adapter_result)) {
+    return;
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+  DXGI_QUERY_VIDEO_MEMORY_INFO non_local = {};
+  const bool have_local = SUCCEEDED(adapter_3->QueryVideoMemoryInfo(
+      0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local));
+  const bool have_non_local = SUCCEEDED(adapter_3->QueryVideoMemoryInfo(
+      0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non_local));
+  adapter_3->Release();
+  if (have_local) {
+    XELOGD3D("GPU memory {}: local {} MiB in use, budget {} MiB", when,
+             local.CurrentUsage >> 20, local.Budget >> 20);
+  }
+  if (have_non_local) {
+    XELOGD3D("GPU memory {}: non-local {} MiB in use, budget {} MiB", when,
+             non_local.CurrentUsage >> 20, non_local.Budget >> 20);
+  }
 }
 
 }  // namespace d3d12
