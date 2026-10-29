@@ -408,6 +408,8 @@ class XThread : public XObject, public cpu::Thread {
   static bool IsInThread(XThread* other);
   static bool IsInThread();
   static XThread* GetCurrentThread();
+  // The guest thread running on the calling host thread, or null.
+  static XThread* TryGetCurrentThread();
   static uint32_t GetCurrentThreadHandle();
   static uint32_t GetCurrentThreadId();
 

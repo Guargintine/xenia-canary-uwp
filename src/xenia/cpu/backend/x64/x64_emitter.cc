@@ -433,7 +433,8 @@ uint64_t TrapDebugBreak(void* raw_context, uint64_t address) {
   auto thread_state =
       reinterpret_cast<ppc::PPCContext_s*>(raw_context)->thread_state;
   XELOGE("tw/td forced trap hit! This should be a crash!");
-  if (cvars::break_on_debugbreak) {
+  // Without a debugger the breakpoint would end the process silently.
+  if (cvars::break_on_debugbreak && xe::debugging::IsDebuggerAttached()) {
     xe::debugging::Break();
   }
   return 0;

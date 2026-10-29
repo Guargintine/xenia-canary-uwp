@@ -24,6 +24,9 @@
 #include "xenia/kernel/kernel_state.h"
 
 namespace xe {
+namespace crash_report {
+class Writer;
+}  // namespace crash_report
 namespace kernel {
 
 using PPCContext = xe::cpu::ppc::PPCContext;
@@ -500,6 +503,16 @@ void AppendKernelCallParams(StringBuffer& string_buffer,
 
 StringBuffer* thread_local_string_buffer();
 
+// Each thread keeps its last kernel calls (export, caller, first arguments) so
+// a crash report or an unexpected exit can say what the guest was doing.
+void TraceKernelCall(const cpu::Export* export_entry,
+                     const PPCContext* ppc_context);
+void DescribeRecentKernelCalls(uint32_t host_thread_id,
+                               crash_report::Writer& out);
+// Logs `what` (a guest request to leave, or a debug break), the guest caller
+// and the calling thread's last kernel calls, then flushes the log.
+void LogGuestEvent(std::string_view what, const PPCContext* ppc_context);
+
 template <typename Tuple>
 XE_NOALIAS void PrintKernelCall(cpu::Export* export_entry,
                                 const Tuple& params) {
@@ -544,6 +557,7 @@ struct ExportRegistrerHelper {
         new cpu::Export(ORDINAL, xe::cpu::Export::Type::kFunction, name, TAGS);
     struct X {
       static void Trampoline(PPCContext* ppc_context) {
+        TraceKernelCall(export_entry, ppc_context);
         Param::Init init = {
             ppc_context,
             0,

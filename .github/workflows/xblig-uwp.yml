@@ -117,6 +117,37 @@ jobs:
           Get-ChildItem out | Format-Table Name, Length -AutoSize
           "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Collect symbols
+        shell: pwsh
+        run: |
+          # The PDB turns the module+offset frames in crash reports into
+          # function names. It must come from this build.
+          $exe = Get-ChildItem -Path build/uwp -Recurse -File -Filter xeniacanary.exe |
+            Where-Object { $_.FullName -notmatch '\\AppPackages\\' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $pdb = $null
+          if ($exe) {
+            $candidate = Join-Path $exe.DirectoryName 'xeniacanary.pdb'
+            if (Test-Path $candidate) { $pdb = Get-Item $candidate }
+          }
+          if (-not $pdb) {
+            $pdb = Get-ChildItem -Path build/uwp -Recurse -File -Filter xeniacanary.pdb |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          }
+          if (-not $pdb) {
+            Write-Warning 'xeniacanary.pdb not found; largest PDBs:'
+            Get-ChildItem -Path build/uwp -Recurse -File -Filter *.pdb |
+              Sort-Object Length -Descending | Select-Object -First 8 |
+              Format-Table FullName, Length -AutoSize | Out-String | Write-Output
+            exit 0
+          }
+          Write-Output "Symbols: $($pdb.FullName) ($($pdb.Length) bytes)"
+          [xml]$manifest = Get-Content xenia-canary-uwp/Package.appxmanifest
+          $version = $manifest.Package.Identity.Version
+          $zip = "out/xeniacanary-$version-symbols.zip"
+          Compress-Archive -Path $pdb.FullName -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Format-Table Name, Length -AutoSize
+
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
@@ -134,6 +165,7 @@ jobs:
             'Experimental Xenia Canary UWP build with Xbox Live Indie Game support, for Xbox One / Series consoles in Developer Mode.',
             '',
             'Install Xenia-XBLIG-*.appx through Device Portal (add Microsoft.VCLibs.x64.14.00.appx as its dependency if asked), then set the app type to Game.',
+            'The symbols zip is for reading crash reports; you do not need it to play.',
             'Setup: docs/xblig-uwp.md. Built from ${{ github.sha }}.'
           ) -join "`n"
           $files = Get-ChildItem out -File | ForEach-Object FullName

@@ -71,6 +71,11 @@ Config:
   run on a console before.
 - `LocalState\xenia.log` shows `Xbox Live Indie Game detected`,
   `XNA title launcher:` and, on failures, the reason.
+- When Xenia closes on its own, the log ends with why: a crash report between
+  `====` lines (also kept in `LocalState\xenia-crash.txt` until the next
+  crash), or the guest call that asked to close, with the calls before it.
+  Each release has a symbols zip that turns the report's `xeniacanary+0x...`
+  offsets into function names.
 
 ## Building
 

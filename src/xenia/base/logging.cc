@@ -519,7 +519,8 @@ void logging::internal::AppendLogLine(LogLevel log_level,
 
 void logging::AppendLogLine(LogLevel log_level, const char prefix_char,
                             const std::string_view str, uint32_t log_mask) {
-  if (!ShouldLog(log_level, log_mask) || !str.size()) {
+  // Crash reports can come before logging starts or after it stops.
+  if (!logger_ || !ShouldLog(log_level, log_mask) || !str.size()) {
     return;
   }
   logger_->AppendLine(xe::threading::current_thread_id(), prefix_char,

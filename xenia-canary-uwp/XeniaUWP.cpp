@@ -20,6 +20,7 @@
 
 #include "xenia/apu/xaudio2/xaudio2_audio_system.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/crash_report.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -174,12 +175,21 @@ bool UWP::HasQuit() {
 }
 
 void UWP::RequestQuit() {
+  // Who asked to close: the stack names the caller (a dialog, the guide, a
+  // guest request) once symbolized.
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    xe::crash_report::LogCurrentStack("Xenia was asked to close");
+  }
   if (app_context) {
     app_context->QuitFromUIThread();
   }
 }
 
 void UWP::ShutdownXenia() {
+  XELOGI("UWP shutting down Xenia");
+  xe::FlushLog();
   SetHostGuideAction({});
   if (app) {
     app->InvokeOnDestroy();

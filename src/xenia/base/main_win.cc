@@ -9,7 +9,9 @@
 
 #include <cstring>
 
+#include "xenia/base/crash_report.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/main_win.h"
 #include "xenia/base/platform_win.h"
@@ -29,6 +31,11 @@ DEFINE_bool(
     "Opt in the Multimedia Class Scheduler Service (MMCSS) scheduling for "
     "prioritized access to CPU resources",
     "Win32");
+DEFINE_bool(crash_reporter, XE_PLATFORM_WINRT != 0,
+            "When Xenia dies of a host exception, abort() or another fatal "
+            "runtime error, write why (the host stack and the guest's last "
+            "kernel calls) to the log and to xenia-crash.txt next to it.",
+            "Win32");
 
 namespace xe {
 
@@ -138,6 +145,13 @@ int InitializeWin32App(const std::string_view app_name) {
       "PR#" XE_BUILD_PR_NUMBER " - "
 #endif
       XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE);
+
+  if (cvars::crash_reporter) {
+    crash_report::Install(
+        xe::filesystem::GetExecutableFolder() / "xenia-crash.txt",
+        "Xenia build " XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT
+        " on " XE_BUILD_DATE);
+  }
 
   // Request high-performance timing and scheduling.
   if (cvars::win32_high_resolution_timer) {

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -144,6 +145,90 @@ bool UWP::ShouldReturnToFrontend() {
   return launch_state.ShouldReturnToFrontend();
 }
 
+namespace {
+
+const char* MemoryUsageLevelName(
+    winrt::Windows::System::AppMemoryUsageLevel level) {
+  switch (level) {
+    case winrt::Windows::System::AppMemoryUsageLevel::Low:
+      return "low";
+    case winrt::Windows::System::AppMemoryUsageLevel::Medium:
+      return "medium";
+    case winrt::Windows::System::AppMemoryUsageLevel::High:
+      return "high";
+    case winrt::Windows::System::AppMemoryUsageLevel::OverLimit:
+      return "over the limit";
+    default:
+      return "unknown";
+  }
+}
+
+// How long Xenia has been running and how close it is to the console's memory
+// limit for it, so a log that just stops says when, and whether memory ran
+// out.
+void LogHeartbeat(std::chrono::steady_clock::time_point start) {
+  using winrt::Windows::System::MemoryManager;
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  try {
+    XELOGI("UWP heartbeat at {} s: app memory {} MiB of {} MiB, usage {}",
+           seconds, MemoryManager::AppMemoryUsage() >> 20,
+           MemoryManager::AppMemoryUsageLimit() >> 20,
+           MemoryUsageLevelName(MemoryManager::AppMemoryUsageLevel()));
+  } catch (const winrt::hresult_error& error) {
+    XELOGW("UWP heartbeat at {} s: memory query failed: 0x{:08X}", seconds,
+           static_cast<uint32_t>(error.code().value));
+  }
+}
+
+// Logs what the system does to the app: suspension, backgrounding, memory
+// pressure. When it ends the app, these may be the only trace.
+void WatchAppLifecycle() {
+  using winrt::Windows::System::MemoryManager;
+  CoreApplication::Suspending([](auto const&, auto const&) {
+    XELOGW("UWP lifecycle: the system is suspending Xenia");
+    xe::FlushLog();
+  });
+  CoreApplication::Resuming(
+      [](auto const&, auto const&) { XELOGI("UWP lifecycle: resumed"); });
+  CoreApplication::EnteredBackground([](auto const&, auto const&) {
+    XELOGW("UWP lifecycle: Xenia went to the background");
+    xe::FlushLog();
+  });
+  CoreApplication::LeavingBackground([](auto const&, auto const&) {
+    XELOGI("UWP lifecycle: Xenia is back in the foreground");
+  });
+  CoreApplication::Exiting([](auto const&, auto const&) {
+    XELOGI("UWP lifecycle: exiting");
+    xe::FlushLog();
+  });
+  try {
+    MemoryManager::AppMemoryUsageIncreased([](auto const&, auto const&) {
+      try {
+        XELOGW("UWP memory usage rose to {}: {} MiB of {} MiB",
+               MemoryUsageLevelName(MemoryManager::AppMemoryUsageLevel()),
+               MemoryManager::AppMemoryUsage() >> 20,
+               MemoryManager::AppMemoryUsageLimit() >> 20);
+        xe::FlushLog();
+      } catch (const winrt::hresult_error&) {
+      }
+    });
+    MemoryManager::AppMemoryUsageLimitChanging(
+        [](auto const&, winrt::Windows::System::
+                            AppMemoryUsageLimitChangingEventArgs const& args) {
+          XELOGW("UWP memory limit changing from {} MiB to {} MiB",
+                 args.OldLimit() >> 20, args.NewLimit() >> 20);
+          xe::FlushLog();
+        });
+  } catch (const winrt::hresult_error& error) {
+    XELOGW("UWP memory notifications unavailable: 0x{:08X}",
+           static_cast<uint32_t>(error.code().value));
+  }
+}
+
+}  // namespace
+
 void UWP::ReturnToFrontend(xe::ui::ImGuiDrawer* drawer) {
   auto return_uri = launch_state.TakeFrontendReturnUri();
   if (!return_uri.empty()) {
@@ -184,6 +269,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
       UWP::SetDPI(displayInfo.LogicalDpi());
     }
 
+    const auto start = std::chrono::steady_clock::now();
     UWP::StartXenia();
 
     try {
@@ -195,15 +281,24 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
       XELOGW("Unable to query UWP app memory limit: 0x{:08X}",
              static_cast<uint32_t>(error.code().value));
     }
+    WatchAppLifecycle();
 
+    constexpr auto kHeartbeatInterval = std::chrono::seconds(15);
+    auto next_heartbeat = start + kHeartbeatInterval;
     while (!UWP::HasQuit()) {
       CoreWindow::GetForCurrentThread().Dispatcher().ProcessEvents(
           CoreProcessEventsOption::ProcessAllIfPresent);
 
       UWP::ExecutePendingFunctionsFromUIThread();
 
+      if (std::chrono::steady_clock::now() >= next_heartbeat) {
+        next_heartbeat += kHeartbeatInterval;
+        LogHeartbeat(start);
+      }
+
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    XELOGI("UWP main loop ended: Xenia is closing");
 
     if (UWP::ShouldReturnToFrontend()) {
       try {

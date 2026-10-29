@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
@@ -23,7 +25,20 @@ namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-void DbgBreakPoint_entry() { xe::debugging::Break(); }
+void DbgBreakPoint_entry(const ppc_context_t& ppc_context) {
+  if (xe::debugging::IsDebuggerAttached()) {
+    xe::debugging::Break();
+    return;
+  }
+  // With no debugger to take it, a host breakpoint ends Xenia without a word.
+  // Log it and let the title go on: what it does next says more.
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+    shim::LogGuestEvent(
+        "The title called DbgBreakPoint with no debugger attached; ignored",
+        ppc_context.value());
+  }
+}
 DECLARE_XBOXKRNL_EXPORT2(DbgBreakPoint, kDebug, kStub, kImportant);
 
 // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx

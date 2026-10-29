@@ -38,6 +38,12 @@
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
 #include "xenia/kernel/xam/ui/passcode_ui.h"
 #include "xenia/kernel/xam/ui/signin_ui.h"
+#include "xenia/ui/window.h"
+#include "xenia/ui/windowed_app_context.h"
+
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
 
 DEFINE_bool(storage_selection_dialog, false,
             "Show storage device selection dialog when the game requests it.",
@@ -887,12 +893,40 @@ dword_result_t XamShowDeviceSelectorUI_entry(
 }
 DECLARE_XAM_EXPORT1(XamShowDeviceSelectorUI, kUI, kImplemented);
 
-void XamShowDirtyDiscErrorUI_entry(dword_t user_index) {
+void XamShowDirtyDiscErrorUI_entry(dword_t user_index,
+                                   const ppc_context_t& ppc_context) {
+  shim::LogGuestEvent(
+      "The title could not read its files and showed the disc read error "
+      "(XamShowDirtyDiscErrorUI): Xenia closes",
+      ppc_context.value());
   if (cvars::headless) {
     assert_always();
     exit(1);
     return;
   }
+#if XE_PLATFORM_WINRT
+  // exit() would close Xenia before the message could be read: show it, and
+  // close when it is dismissed.
+  {
+    const Emulator* emulator = kernel_state()->emulator();
+    xe::ui::ImGuiDrawer* drawer = emulator->imgui_drawer();
+    if (emulator->display_window() && drawer) {
+      emulator->display_window()->app_context().CallInUIThreadSynchronous(
+          [drawer]() {
+            auto dialog = xe::ui::ImGuiDialog::ShowMessageBox(
+                drawer, "Disc Read Error",
+                "The game could not read its files, so it stopped. Select OK "
+                "to close Xenia.\n\nThe calls that failed are in xenia.log.");
+            dialog->Then([]() {
+              xe::FlushLog();
+              UWP::RequestQuit();
+            });
+          });
+      kernel_state()->TerminateTitle();
+      return;
+    }
+  }
+#endif
 
   std::string title = "Disc Read Error";
   std::string desc =

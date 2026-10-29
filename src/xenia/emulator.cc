@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/crash_report.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
@@ -47,6 +49,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -133,6 +136,133 @@ DECLARE_bool(upnp);
 
 namespace xe {
 using namespace xe::literals;
+
+namespace {
+
+// What crash reports can say about the guest, from the running emulator.
+std::atomic<Emulator*> crash_report_emulator{nullptr};
+
+cpu::backend::CodeCache* CrashReportCodeCache() {
+  Emulator* emulator = crash_report_emulator.load(std::memory_order_acquire);
+  cpu::Processor* processor = emulator ? emulator->processor() : nullptr;
+  if (!processor || !processor->backend()) {
+    return nullptr;
+  }
+  return processor->backend()->code_cache();
+}
+
+void* CrashReportCurrentGuestThread() {
+  return kernel::XThread::TryGetCurrentThread();
+}
+
+void CrashReportDescribeGuestThread(void* guest_thread,
+                                    crash_report::Writer& out) {
+  auto thread = static_cast<kernel::XThread*>(guest_thread);
+  out.Append("guest thread {:08X} '{}'", thread->handle(), thread->name());
+  cpu::ThreadState* thread_state = thread->thread_state();
+  const cpu::ppc::PPCContext* context =
+      thread_state ? thread_state->context() : nullptr;
+  if (!context) {
+    return;
+  }
+  out.Append(" (lr {:08X} ctr {:08X} r1 {:08X} r3 {:08X} r4 {:08X} r5 {:08X})",
+             uint32_t(context->lr), uint32_t(context->ctr),
+             uint32_t(context->r[1]), uint32_t(context->r[3]),
+             uint32_t(context->r[4]), uint32_t(context->r[5]));
+  Emulator* emulator = crash_report_emulator.load(std::memory_order_acquire);
+  Memory* memory = emulator ? emulator->memory() : nullptr;
+  if (memory && memory->alias_space_membase() &&
+      context->virtual_membase == memory->alias_space_membase()) {
+    out.AppendText(", in user mode");
+  }
+}
+
+bool CrashReportIsGeneratedCode(uint64_t host_pc) {
+  cpu::backend::CodeCache* code_cache = CrashReportCodeCache();
+  if (!code_cache) {
+    return false;
+  }
+  const uint64_t base = code_cache->execute_base_address();
+  return host_pc >= base && host_pc < base + code_cache->total_size();
+}
+
+void* CrashReportLookupUnwindInfo(uint64_t host_pc, uint64_t* image_base) {
+  cpu::backend::CodeCache* code_cache = CrashReportCodeCache();
+  if (!code_cache) {
+    return nullptr;
+  }
+  *image_base = code_cache->execute_base_address();
+  return code_cache->LookupUnwindInfo(host_pc);
+}
+
+void CrashReportDescribeGeneratedCode(uint64_t host_pc,
+                                      crash_report::Writer& out) {
+  cpu::backend::CodeCache* code_cache = CrashReportCodeCache();
+  cpu::GuestFunction* function =
+      code_cache ? code_cache->LookupFunction(host_pc) : nullptr;
+  if (!function) {
+    out.Append("generated code 0x{:X} (a thunk or no guest function)",
+               host_pc);
+    return;
+  }
+  out.Append("guest {:08X} in function {:08X}",
+             function->MapMachineCodeToGuestAddress(host_pc),
+             function->address());
+  if (!function->name().empty()) {
+    out.Append(" {}", function->name());
+  }
+}
+
+bool CrashReportDescribeDataAddress(uint64_t host_address,
+                                    crash_report::Writer& out) {
+  Emulator* emulator = crash_report_emulator.load(std::memory_order_acquire);
+  Memory* memory = emulator ? emulator->memory() : nullptr;
+  if (!memory) {
+    return false;
+  }
+  constexpr uint64_t kAddressSpaceSize = UINT64_C(0x100000000);
+  const uint64_t user = uint64_t(memory->alias_space_membase());
+  if (user && host_address >= user && host_address - user < kAddressSpaceSize) {
+    out.Append("user mode address {:08X}", uint32_t(host_address - user));
+    return true;
+  }
+  const uint64_t virtual_base = uint64_t(memory->virtual_membase());
+  if (host_address >= virtual_base &&
+      host_address - virtual_base < kAddressSpaceSize) {
+    out.Append("guest address {:08X}", uint32_t(host_address - virtual_base));
+    return true;
+  }
+  const uint64_t physical_base = uint64_t(memory->physical_membase());
+  if (host_address >= physical_base &&
+      host_address - physical_base < UINT64_C(0x20000000)) {
+    out.Append("guest physical address {:08X}",
+               uint32_t(host_address - physical_base));
+    return true;
+  }
+  return false;
+}
+
+void InstallCrashReportHooks(Emulator* emulator) {
+  crash_report_emulator.store(emulator, std::memory_order_release);
+  crash_report::GuestHooks hooks;
+  hooks.current_guest_thread = CrashReportCurrentGuestThread;
+  hooks.describe_guest_thread = CrashReportDescribeGuestThread;
+  hooks.is_generated_code = CrashReportIsGeneratedCode;
+  hooks.lookup_unwind_info = CrashReportLookupUnwindInfo;
+  hooks.describe_generated_code = CrashReportDescribeGeneratedCode;
+  hooks.describe_data_address = CrashReportDescribeDataAddress;
+  hooks.describe_recent_activity = kernel::shim::DescribeRecentKernelCalls;
+  crash_report::SetGuestHooks(hooks);
+}
+
+void RemoveCrashReportHooks(Emulator* emulator) {
+  Emulator* expected = emulator;
+  if (crash_report_emulator.compare_exchange_strong(expected, nullptr)) {
+    crash_report::ClearGuestHooks();
+  }
+}
+
+}  // namespace
 
 Emulator::GameConfigLoadCallback::GameConfigLoadCallback(Emulator& emulator)
     : emulator_(emulator) {
@@ -229,6 +359,8 @@ Emulator::~Emulator() {
   graphics_system_.reset();
   audio_system_.reset();
 
+  // Guest threads and generated code go away from here on.
+  RemoveCrashReportHooks(this);
   kernel_state_.reset();
   file_system_.reset();
 
@@ -407,6 +539,7 @@ X_STATUS Emulator::Setup(
 
   // Initialize emulator fallback exception handling last.
   ExceptionHandler::Install(Emulator::ExceptionCallbackThunk, this);
+  InstallCrashReportHooks(this);
   SetupFileSystem();
 
   return result;
@@ -546,6 +679,7 @@ X_STATUS Emulator::ResetTitle() {
   game_info_database_.reset();
   plugin_loader_.reset();
   patcher_.reset();
+  RemoveCrashReportHooks(this);
   kernel_state_.reset();
   file_system_.reset();
   ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);

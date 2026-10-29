@@ -574,7 +574,8 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
 
-void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
+void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags,
+                                const ppc_context_t& ppc_context) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
 
   auto& loader_data = xam->loader_data();
@@ -589,6 +590,11 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
     XELOGI("UWP title restart requested: {}; saved: {}",
            loader_data.launch_path, saved);
   }
+  shim::LogGuestEvent(restart ? "The title asked to launch another title "
+                                "(XamLoaderLaunchTitle): Xenia restarts"
+                              : "The title asked to return to the dashboard "
+                                "(XamLoaderLaunchTitle): Xenia closes",
+                      ppc_context.value());
   auto emulator = kernel_state()->emulator();
   emulator->display_window()->app_context().CallInUIThreadSynchronous(
       [drawer = emulator->imgui_drawer(), restart, saved]() {
@@ -648,8 +654,12 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
-void XamLoaderTerminateTitle_entry() {
+void XamLoaderTerminateTitle_entry(const ppc_context_t& ppc_context) {
 #if XE_PLATFORM_WINRT
+  shim::LogGuestEvent(
+      "The title asked to return to the dashboard (XamLoaderTerminateTitle): "
+      "Xenia closes",
+      ppc_context.value());
   kernel_state()->emulator()->display_window()->app_context()
       .CallInUIThreadSynchronous([]() { UWP::RequestQuit(); });
 #else

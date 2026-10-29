@@ -118,6 +118,8 @@ XThread* XThread::GetCurrentThread() {
   return thread;
 }
 
+XThread* XThread::TryGetCurrentThread() { return current_xthread_tls_; }
+
 uint32_t XThread::GetCurrentThreadHandle() {
   XThread* thread = XThread::GetCurrentThread();
   return thread->handle();

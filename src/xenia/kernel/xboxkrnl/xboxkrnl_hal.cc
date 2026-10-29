@@ -7,9 +7,16 @@
  ******************************************************************************
  */
 
+#include "xenia/emulator.h"
 #include "xenia/kernel/smc.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/ui/window.h"
+#include "xenia/ui/windowed_app_context.h"
+
+#if XE_PLATFORM_WINRT
+#include "xenia-canary-uwp/XeniaUWP.h"
+#endif
 
 DECLARE_int32(avpack);
 
@@ -29,16 +36,26 @@ constexpr std::array<std::string_view, 9> FirmwareReentryMessage = {
     "Shut off",
 };
 
-void HalReturnToFirmware_entry(dword_t routine) {
-  // TODO(benvank): diediedie much more gracefully
-  // Not sure how to blast back up the stack in LLVM without exceptions, though.
+void HalReturnToFirmware_entry(dword_t routine,
+                               const ppc_context_t& ppc_context) {
   const std::string exitMessage = fmt::format(
       "Game requested a {} via HalReturnToFirmware",
       static_cast<size_t>(routine) < FirmwareReentryMessage.size()
           ? FirmwareReentryMessage[routine]
           : fmt::format("Reboot (Routine Code: {})", routine.value()));
-  XELOGE(exitMessage);
+  // Logged and flushed with what led to it: exit() can end the process before
+  // the log writer gets to a line logged just before.
+  shim::LogGuestEvent(exitMessage, ppc_context.value());
+#if XE_PLATFORM_WINRT
+  // Close Xenia the way XamLoaderTerminateTitle does.
+  kernel_state()->emulator()->display_window()->app_context()
+      .CallInUIThreadSynchronous([]() { UWP::RequestQuit(); });
+  kernel_state()->TerminateTitle();
+#else
+  // TODO(benvank): diediedie much more gracefully
+  // Not sure how to blast back up the stack in LLVM without exceptions, though.
   exit(0);
+#endif
 }
 DECLARE_XBOXKRNL_EXPORT2(HalReturnToFirmware, kNone, kStub, kImportant);
 
