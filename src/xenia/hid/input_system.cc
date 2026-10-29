@@ -202,7 +202,13 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
 #if XE_PLATFORM_WIN32
   merged_input_[user_index].Update(false, *out_state);
 #endif
-  UpdateUsedSlot(nullptr, user_index, false);
+  // Only a query that includes the controller can find it gone. The XNA
+  // runtime reads the keyboard every frame; with no keyboard that read fails,
+  // and treating it as a disconnect flipped the slot on every frame and sent
+  // the title an input device change each time.
+  if (flags & InputType::Controller) {
+    UpdateUsedSlot(nullptr, user_index, false);
+  }
   return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
