@@ -193,9 +193,13 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   }
 
   // Runtime code ends a function before the next declared entry (see
-  // PPCScanner::Scan), not only after an unconditional branch. Run on into
-  // the code that follows, as the guest would.
-  if (function_->module()->is_runtime_code()) {
+  // PPCScanner::Scan), not only after an unconditional branch. Where the scan
+  // stopped there, run on into the code that follows, as the guest would.
+  // Other ends (a return, zeros after a call that does not return) stay as
+  // they were.
+  if (function_->module()->is_runtime_code() &&
+      function_->module()->NextFunctionEntry(start_address) ==
+          end_address + 4) {
     const uint32_t last_code =
         xe::load_and_swap<uint32_t>(memory->TranslateVirtual(end_address));
     const bool ends_unconditionally =
