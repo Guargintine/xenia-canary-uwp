@@ -61,7 +61,22 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
   size_t blocks_found = 0;
   bool in_block = false;
   bool starts_with_mfspr_lr = false;
+  // Runtime code has no .pdata. Without a bound the scan can run on through
+  // the methods a JIT laid out after this one, and every method written there
+  // later invalidates the whole translation, which then gets translated
+  // again. End at the next entry another call declared, and let
+  // PPCHIRBuilder run on into it.
+  const uint32_t next_entry =
+      function->module()->is_runtime_code()
+          ? function->module()->NextFunctionEntry(start_address)
+          : 0;
   while (true) {
+    if (next_entry && address >= next_entry) {
+      LOGPPC("function end {:08X} (next entry {:08X})", address - 4,
+             next_entry);
+      address -= 4;
+      break;
+    }
     uint32_t code =
         xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
 

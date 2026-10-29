@@ -14,6 +14,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/crash_report.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
@@ -125,6 +126,14 @@ class Win32X64CodeCache : public X64CodeCache {
                              void* code_execute_address,
                              const EmitFunctionInfo& func_info);
 
+  // The size of the translated code, for heartbeats and crash reports.
+  static void DescribeStatus(void* context, xe::crash_report::Writer& out) {
+    auto code_cache = static_cast<const Win32X64CodeCache*>(context);
+    out.Append("translated code {} MiB in {} functions",
+               code_cache->generated_code_offset_ >> 20,
+               code_cache->unwind_table_count_.load(std::memory_order_relaxed));
+  }
+
   // Growable function table system handle.
   void* unwind_table_handle_ = nullptr;
   // Actual unwind table entries.
@@ -146,6 +155,7 @@ std::unique_ptr<X64CodeCache> X64CodeCache::Create() {
 Win32X64CodeCache::Win32X64CodeCache() = default;
 
 Win32X64CodeCache::~Win32X64CodeCache() {
+  xe::crash_report::RemoveStatusSource(DescribeStatus, this);
   if (supports_growable_table_) {
     if (unwind_table_handle_) {
       delete_growable_table_(unwind_table_handle_);
@@ -183,6 +193,8 @@ bool Win32X64CodeCache::Initialize() {
   }
   supports_growable_table_ =
       add_growable_table_ && delete_growable_table_ && grow_table_;
+
+  xe::crash_report::AddStatusSource(DescribeStatus, this);
 
   // Create table and register with the system. It's empty now, but we'll grow
   // it as functions are added.

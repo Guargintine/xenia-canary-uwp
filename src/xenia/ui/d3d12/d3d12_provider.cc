@@ -89,6 +89,10 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
 }
 
 D3D12Provider::~D3D12Provider() {
+  if (memory_info_adapter_ != nullptr) {
+    xe::crash_report::RemoveStatusSource(DescribeMemoryStatus, this);
+    memory_info_adapter_->Release();
+  }
   if (graphics_analysis_ != nullptr) {
     graphics_analysis_->Release();
   }
@@ -528,6 +532,19 @@ bool D3D12Provider::Initialize() {
       unaligned_block_textures_supported_ ? "yes" : "no");
 
   LogVideoMemoryInfo("after device creation");
+  {
+    IDXGIFactory4* dxgi_factory_4;
+    if (SUCCEEDED(dxgi_factory_->QueryInterface(IID_PPV_ARGS(&dxgi_factory_4)))) {
+      if (FAILED(dxgi_factory_4->EnumAdapterByLuid(
+              device_->GetAdapterLuid(), IID_PPV_ARGS(&memory_info_adapter_)))) {
+        memory_info_adapter_ = nullptr;
+      }
+      dxgi_factory_4->Release();
+    }
+    if (memory_info_adapter_) {
+      xe::crash_report::AddStatusSource(DescribeMemoryStatus, this);
+    }
+  }
 
   // Get the graphics analysis interface, will silently fail if PIX is not
   // attached.
@@ -810,6 +827,20 @@ void D3D12Provider::LogDeviceRemoval(const char* noticed_by) const {
   }
   dred->Release();
   xe::FlushLog();
+}
+
+void D3D12Provider::DescribeMemoryStatus(void* context,
+                                         xe::crash_report::Writer& out) {
+  auto provider = static_cast<const D3D12Provider*>(context);
+  DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+  if (provider->memory_info_adapter_ &&
+      SUCCEEDED(provider->memory_info_adapter_->QueryVideoMemoryInfo(
+          0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+    out.Append("GPU memory {} MiB of a {} MiB budget",
+               uint64_t(local.CurrentUsage >> 20), uint64_t(local.Budget >> 20));
+  } else {
+    out.AppendText("GPU memory unknown");
+  }
 }
 
 void D3D12Provider::LogVideoMemoryInfo(const char* when) const {

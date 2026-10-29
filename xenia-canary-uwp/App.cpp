@@ -28,6 +28,7 @@
 #include "XeniaUWP.h"
 #include "app_launch_state.h"
 #include "protocol_activation.h"
+#include "xenia/base/crash_report.h"
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
 #include "xenia/ui/imgui_dialog.h"
@@ -171,11 +172,15 @@ void LogHeartbeat(std::chrono::steady_clock::time_point start) {
   const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
+  char status_buffer[768];
+  xe::crash_report::Writer status(status_buffer, sizeof(status_buffer));
+  xe::crash_report::DescribeStatus(status);
   try {
-    XELOGI("UWP heartbeat at {} s: app memory {} MiB of {} MiB, usage {}",
+    XELOGI("UWP heartbeat at {} s: app memory {} MiB of {} MiB, usage {}; {}",
            seconds, MemoryManager::AppMemoryUsage() >> 20,
            MemoryManager::AppMemoryUsageLimit() >> 20,
-           MemoryUsageLevelName(MemoryManager::AppMemoryUsageLevel()));
+           MemoryUsageLevelName(MemoryManager::AppMemoryUsageLevel()),
+           status.view());
   } catch (const winrt::hresult_error& error) {
     XELOGW("UWP heartbeat at {} s: memory query failed: 0x{:08X}", seconds,
            static_cast<uint32_t>(error.code().value));

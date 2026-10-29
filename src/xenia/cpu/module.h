@@ -38,6 +38,13 @@ class Module {
 
   virtual bool ContainsAddress(uint32_t address);
 
+  // Code the guest writes at runtime, such as the XNA runtime's JIT output. It
+  // has no .pdata, so a function ends before the next function entry declared
+  // above it and runs on into it.
+  virtual bool is_runtime_code() const { return false; }
+  // The lowest function entry declared above |address|, or 0 for none.
+  virtual uint32_t NextFunctionEntry(uint32_t address) { return 0; }
+
   Symbol* LookupSymbol(uint32_t address, bool wait = true);
   virtual Symbol::Status DeclareFunction(uint32_t address,
                                          Function** out_function);

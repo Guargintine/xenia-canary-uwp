@@ -93,6 +93,15 @@ void ClearGuestHooks();
 // Appends "module+0xOFFSET" (or the guest code) for a host code address.
 void DescribeHostAddress(uint64_t address, Writer& out);
 
+// State worth a line in heartbeats and crash reports, such as GPU memory or
+// the size of the translated code. Sources must not take locks: a crash
+// report can call them while the failing thread holds any lock.
+using StatusSource = void (*)(void* context, Writer& out);
+void AddStatusSource(StatusSource source, void* context);
+void RemoveStatusSource(StatusSource source, void* context);
+// Appends the process's committed memory, then each source, "; " between.
+void DescribeStatus(Writer& out);
+
 // Logs the calling thread's host stack with `reason` as the heading, for exits
 // that are not crashes but should say who asked for them.
 void LogCurrentStack(std::string_view reason);

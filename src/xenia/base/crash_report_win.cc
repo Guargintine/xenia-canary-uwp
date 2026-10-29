@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <string>
 
 #include "xenia/base/logging.h"
@@ -143,6 +144,16 @@ char report_buffer[96 * 1024];
 
 thread_local CppExceptionInfo last_cpp_exception;
 std::atomic<uint64_t> logged_cpp_types[16];
+
+// Status sources: a slot is in use while its source is set. Writers take the
+// mutex; readers (heartbeats and crash reports) only load the atomics.
+struct StatusSlot {
+  std::atomic<StatusSource> source{nullptr};
+  std::atomic<void*> context{nullptr};
+};
+constexpr size_t kMaxStatusSources = 8;
+StatusSlot status_slots[kMaxStatusSources];
+std::mutex status_slots_mutex;
 
 GuestHooks LoadHooks() {
   if (!guest_hooks_set.load(std::memory_order_acquire)) {
@@ -646,7 +657,9 @@ void WriteRequestedReport() {
     hooks.describe_recent_activity(uint32_t(r.thread_id), out);
   }
   DescribeProcessMemory(out);
-  out.AppendText("==== end of report ====");
+  out.AppendText("Status: ");
+  DescribeStatus(out);
+  out.AppendText("\n==== end of report ====");
 
   xe::logging::AppendLogLine(r.is_crash ? xe::LogLevel::Error
                                         : xe::LogLevel::Info,
@@ -931,6 +944,54 @@ void DescribeHostAddress(uint64_t address, Writer& out) {
     return;
   }
   out.Append("0x{:016X}", address);
+}
+
+void AddStatusSource(StatusSource source, void* context) {
+  std::lock_guard<std::mutex> lock(status_slots_mutex);
+  for (StatusSlot& slot : status_slots) {
+    if (!slot.source.load(std::memory_order_relaxed)) {
+      slot.context.store(context, std::memory_order_relaxed);
+      slot.source.store(source, std::memory_order_release);
+      return;
+    }
+  }
+}
+
+void RemoveStatusSource(StatusSource source, void* context) {
+  std::lock_guard<std::mutex> lock(status_slots_mutex);
+  for (StatusSlot& slot : status_slots) {
+    if (slot.source.load(std::memory_order_relaxed) == source &&
+        slot.context.load(std::memory_order_relaxed) == context) {
+      slot.source.store(nullptr, std::memory_order_release);
+      slot.context.store(nullptr, std::memory_order_relaxed);
+    }
+  }
+}
+
+void DescribeStatus(Writer& out) {
+  bool first = true;
+  if (get_process_memory_info) {
+    ProcessMemoryCounters counters = {};
+    counters.cb = sizeof(counters);
+    if (get_process_memory_info(GetCurrentProcess(), &counters,
+                                sizeof(counters))) {
+      out.Append("process commit {} MiB (peak {} MiB)",
+                 uint64_t(counters.pagefile_usage >> 20),
+                 uint64_t(counters.peak_pagefile_usage >> 20));
+      first = false;
+    }
+  }
+  for (StatusSlot& slot : status_slots) {
+    StatusSource source = slot.source.load(std::memory_order_acquire);
+    if (!source) {
+      continue;
+    }
+    if (!first) {
+      out.AppendText("; ");
+    }
+    first = false;
+    source(slot.context.load(std::memory_order_relaxed), out);
+  }
 }
 
 void LogCurrentStack(std::string_view reason) {

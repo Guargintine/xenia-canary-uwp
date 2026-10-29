@@ -402,27 +402,50 @@ class CodeCacheBase : public CodeCache {
 
   void EnsureCommitted(size_t high_mark) {
     using namespace xe::literals;
-    size_t old_commit_mark, new_commit_mark;
-    do {
-      old_commit_mark = generated_code_commit_mark_;
+    constexpr size_t kCommitStep = 16_MiB;
+    while (true) {
+      size_t old_commit_mark = generated_code_commit_mark_;
       if (high_mark <= old_commit_mark) {
-        break;
+        return;
       }
-      new_commit_mark = old_commit_mark + 16_MiB;
+      if (old_commit_mark + kCommitStep > kGeneratedCodeSize + 1) {
+        xe::FatalError(fmt::format(
+            "Translated code filled the {} MiB code cache.",
+            (kGeneratedCodeSize + 1) >> 20));
+      }
+      // Commit only the next step: committing everything below it again in
+      // one request was refused past 64 MiB on an Xbox Series S.
+      bool committed;
       if (generated_code_execute_base_ == generated_code_write_base_) {
-        xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kExecuteReadWrite);
+        committed = xe::memory::AllocFixed(
+                        generated_code_execute_base_ + old_commit_mark,
+                        kCommitStep, xe::memory::AllocationType::kCommit,
+                        xe::memory::PageAccess::kExecuteReadWrite) != nullptr;
       } else {
-        xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kExecuteReadOnly);
-        xe::memory::AllocFixed(generated_code_write_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kReadWrite);
+        committed = xe::memory::AllocFixed(
+                        generated_code_execute_base_ + old_commit_mark,
+                        kCommitStep, xe::memory::AllocationType::kCommit,
+                        xe::memory::PageAccess::kExecuteReadOnly) != nullptr &&
+                    xe::memory::AllocFixed(
+                        generated_code_write_base_ + old_commit_mark,
+                        kCommitStep, xe::memory::AllocationType::kCommit,
+                        xe::memory::PageAccess::kReadWrite) != nullptr;
       }
-    } while (generated_code_commit_mark_.compare_exchange_weak(
-        old_commit_mark, new_commit_mark));
+      if (!committed) {
+        // Writing the code anyway would crash with no explanation.
+        xe::FatalError(fmt::format(
+            "Xenia could not get more memory for translated code: {} MiB "
+            "are in use and the next {} MiB was refused (the reason is on "
+            "the line before in the log).",
+            old_commit_mark >> 20, kCommitStep >> 20));
+      }
+      // Another thread may have committed the same step; either way it is.
+      if (generated_code_commit_mark_.compare_exchange_strong(
+              old_commit_mark, old_commit_mark + kCommitStep)) {
+        XELOGI("Code cache: {} MiB of memory for translated code",
+               (old_commit_mark + kCommitStep) >> 20);
+      }
+    }
   }
 };
 

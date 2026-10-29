@@ -18,9 +18,24 @@
 namespace xe {
 namespace cpu {
 
-GuestCodeModule::GuestCodeModule(Processor* processor) : Module(processor) {}
+GuestCodeModule::GuestCodeModule(Processor* processor) : Module(processor) {
+  xe::crash_report::AddStatusSource(DescribeStatus, this);
+}
 
-GuestCodeModule::~GuestCodeModule() = default;
+GuestCodeModule::~GuestCodeModule() {
+  xe::crash_report::RemoveStatusSource(DescribeStatus, this);
+}
+
+void GuestCodeModule::DescribeStatus(void* context,
+                                     xe::crash_report::Writer& out) {
+  auto module = static_cast<const GuestCodeModule*>(context);
+  out.Append(
+      "runtime guest code {} functions translated, {} invalidated, longest "
+      "{} bytes",
+      module->created_count_.load(std::memory_order_relaxed),
+      module->invalidated_count_.load(std::memory_order_relaxed),
+      module->max_span_seen_.load(std::memory_order_relaxed));
+}
 
 bool GuestCodeModule::ContainsAddress(uint32_t address) {
   if (!cvars::guest_code_generation || (address & 3)) {
@@ -59,6 +74,7 @@ Symbol::Status GuestCodeModule::DeclareFunction(uint32_t address,
   owned_.push_back(std::move(function));
   live_[address] = raw;
   *out_function = raw;
+  created_count_.fetch_add(1, std::memory_order_relaxed);
   return Symbol::Status::kNew;
 }
 
@@ -87,11 +103,18 @@ std::vector<uint32_t> GuestCodeModule::Invalidate(uint32_t low, uint32_t high) {
     if (end > low) {
       removed.push_back(start);
       it = live_.erase(it);
+      invalidated_count_.fetch_add(1, std::memory_order_relaxed);
     } else {
       ++it;
     }
   }
   return removed;
+}
+
+uint32_t GuestCodeModule::NextFunctionEntry(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = live_.upper_bound(address);
+  return it != live_.end() ? it->first : 0;
 }
 
 size_t GuestCodeModule::live_function_count() {
@@ -110,6 +133,7 @@ void GuestCodeModule::NoteFunctionSpan(uint32_t start, uint32_t end) {
   }
   auto global_lock = global_critical_region_.Acquire();
   max_span_ = std::max(max_span_, end - start);
+  max_span_seen_.store(max_span_, std::memory_order_relaxed);
 }
 
 }  // namespace cpu

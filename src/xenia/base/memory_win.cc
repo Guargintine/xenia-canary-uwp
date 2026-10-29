@@ -9,6 +9,9 @@
 
 #include "xenia/base/memory.h"
 
+#include <atomic>
+
+#include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | \
@@ -124,11 +127,31 @@ void* AllocFixed(void* base_address, size_t length,
   }
   DWORD protect = ToWin32ProtectFlags(access);
 #ifdef XE_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
-  return VirtualAlloc(base_address, length, alloc_type, protect);
+  void* result = VirtualAlloc(base_address, length, alloc_type, protect);
 #else
-  return VirtualAllocFromApp(base_address, length, ULONG(alloc_type),
-                             ULONG(protect));
+  void* result = VirtualAllocFromApp(base_address, length, ULONG(alloc_type),
+                                     ULONG(protect));
 #endif
+  if (!result && (alloc_type & MEM_COMMIT)) {
+    // Commits are made in ranges already reserved, so a refusal means the
+    // system is out of memory for this process. Say why: callers only see
+    // null.
+    const DWORD error = GetLastError();
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+      XELOGE(
+          "Host memory: committing {} KiB at {} (protection 0x{:X}) failed "
+          "with system error {}{}",
+          length >> 10, base_address, uint32_t(protect), uint32_t(error),
+          error == ERROR_COMMITMENT_LIMIT    ? " (commit limit reached)"
+          : error == ERROR_NOT_ENOUGH_MEMORY ? " (not enough memory)"
+          : error == ERROR_INVALID_ADDRESS   ? " (address not reserved)"
+          : error == ERROR_INVALID_PARAMETER ? " (invalid parameter)"
+                                             : "");
+    }
+    SetLastError(error);
+  }
+  return result;
 }
 
 bool DeallocFixed(void* base_address, size_t length,

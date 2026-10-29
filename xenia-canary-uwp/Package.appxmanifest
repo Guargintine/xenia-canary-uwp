@@ -3,7 +3,7 @@
   <Identity
     Name="XeniaXBLIG.Experimental"
     Publisher="CN=XeniaXBLIG"
-    Version="0.6.0.5" />
+    Version="0.6.0.6" />
   <mp:PhoneIdentity PhoneProductId="999ab91c-3886-4ff4-96e2-2e4a2c5a61be" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
   <Properties>
     <DisplayName>Xenia XBLIG</DisplayName>

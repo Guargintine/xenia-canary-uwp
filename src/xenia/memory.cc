@@ -1593,7 +1593,10 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
           TranslateRelative(start_page_number << page_size_shift_),
           page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE("BaseHeap::Alloc failed to alloc range from host");
+        XELOGE(
+            "BaseHeap::Alloc failed to alloc range from host: {:08X}, {} KiB",
+            heap_base_ + (start_page_number << page_size_shift_),
+            (page_count << page_size_shift_) >> 10);
         // Restore the free block since we failed.
         InsertFreeBlock(start_page_number, page_count);
         return false;

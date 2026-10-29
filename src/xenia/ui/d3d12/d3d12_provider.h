@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 
+#include "xenia/base/crash_report.h"
 #include "xenia/ui/d3d12/d3d12_api.h"
 #include "xenia/ui/graphics_provider.h"
 
@@ -205,6 +206,10 @@ class D3D12Provider : public GraphicsProvider {
   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
+  // For the GPU memory line of heartbeats and crash reports.
+  IDXGIAdapter3* memory_info_adapter_ = nullptr;
+  static void DescribeMemoryStatus(void* context,
+                                   xe::crash_report::Writer& out);
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;

@@ -10,11 +10,13 @@
 #ifndef XENIA_CPU_GUEST_CODE_MODULE_H_
 #define XENIA_CPU_GUEST_CODE_MODULE_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "xenia/base/crash_report.h"
 #include "xenia/base/mutex.h"
 #include "xenia/cpu/module.h"
 
@@ -43,6 +45,9 @@ class GuestCodeModule : public Module {
 
   bool ContainsAddress(uint32_t address) override;
 
+  bool is_runtime_code() const override { return true; }
+  uint32_t NextFunctionEntry(uint32_t address) override;
+
   Symbol::Status DeclareFunction(uint32_t address,
                                  Function** out_function) override;
 
@@ -67,6 +72,13 @@ class GuestCodeModule : public Module {
   std::vector<std::unique_ptr<Function>> owned_;
   // Largest [start, end) span seen, used to bound the overlap search.
   uint32_t max_span_ = 4;
+
+  // How much runtime code was translated and thrown away again, for
+  // heartbeats and crash reports.
+  static void DescribeStatus(void* context, xe::crash_report::Writer& out);
+  std::atomic<uint32_t> created_count_{0};
+  std::atomic<uint32_t> invalidated_count_{0};
+  std::atomic<uint32_t> max_span_seen_{4};
 };
 
 }  // namespace cpu

@@ -28,6 +28,10 @@ void DescribeHostAddress(uint64_t address, Writer& out) {
 
 void LogCurrentStack(std::string_view reason) { XELOGI("{}", reason); }
 
+void AddStatusSource(StatusSource, void*) {}
+void RemoveStatusSource(StatusSource, void*) {}
+void DescribeStatus(Writer&) {}
+
 }  // namespace crash_report
 }  // namespace xe
 #endif  // !XE_PLATFORM_WIN32
