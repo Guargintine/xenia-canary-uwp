@@ -168,8 +168,11 @@ void* Commit(void* base_address, size_t length, DWORD protect) {
     error = CommitInPieces(static_cast<uint8_t*>(base_address), length,
                            protect, calls);
   }
+  // What VirtualAlloc returns for a commit: the start of its first page.
+  void* const committed_base = reinterpret_cast<void*>(
+      reinterpret_cast<uintptr_t>(base_address) & ~uintptr_t(page_size() - 1));
   if (error == ERROR_SUCCESS && calls == 1) {
-    return base_address;
+    return committed_base;
   }
   static std::atomic<uint32_t> logged{0};
   if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -190,7 +193,7 @@ void* Commit(void* base_address, size_t length, DWORD protect) {
     }
   }
   SetLastError(error);
-  return error == ERROR_SUCCESS ? base_address : nullptr;
+  return error == ERROR_SUCCESS ? committed_base : nullptr;
 }
 
 }  // namespace
