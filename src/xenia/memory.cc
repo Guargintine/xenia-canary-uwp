@@ -16,6 +16,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/crash_report.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
@@ -44,6 +45,13 @@ DEFINE_bool(record_mmio_access_exceptions, true,
             "CPU");
 DEFINE_bool(protect_on_release, false,
             "Protect released memory to prevent accesses.", "Memory");
+DEFINE_bool(commit_all_physical_memory, true,
+            "Get host memory for all 512 MiB of guest physical memory when a "
+            "game starts, so the GPU can read memory a game never allocated. "
+            "Off, Xenia takes physical memory only as games allocate it, which "
+            "can use hundreds of MiB less, but games that point the GPU at "
+            "memory they never allocated crash.",
+            "Memory");
 DEFINE_bool(scribble_heap, false,
             "Scribble specific or random value into all allocated heap memory.",
             "Memory");
@@ -114,6 +122,22 @@ static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
     return true;
   }
   return false;
+}
+
+// The guest gets null when the host refuses memory, and games rarely check, so
+// this is often the last line before a crash: say what was asked for, why the
+// system said no and how much memory was in use.
+static void LogHostAllocationFailure(const char* caller, uint32_t address,
+                                     uint32_t size, uint32_t protect,
+                                     uint32_t error) {
+  char status_buffer[1024];
+  crash_report::Writer status(status_buffer, sizeof(status_buffer));
+  crash_report::DescribeStatus(status);
+  XELOGE(
+      "{} failed to alloc range from host: {:08X}, {} KiB, protection {:X}: "
+      "system error {} ({}). Memory: {}",
+      caller, address, size >> 10, protect, error,
+      xe::memory::DescribeAllocationError(error), status.view());
 }
 
 void RandomizeMemory(void* range_start, uint32_t size) {
@@ -272,11 +296,21 @@ bool Memory::Initialize() {
   // without any restriction. This however needs some form of validation.
   // That's why we're commiting whole physical memory range and deal with
   // allocations issues on custom page protection level.
-  for (size_t i = 1; i <= 16; i++) {
-    xe::memory::AllocFixed(heaps_.physical.TranslateRelative(i << 24),
-                           heaps_.physical.page_size() * 0x10000,
-                           xe::memory::AllocationType::kCommit,
-                           xe::memory::PageAccess::kReadWrite);
+  if (cvars::commit_all_physical_memory) {
+    bool committed = true;
+    for (size_t i = 1; committed && i <= 16; i++) {
+      committed = xe::memory::AllocFixed(
+                      heaps_.physical.TranslateRelative(i << 24),
+                      heaps_.physical.page_size() * 0x10000,
+                      xe::memory::AllocationType::kCommit,
+                      xe::memory::PageAccess::kReadWrite) != nullptr;
+    }
+    XELOGI("Memory: {} all guest physical memory up front",
+           committed ? "committed" : "could not commit");
+  } else {
+    XELOGI(
+        "Memory: guest physical memory is committed as games allocate it "
+        "(commit_all_physical_memory is off)");
   }
 
   // Add handlers for MMIO.
@@ -1399,7 +1433,10 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
           TranslateRelative(start_page_number * page_size_),
           page_count * page_size_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE("BaseHeap::AllocFixed failed to alloc range from host");
+        LogHostAllocationFailure("BaseHeap::AllocFixed",
+                                 heap_base_ + start_page_number * page_size_,
+                                 page_count * page_size_, protect,
+                                 xe::memory::LastAllocationError());
         return false;
       }
 
@@ -1593,10 +1630,11 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
           TranslateRelative(start_page_number << page_size_shift_),
           page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE(
-            "BaseHeap::Alloc failed to alloc range from host: {:08X}, {} KiB",
+        LogHostAllocationFailure(
+            "BaseHeap::Alloc",
             heap_base_ + (start_page_number << page_size_shift_),
-            (page_count << page_size_shift_) >> 10);
+            page_count << page_size_shift_, protect,
+            xe::memory::LastAllocationError());
         // Restore the free block since we failed.
         InsertFreeBlock(start_page_number, page_count);
         return false;

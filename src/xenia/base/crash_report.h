@@ -99,8 +99,12 @@ void DescribeHostAddress(uint64_t address, Writer& out);
 using StatusSource = void (*)(void* context, Writer& out);
 void AddStatusSource(StatusSource source, void* context);
 void RemoveStatusSource(StatusSource source, void* context);
-// Appends the process's committed memory, then each source, "; " between.
+// Appends the process's committed memory and what it may still commit, then
+// each source, "; " between.
 void DescribeStatus(Writer& out);
+// Appends the memory limits that apply to the process: its job's, its own
+// commit limit and the system's.
+void DescribeMemoryLimits(Writer& out);
 
 // Logs the calling thread's host stack with `reason` as the heading, for exits
 // that are not crashes but should say who asked for them.

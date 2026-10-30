@@ -31,6 +31,7 @@ void LogCurrentStack(std::string_view reason) { XELOGI("{}", reason); }
 void AddStatusSource(StatusSource, void*) {}
 void RemoveStatusSource(StatusSource, void*) {}
 void DescribeStatus(Writer&) {}
+void DescribeMemoryLimits(Writer&) {}
 
 }  // namespace crash_report
 }  // namespace xe

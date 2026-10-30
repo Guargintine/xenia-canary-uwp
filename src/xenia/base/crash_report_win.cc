@@ -51,6 +51,10 @@ using TopLevelFilter = LONG(WINAPI*)(PEXCEPTION_POINTERS);
 using SetFilterFn = TopLevelFilter(WINAPI*)(TopLevelFilter);
 using PcToFileHeaderFn = PVOID(NTAPI*)(PVOID, PVOID*);
 using GetProcessMemoryInfoFn = BOOL(WINAPI*)(HANDLE, void*, DWORD);
+using GlobalMemoryStatusExFn = BOOL(WINAPI*)(MEMORYSTATUSEX*);
+using GetPerformanceInfoFn = BOOL(WINAPI*)(void*, DWORD);
+using QueryJobInformationFn = BOOL(WINAPI*)(HANDLE, JOBOBJECTINFOCLASS, void*,
+                                            DWORD, DWORD*);
 
 // PROCESS_MEMORY_COUNTERS (psapi.h).
 struct ProcessMemoryCounters {
@@ -64,6 +68,24 @@ struct ProcessMemoryCounters {
   SIZE_T quota_non_paged_pool_usage;
   SIZE_T pagefile_usage;
   SIZE_T peak_pagefile_usage;
+};
+
+// PERFORMANCE_INFORMATION (psapi.h). Counts are in pages.
+struct PerformanceInformation {
+  DWORD cb;
+  SIZE_T commit_total;
+  SIZE_T commit_limit;
+  SIZE_T commit_peak;
+  SIZE_T physical_total;
+  SIZE_T physical_available;
+  SIZE_T system_cache;
+  SIZE_T kernel_total;
+  SIZE_T kernel_paged;
+  SIZE_T kernel_nonpaged;
+  SIZE_T page_size;
+  DWORD handle_count;
+  DWORD process_count;
+  DWORD thread_count;
 };
 
 // What a Visual C++ throw describes on x64, as 32-bit offsets from the image
@@ -113,6 +135,9 @@ struct Request {
 
 PcToFileHeaderFn pc_to_file_header = nullptr;
 GetProcessMemoryInfoFn get_process_memory_info = nullptr;
+GlobalMemoryStatusExFn global_memory_status = nullptr;
+GetPerformanceInfoFn get_performance_info = nullptr;
+QueryJobInformationFn query_job_information = nullptr;
 TopLevelFilter previous_filter = nullptr;
 
 wchar_t report_path[2048] = {};
@@ -857,9 +882,24 @@ void Install(const std::filesystem::path& path,
         GetProcAddress(ntdll, "RtlPcToFileHeader"));
   }
   for (HMODULE module : {kernelbase, kernel32}) {
-    if (module && !get_process_memory_info) {
+    if (!module) {
+      continue;
+    }
+    if (!get_process_memory_info) {
       get_process_memory_info = reinterpret_cast<GetProcessMemoryInfoFn>(
           GetProcAddress(module, "K32GetProcessMemoryInfo"));
+    }
+    if (!global_memory_status) {
+      global_memory_status = reinterpret_cast<GlobalMemoryStatusExFn>(
+          GetProcAddress(module, "GlobalMemoryStatusEx"));
+    }
+    if (!get_performance_info) {
+      get_performance_info = reinterpret_cast<GetPerformanceInfoFn>(
+          GetProcAddress(module, "K32GetPerformanceInfo"));
+    }
+    if (!query_job_information) {
+      query_job_information = reinterpret_cast<QueryJobInformationFn>(
+          GetProcAddress(module, "QueryInformationJobObject"));
     }
   }
 
@@ -912,6 +952,11 @@ void Install(const std::filesystem::path& path,
       uint32_t(guid.Data2), uint32_t(guid.Data3), guid.Data4[0], guid.Data4[1],
       guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5],
       guid.Data4[6], guid.Data4[7], age);
+
+  char limits_buffer[512];
+  Writer limits(limits_buffer, sizeof(limits_buffer));
+  DescribeMemoryLimits(limits);
+  XELOGI("Memory limits: {}", limits.view());
 }
 
 void SetGuestHooks(const GuestHooks& hooks) {
@@ -968,6 +1013,57 @@ void RemoveStatusSource(StatusSource source, void* context) {
   }
 }
 
+void DescribeMemoryLimits(Writer& out) {
+  bool first = true;
+  const auto separate = [&]() {
+    if (!first) {
+      out.AppendText("; ");
+    }
+    first = false;
+  };
+  const auto append_limit = [&](const char* name, bool set, SIZE_T bytes) {
+    if (set) {
+      out.Append("{} {} MiB", name, uint64_t(bytes >> 20));
+    } else {
+      out.Append("{} none", name);
+    }
+  };
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION job = {};
+  separate();
+  if (!query_job_information) {
+    out.AppendText("job limits unavailable");
+  } else if (query_job_information(nullptr, JobObjectExtendedLimitInformation,
+                                   &job, sizeof(job), nullptr)) {
+    const DWORD flags = job.BasicLimitInformation.LimitFlags;
+    append_limit("job memory limit", (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) != 0,
+                 job.JobMemoryLimit);
+    out.AppendText(", ");
+    append_limit("process memory limit",
+                 (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) != 0,
+                 job.ProcessMemoryLimit);
+  } else {
+    out.Append("job limits unreadable (system error {})",
+               uint32_t(GetLastError()));
+  }
+  MEMORYSTATUSEX status = {};
+  status.dwLength = sizeof(status);
+  if (global_memory_status && global_memory_status(&status)) {
+    separate();
+    out.Append("commit limit for this process {} MiB, RAM {} MiB",
+               uint64_t(status.ullTotalPageFile >> 20),
+               uint64_t(status.ullTotalPhys >> 20));
+  }
+  PerformanceInformation performance = {};
+  performance.cb = sizeof(performance);
+  if (get_performance_info &&
+      get_performance_info(&performance, sizeof(performance))) {
+    separate();
+    out.Append("system commit limit {} MiB",
+               uint64_t(performance.commit_limit) * performance.page_size >>
+                   20);
+  }
+}
+
 void DescribeStatus(Writer& out) {
   bool first = true;
   if (get_process_memory_info) {
@@ -980,6 +1076,27 @@ void DescribeStatus(Writer& out) {
                  uint64_t(counters.peak_pagefile_usage >> 20));
       first = false;
     }
+  }
+  // Whose limit a refused commit hit: this process's (the job's) or the
+  // whole system's.
+  MEMORYSTATUSEX memory_status = {};
+  memory_status.dwLength = sizeof(memory_status);
+  if (global_memory_status && global_memory_status(&memory_status)) {
+    out.Append("{}{} MiB more may be committed, {} MiB RAM free",
+               first ? "" : ", ",
+               uint64_t(memory_status.ullAvailPageFile >> 20),
+               uint64_t(memory_status.ullAvailPhys >> 20));
+    first = false;
+  }
+  PerformanceInformation performance = {};
+  performance.cb = sizeof(performance);
+  if (get_performance_info &&
+      get_performance_info(&performance, sizeof(performance))) {
+    out.Append("{}system commit {} of {} MiB", first ? "" : "; ",
+               uint64_t(performance.commit_total) * performance.page_size >> 20,
+               uint64_t(performance.commit_limit) * performance.page_size >>
+                   20);
+    first = false;
   }
   for (StatusSlot& slot : status_slots) {
     StatusSource source = slot.source.load(std::memory_order_acquire);

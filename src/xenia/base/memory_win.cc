@@ -11,6 +11,7 @@
 
 #include <atomic>
 
+#include "xenia/base/crash_report.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
 
@@ -108,6 +109,92 @@ bool IsWritableExecutableMemorySupported() {
 #endif
 }
 
+namespace {
+
+void* CallVirtualAlloc(void* base_address, size_t length, DWORD alloc_type,
+                       DWORD protect) {
+#ifdef XE_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+  return VirtualAlloc(base_address, length, alloc_type, protect);
+#else
+  return VirtualAllocFromApp(base_address, length, ULONG(alloc_type),
+                             ULONG(protect));
+#endif
+}
+
+bool IsOutOfMemoryError(DWORD error) {
+  return error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY ||
+         error == ERROR_NOT_ENOUGH_QUOTA;
+}
+
+// Commits a reserved range, in halves down to 64 KiB when the system refuses
+// all of it at once for lack of memory, in case smaller requests still fit.
+// Returns the error that stopped it, or ERROR_SUCCESS.
+DWORD CommitInPieces(uint8_t* base, size_t length, DWORD protect,
+                     uint32_t& calls) {
+  constexpr size_t kSmallestPiece = 64 * 1024;
+  ++calls;
+  if (CallVirtualAlloc(base, length, MEM_COMMIT, protect)) {
+    return ERROR_SUCCESS;
+  }
+  const DWORD error = GetLastError();
+  if (!IsOutOfMemoryError(error) || length <= kSmallestPiece) {
+    return error;
+  }
+  const size_t first_length =
+      (length / 2 + kSmallestPiece - 1) & ~(kSmallestPiece - 1);
+  const DWORD first_error = CommitInPieces(base, first_length, protect, calls);
+  if (first_error != ERROR_SUCCESS) {
+    return first_error;
+  }
+  return CommitInPieces(base + first_length, length - first_length, protect,
+                        calls);
+}
+
+// Commit only: the range is reserved already, as every caller's is.
+void* Commit(void* base_address, size_t length, DWORD protect) {
+  uint32_t calls = 0;
+  DWORD error = CommitInPieces(static_cast<uint8_t*>(base_address), length,
+                               protect, calls);
+  // Memory may come back: from another process exiting (a Xenia restarted
+  // right after closing, say), or from Xenia's own threads freeing some.
+  uint32_t tries = 1;
+  uint32_t waited_ms = 0;
+  for (DWORD delay_ms = 50; error != ERROR_SUCCESS &&
+                            IsOutOfMemoryError(error) && delay_ms <= 800;
+       delay_ms *= 2) {
+    Sleep(delay_ms);
+    waited_ms += delay_ms;
+    ++tries;
+    error = CommitInPieces(static_cast<uint8_t*>(base_address), length,
+                           protect, calls);
+  }
+  if (error == ERROR_SUCCESS && calls == 1) {
+    return base_address;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+    char status_buffer[1024];
+    crash_report::Writer status(status_buffer, sizeof(status_buffer));
+    crash_report::DescribeStatus(status);
+    if (error == ERROR_SUCCESS) {
+      XELOGW(
+          "Host memory: committing {} KiB at {} was refused at first, then "
+          "got in {} requests over {} ms. Memory: {}",
+          length >> 10, base_address, calls, waited_ms, status.view());
+    } else {
+      XELOGE(
+          "Host memory: committing {} KiB at {} (protection 0x{:X}) failed "
+          "with system error {} ({}) after {} tries over {} ms. Memory: {}",
+          length >> 10, base_address, uint32_t(protect), uint32_t(error),
+          DescribeAllocationError(error), tries, waited_ms, status.view());
+    }
+  }
+  SetLastError(error);
+  return error == ERROR_SUCCESS ? base_address : nullptr;
+}
+
+}  // namespace
+
 void* AllocFixed(void* base_address, size_t length,
                  AllocationType allocation_type, PageAccess access) {
   DWORD alloc_type = 0;
@@ -126,32 +213,36 @@ void* AllocFixed(void* base_address, size_t length,
       break;
   }
   DWORD protect = ToWin32ProtectFlags(access);
-#ifdef XE_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
-  void* result = VirtualAlloc(base_address, length, alloc_type, protect);
-#else
-  void* result = VirtualAllocFromApp(base_address, length, ULONG(alloc_type),
-                                     ULONG(protect));
-#endif
-  if (!result && (alloc_type & MEM_COMMIT)) {
-    // Commits are made in ranges already reserved, so a refusal means the
-    // system is out of memory for this process. Say why: callers only see
-    // null.
-    const DWORD error = GetLastError();
-    static std::atomic<uint32_t> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-      XELOGE(
-          "Host memory: committing {} KiB at {} (protection 0x{:X}) failed "
-          "with system error {}{}",
-          length >> 10, base_address, uint32_t(protect), uint32_t(error),
-          error == ERROR_COMMITMENT_LIMIT    ? " (commit limit reached)"
-          : error == ERROR_NOT_ENOUGH_MEMORY ? " (not enough memory)"
-          : error == ERROR_INVALID_ADDRESS   ? " (address not reserved)"
-          : error == ERROR_INVALID_PARAMETER ? " (invalid parameter)"
-                                             : "");
-    }
-    SetLastError(error);
+  if (alloc_type == MEM_COMMIT && base_address) {
+    // Callers only see null, so Commit logs refusals. Reserving at a fixed
+    // address is left out: failing there is how callers probe for free space
+    // (each guest thread's context does).
+    return Commit(base_address, length, protect);
   }
-  return result;
+  return CallVirtualAlloc(base_address, length, alloc_type, protect);
+}
+
+uint32_t LastAllocationError() { return uint32_t(GetLastError()); }
+
+const char* DescribeAllocationError(uint32_t error) {
+  switch (error) {
+    case ERROR_COMMITMENT_LIMIT:
+      return "commit limit reached";
+    case ERROR_NOT_ENOUGH_MEMORY:
+      return "not enough memory";
+    case ERROR_NOT_ENOUGH_QUOTA:
+      return "quota exceeded";
+    case ERROR_INVALID_ADDRESS:
+      return "address not reserved, or already in use";
+    case ERROR_INVALID_PARAMETER:
+      return "invalid parameter";
+    case ERROR_ACCESS_DENIED:
+      return "access denied";
+    case ERROR_SUCCESS:
+      return "no error recorded";
+    default:
+      return "no description";
+  }
 }
 
 bool DeallocFixed(void* base_address, size_t length,

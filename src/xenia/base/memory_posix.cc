@@ -176,6 +176,25 @@ void* AllocFixed(void* base_address, size_t length,
   return nullptr;
 }
 
+uint32_t LastAllocationError() { return uint32_t(errno); }
+
+const char* DescribeAllocationError(uint32_t error) {
+  switch (error) {
+    case ENOMEM:
+      return "not enough memory";
+    case EINVAL:
+      return "invalid argument";
+    case EACCES:
+      return "access denied";
+    case EEXIST:
+      return "address already in use";
+    case 0:
+      return "no error recorded";
+    default:
+      return "no description";
+  }
+}
+
 bool DeallocFixed(void* base_address, size_t length,
                   DeallocationType deallocation_type) {
   const auto region_begin = reinterpret_cast<uintptr_t>(base_address);

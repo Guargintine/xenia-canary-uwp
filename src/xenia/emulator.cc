@@ -37,6 +37,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -2171,6 +2172,18 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   }
   // The registers follow; the summary above is what fits in a dialog.
   const std::string crash_summary = crash_msg;
+  {
+    // What the guest called last often says why it crashed, such as an
+    // allocation that returned null.
+    char activity_buffer[8192];
+    crash_report::Writer activity(activity_buffer, sizeof(activity_buffer));
+    kernel::shim::DescribeRecentKernelCalls(
+        xe::threading::current_thread_system_id(), activity);
+    activity.AppendText("Memory: ");
+    crash_report::DescribeStatus(activity);
+    activity.AppendText("\n");
+    crash_msg.append(activity.view());
+  }
   crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));

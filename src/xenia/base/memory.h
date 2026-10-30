@@ -94,6 +94,11 @@ bool IsWritableExecutableMemoryPreferred();
 // Specify nullptr for base_address to leave it up to the system.
 void* AllocFixed(void* base_address, size_t length,
                  AllocationType allocation_type, PageAccess access);
+// The system's reason the last AllocFixed on this thread failed: a Win32 error
+// code or errno. Read it right after the call.
+uint32_t LastAllocationError();
+// A few words for a LastAllocationError value.
+const char* DescribeAllocationError(uint32_t error);
 
 // Deallocates and/or releases the given block of memory.
 // When releasing memory length must be zero, as all pages in the region are

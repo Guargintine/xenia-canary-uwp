@@ -76,6 +76,13 @@ Config:
   crash), or the guest call that asked to close, with the calls before it.
   Each release has a symbols zip that turns the report's `xeniacanary+0x...`
   offsets into function names.
+- On an Xbox Series S the console can refuse memory well below the app's
+  5 GB limit (the log says `Host memory: committing ... failed`, with the
+  memory state then). Xenia retries a refused request in smaller pieces for
+  about 1.5 s first. `commit_all_physical_memory = false` in `[Memory]` makes
+  Xenia take guest physical memory only as games allocate it, up to 512 MiB
+  less; games that point the GPU at memory they never allocated crash with it
+  off.
 
 ## Building
 
