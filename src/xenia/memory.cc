@@ -9,6 +9,7 @@
 
 #include "xenia/memory.h"
 
+#include <atomic>
 #include <cstring>
 #include <random>
 
@@ -21,6 +22,7 @@
 #include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 
 #include "xenia/cpu/mmio_handler.h"
@@ -45,13 +47,16 @@ DEFINE_bool(record_mmio_access_exceptions, true,
             "CPU");
 DEFINE_bool(protect_on_release, false,
             "Protect released memory to prevent accesses.", "Memory");
-DEFINE_bool(commit_all_physical_memory, true,
+// Off on the Xbox: it refused this memory (guest memory and translated code
+// both come from it) at about 700 MiB, far below the app's limit, which left
+// games about 200 MiB of their own.
+DEFINE_bool(commit_all_physical_memory, !XE_PLATFORM_WINRT,
             "Get host memory for all 512 MiB of guest physical memory when a "
-            "game starts, so the GPU can read memory a game never allocated. "
-            "Off, Xenia takes physical memory only as games allocate it, which "
-            "can use hundreds of MiB less, but games that point the GPU at "
-            "memory they never allocated crash.",
+            "game starts. Off, Xenia gets it as games allocate it, or when the "
+            "GPU or a game first touches a page no game allocated, which can "
+            "use hundreds of MiB less. Off by default on the Xbox.",
             "Memory");
+UPDATE_from_bool(commit_all_physical_memory, 2026, 10, 30, 5, true);
 DEFINE_bool(scribble_heap, false,
             "Scribble specific or random value into all allocated heap memory.",
             "Memory");
@@ -891,9 +896,61 @@ cpu::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+bool Memory::CommitUntouchedPhysicalPage(void* host_address) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(host_address);
+  const uintptr_t physical_base = reinterpret_cast<uintptr_t>(physical_membase_);
+  const uintptr_t virtual_base = reinterpret_cast<uintptr_t>(virtual_membase_);
+  uint32_t guest_address;
+  xe::memory::PageAccess guest_access;
+  if (address >= physical_base && address < physical_base + 0x20000000) {
+    guest_address = uint32_t(address - physical_base);
+    guest_access =
+        heaps_.physical.QueryRangeAccess(guest_address, guest_address);
+  } else if (address >= virtual_base + 0xA0000000 &&
+             address < virtual_base + 0x100000000ull +
+                           heaps_.vE0000000.host_address_offset()) {
+    guest_address = HostToGuestVirtual(host_address);
+    BaseHeap* heap = LookupHeap(guest_address);
+    if (!heap || heap->heap_type() != HeapType::kGuestPhysical) {
+      return false;
+    }
+    guest_access = heap->QueryRangeAccess(guest_address, guest_address);
+  } else {
+    return false;
+  }
+  // Pages a game allocated have host memory already, so a fault on one is a
+  // watch; and a committed page is protected on purpose.
+  if (guest_access != xe::memory::PageAccess::kNoAccess ||
+      xe::memory::IsCommitted(host_address)) {
+    return false;
+  }
+  void* page = reinterpret_cast<void*>(address &
+                                       ~uintptr_t(system_page_size_ - 1));
+  if (!xe::memory::AllocFixed(page, system_page_size_,
+                              xe::memory::AllocationType::kCommit,
+                              xe::memory::PageAccess::kReadWrite)) {
+    return false;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+    XELOGI(
+        "Memory: gave host memory to the page at {:08X}, which no game "
+        "allocated, on its first access",
+        guest_address);
+  }
+  return true;
+}
+
 bool Memory::AccessViolationCallback(
     global_unique_lock_type global_lock_locked_once, void* host_address,
     bool is_write) {
+  // With commit_all_physical_memory off, physical memory no game allocated
+  // has no host memory until something touches it. The GPU reads it on the
+  // console, and so may a game.
+  if (!cvars::commit_all_physical_memory &&
+      CommitUntouchedPhysicalPage(host_address)) {
+    return true;
+  }
   // Access via physical_membase_ is special, when need to bypass everything
   // (for instance, for a data provider to actually write the data) so only
   // triggering callbacks on virtual memory regions.

@@ -237,6 +237,8 @@ bool Protect(void* base_address, size_t length, PageAccess access,
   return mprotect(base_address, length, prot) == 0;
 }
 
+bool IsCommitted(const void*) { return true; }
+
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   // No generic POSIX solution exists. The Linux solution should work on all
   // Linux kernel based OS, including Android.

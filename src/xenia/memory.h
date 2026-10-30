@@ -664,6 +664,10 @@ class Memory {
   static uint32_t HostToGuestVirtualThunk(const void* context,
                                           const void* host_address);
 
+  // Gives host memory to a page of guest physical memory that no game
+  // allocated, when something first touches it. False if the fault is not
+  // about that.
+  bool CommitUntouchedPhysicalPage(void* host_address);
   bool AccessViolationCallback(global_unique_lock_type global_lock_locked_once,
                                void* host_address, bool is_write);
   static bool AccessViolationCallbackThunk(

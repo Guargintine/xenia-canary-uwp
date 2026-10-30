@@ -151,23 +151,12 @@ DWORD CommitInPieces(uint8_t* base, size_t length, DWORD protect,
 }
 
 // Commit only: the range is reserved already, as every caller's is.
+// Waiting and trying again does not help: on an Xbox Series S, refusals came
+// from a limit that held for the rest of the run.
 void* Commit(void* base_address, size_t length, DWORD protect) {
   uint32_t calls = 0;
-  DWORD error = CommitInPieces(static_cast<uint8_t*>(base_address), length,
-                               protect, calls);
-  // Memory may come back: from another process exiting (a Xenia restarted
-  // right after closing, say), or from Xenia's own threads freeing some.
-  uint32_t tries = 1;
-  uint32_t waited_ms = 0;
-  for (DWORD delay_ms = 50; error != ERROR_SUCCESS &&
-                            IsOutOfMemoryError(error) && delay_ms <= 800;
-       delay_ms *= 2) {
-    Sleep(delay_ms);
-    waited_ms += delay_ms;
-    ++tries;
-    error = CommitInPieces(static_cast<uint8_t*>(base_address), length,
-                           protect, calls);
-  }
+  const DWORD error = CommitInPieces(static_cast<uint8_t*>(base_address),
+                                     length, protect, calls);
   // What VirtualAlloc returns for a commit: the start of its first page.
   void* const committed_base = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(base_address) & ~uintptr_t(page_size() - 1));
@@ -181,15 +170,15 @@ void* Commit(void* base_address, size_t length, DWORD protect) {
     crash_report::DescribeStatus(status);
     if (error == ERROR_SUCCESS) {
       XELOGW(
-          "Host memory: committing {} KiB at {} was refused at first, then "
-          "got in {} requests over {} ms. Memory: {}",
-          length >> 10, base_address, calls, waited_ms, status.view());
+          "Host memory: committing {} KiB at {} was refused whole, then got "
+          "in {} requests. Memory: {}",
+          length >> 10, base_address, calls, status.view());
     } else {
       XELOGE(
           "Host memory: committing {} KiB at {} (protection 0x{:X}) failed "
-          "with system error {} ({}) after {} tries over {} ms. Memory: {}",
+          "with system error {} ({}). Memory: {}",
           length >> 10, base_address, uint32_t(protect), uint32_t(error),
-          DescribeAllocationError(error), tries, waited_ms, status.view());
+          DescribeAllocationError(error), status.view());
     }
   }
   SetLastError(error);
@@ -300,6 +289,12 @@ bool Protect(void* base_address, size_t length, PageAccess access,
     *out_old_access = ToXeniaProtectFlags(DWORD(old_protect));
   }
   return true;
+}
+
+bool IsCommitted(const void* address) {
+  MEMORY_BASIC_INFORMATION info = {};
+  return VirtualQuery(address, &info, sizeof(info)) != 0 &&
+         info.State == MEM_COMMIT;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
